@@ -29,7 +29,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.7.0'
+VERSION = '0.7.1'
 
 
 class Strict(BaseModel):

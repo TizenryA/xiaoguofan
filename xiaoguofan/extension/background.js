@@ -1,7 +1,10 @@
 'use strict';
-// User action only. Never reads cookies or sends network requests in background.
+importScripts('compat.js');
+// User action only; bind only the supplied portal tab, never pick another tab.
 async function openImporter(tab){
- if(!tab?.id)return;
- await chrome.windows.create({url:chrome.runtime.getURL('popup.html')+'?tab='+tab.id,type:'popup',width:440,height:760});
+ if(!Number.isSafeInteger(tab?.id)||tab.id<0)return;
+ const url=ImportAPI.raw.runtime.getURL('popup.html')+'?tab='+tab.id;
+ try{await ImportAPI.call('windows','create',{url,type:'popup',width:440,height:760})}
+ catch{await ImportAPI.call('tabs','create',{url,active:true})}
 }
-chrome.action.onClicked.addListener(openImporter);
+ImportAPI.raw.action.onClicked.addListener(tab=>{openImporter(tab).catch(()=>{})});

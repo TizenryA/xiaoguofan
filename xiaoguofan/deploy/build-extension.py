@@ -6,9 +6,9 @@ import zipfile
 
 root = Path(__file__).resolve().parents[1]
 source = root / 'extension'
-files = ['manifest.json', 'core.js', 'popup.js', 'background.js', 'popup.html', 'popup.css', '使用说明.txt']
+files = ['manifest.json', 'core.js', 'compat.js', 'popup.js', 'background.js', 'popup.html', 'popup.css', '使用说明.txt']
 version = json.loads((source / 'manifest.json').read_text())['version']
-assert version == '0.3.4'
+assert version == '0.3.5'
 archive = root / 'portal/static/AIStudio-Lite-账号导入.zip'
 with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as z:
     for name in files:
