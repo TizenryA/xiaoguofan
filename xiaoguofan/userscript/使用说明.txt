@@ -1,4 +1,4 @@
-小锅饭 AI Studio 登录文件导出 1.0.0
+小锅饭 AI Studio 登录文件导出 1.0.1
 作者：渡鸦4455
 
 安装：
@@ -21,6 +21,8 @@
 - 不自动上传、不访问外部API、不保存Cookie到浏览器持久存储、不显示Cookie原值。
 - JSON是高敏感账号通行证，只给你信任的小锅饭站点；不要发群里。
 - 字段通过和导出成功不代表Google会话有效、模型有权限或生成成功。
-- 已验证Node字段映射/失败拦截、三尺寸浏览器下载交互、导出结构被门户接收。浏览器交互使用隔离假Cookie，不是官方窜改猴手机实机或真实Google登录验收。
+- 1.0.1修正权限声明：@grant GM_cookie 与 @grant GM.cookie，不能写成 .list。
+- 已加载官网下载的Tampermonkey Beta 5.6.6242，在桌面Chromium通过真实GM_cookie接口读取HttpOnly测试Cookie并下载JSON。测试Cookie为隔离假数据，非真实Google会话。
+- Node字段映射/失败拦截、三尺寸下载交互、门户导入测试通过；手机实机和真实Google登录仍未验收。
 
 官方文档：https://www.tampermonkey.net/documentation.php?locale=en&q=GM_cookie

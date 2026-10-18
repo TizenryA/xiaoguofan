@@ -21,5 +21,5 @@ def test_userscript_output_accepted_by_real_import_endpoint(tmp_path):
         r=c.post('/lite/api/accounts/import',json=data,headers={'X-CSRF-Token':csrf})
         assert r.status_code==201,r.text
         rows=c.get('/lite/api/accounts').json();assert len(rows)==1 and rows[0]['email']=='fixture@example.com'
-        public=c.get('/lite/static/aistudio-export.user.js');assert public.status_code==200 and '@grant        GM_cookie.list' in public.text
+        public=c.get('/lite/static/aistudio-export.user.js');assert public.status_code==200 and '@grant        GM_cookie\n' in public.text
         assert '/static/aistudio-export.user.js' in c.get('/lite').text

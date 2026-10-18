@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         小锅饭 · AI Studio 登录文件导出
 // @namespace    https://github.com/TizenryA/xiaoguofan
-// @version      1.0.0
+// @version      1.0.1
 // @description  在本人确认后读取 AI Studio 登录状态，仅下载到本机，不自动上传。官方 Tampermonkey Cookie API，HttpOnly 支持取决于版本。
 // @author       渡鸦4455
 // @match        https://aistudio.google.com/*
-// @grant        GM_cookie.list
-// @grant        GM.cookie.list
+// @grant        GM_cookie
+// @grant        GM.cookie
 // @grant        GM_registerMenuCommand
 // @run-at       document-idle
 // @noframes
@@ -14,7 +14,7 @@
 // ==/UserScript==
 'use strict';
 (function(){
- const VERSION='1.0.0';
+ const VERSION='1.0.1';
  const REQUIRED=['SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'];
  function readCookies(api){
   return new Promise((resolve,reject)=>{
