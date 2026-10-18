@@ -1,0 +1,8 @@
+'use strict';
+(function(root){
+const required=['SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'];
+function validateTarget(raw){const u=new URL(raw);if(u.protocol!=='https:'||u.username||u.password||!['','/'].includes(u.pathname)||u.hostname==='google.com'||u.hostname.endsWith('.google.com'))throw Error('请填写受信任的 HTTPS 门户根地址，不能填写 Google 或管理路径');return u.origin}
+function normalizeCookies(cookies){return cookies.filter(c=>{const d=c.domain.replace(/^\./,'');return !c.partitionKey&&(d==='google.com'||d==='aistudio.google.com')&&c.path==='/'&&(!c.expirationDate||c.expirationDate>Date.now()/1000)}).map(c=>({name:c.name,value:c.value,domain:c.domain,path:c.path,expires:c.session?-1:(c.expirationDate??-1),httpOnly:!!c.httpOnly,secure:!!c.secure,sameSite:({no_restriction:'None',lax:'Lax',strict:'Strict'})[c.sameSite]||'Lax'}))}
+function makePayload(label,cookies,email){if(typeof email!=='string'||!/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(email.trim())||email.length>254)throw Error('请填写此登录状态所属的 Google 邮箱');email=email.trim().toLowerCase();label=label.trim();if(!label||label.length>80)throw Error('请填写1–80字备注');const normalized=normalizeCookies(cookies);for(const n of required){const found=normalized.filter(c=>c.name===n&&c.value);if(found.length!==1)throw Error('登录状态缺失或存在多组冲突 Cookie，请用单独浏览器配置登录后重试')}return {email,label,storage_state:{cookies:normalized,origins:[]},locale:'en-US',timezone:'America/Los_Angeles'}}
+const api={validateTarget,normalizeCookies,makePayload};if(typeof module!=='undefined')module.exports=api;else root.ImportCore=api;
+})(globalThis);

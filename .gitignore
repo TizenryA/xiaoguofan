@@ -25,3 +25,23 @@ go.work
 .idea/
 .DS_Store
 Thumbs.db
+
+
+# 小锅饭：禁止真实凭据、数据库、私有运维与测试会话入库
+xiaoguofan/.venv/
+xiaoguofan/**/__pycache__/
+xiaoguofan/.pytest_cache/
+xiaoguofan/.ruff_cache/
+xiaoguofan/**/*.pyc
+xiaoguofan/**/*.db*
+xiaoguofan/**/master.key
+xiaoguofan/**/credentials.json
+xiaoguofan/**/*.env
+xiaoguofan/**/.browser-credentials.json
+xiaoguofan/**/*sessions*.json
+xiaoguofan/**/*session*.json
+xiaoguofan/deploy/*-data/
+xiaoguofan/delivery/
+xiaoguofan/backups/
+xiaoguofan/runtime/
+xiaoguofan/deploy/withdrawn-*
