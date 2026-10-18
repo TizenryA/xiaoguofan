@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -58,11 +59,13 @@ class Store:
         if 'plan' not in columns:
             self.db.execute("ALTER TABLE accounts ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'")
         request_columns = {r[1] for r in self.db.execute('PRAGMA table_info(requests)')}
-        for name, ddl in [('account_id','TEXT'), ('generation','INTEGER')]:
+        for name, ddl in [('account_id','TEXT'), ('generation','INTEGER'), ('first_token_seconds','REAL')]:
             if name not in request_columns:
                 self.db.execute(f'ALTER TABLE requests ADD COLUMN {name} {ddl}')
         self.db.execute('CREATE INDEX IF NOT EXISTS idx_requests_owner_time ON requests(user_id,created)')
-        self.db.execute("INSERT OR IGNORE INTO users VALUES ('admin',NULL,'管理员','admin',0,0,0,?)", (time.time(),))
+        if 'avatar' not in {r[1] for r in self.db.execute('PRAGMA table_info(users)')}:
+            self.db.execute('ALTER TABLE users ADD COLUMN avatar TEXT')
+        self.db.execute("INSERT OR IGNORE INTO users(id,discord_id,name,role,disabled,verified,policy,created) VALUES ('admin',NULL,'管理员','admin',0,0,0,?)", (time.time(),))
         if not self.db.execute("SELECT 1 FROM metadata WHERE key='admin_hash'").fetchone():
             self.db.execute('INSERT INTO metadata VALUES (?,?)', ('admin_hash', PasswordHasher().hash(admin_password)))
         if not self.db.execute('SELECT 1 FROM settings').fetchone():
@@ -108,7 +111,7 @@ class Store:
             self.run('UPDATE settings SET payload=?,policy=? WHERE id=1', (self.encrypt(new), policy))
             self.audit('admin', 'settings_updated')
 
-    def discord_user(self, discord_id, name):
+    def discord_user(self, discord_id, name, avatar=None):
         with self.lock:
             u = self.one('SELECT * FROM users WHERE discord_id=?', (discord_id,))
             if not u:
@@ -116,6 +119,8 @@ class Store:
                          (uuid.uuid4().hex, discord_id, name[:100], 'user', time.time()))
             else:
                 self.run('UPDATE users SET name=? WHERE id=?', (name[:100], u['id']))
+            avatar = avatar if isinstance(avatar,str) and re.fullmatch(r'(?:a_)?[0-9a-f]{32}',avatar) else None
+            self.run('UPDATE users SET avatar=? WHERE discord_id=?',(avatar,discord_id))
             return self.one('SELECT * FROM users WHERE discord_id=?', (discord_id,))
 
     def mark_verified(self, uid, checked_policy=None):
@@ -181,7 +186,7 @@ class Store:
     def records(self, uid, limit=20, offset=0):
         self.cleanup()
         return {'total':self.one('SELECT COUNT(*) n FROM requests WHERE user_id=?', (uid,))['n'],
-                'items':self.all('SELECT r.model,r.status,r.duration,r.input_tokens,r.output_tokens,r.created,r.account_id,r.generation,a.label account_label FROM requests r LEFT JOIN accounts a ON a.id=r.account_id AND a.user_id=r.user_id WHERE r.user_id=? ORDER BY r.id DESC LIMIT ? OFFSET ?', (uid, limit, offset))}
+                'items':self.all('SELECT r.model,r.status,r.duration,r.first_token_seconds,r.input_tokens,r.output_tokens,r.created,r.account_id,r.generation,a.label account_label FROM requests r LEFT JOIN accounts a ON a.id=r.account_id AND a.user_id=r.user_id WHERE r.user_id=? ORDER BY r.id DESC LIMIT ? OFFSET ?', (uid, limit, offset))}
 
     def create_key(self, uid, label):
         with self.lock:
@@ -204,10 +209,10 @@ class Store:
     def audit(self, uid, action):
         self.run('INSERT INTO audit(actor,action,created) VALUES (?,?,?)', (uid, action, time.time()))
 
-    def record(self, uid, kid, model, status, duration, usage=None, account_id=None, generation=None):
+    def record(self, uid, kid, model, status, duration, usage=None, account_id=None, generation=None, first_token_seconds=None):
         usage = usage or {}
-        self.run('INSERT INTO requests(user_id,key_id,model,status,duration,input_tokens,output_tokens,created,account_id,generation) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                 (uid, kid, model[:120], status, duration, usage.get('input_tokens'), usage.get('output_tokens'), time.time(), account_id, generation))
+        self.run('INSERT INTO requests(user_id,key_id,model,status,duration,input_tokens,output_tokens,created,account_id,generation,first_token_seconds) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                 (uid, kid, model[:120], status, duration, usage.get('input_tokens'), usage.get('output_tokens'), time.time(), account_id, generation, first_token_seconds))
         self.run('DELETE FROM requests WHERE created<?', (time.time()-30*86400,))
 
     def cleanup(self):

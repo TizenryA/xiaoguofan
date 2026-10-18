@@ -29,7 +29,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.6.0'
+VERSION = '0.7.0'
 
 
 class Strict(BaseModel):
@@ -204,7 +204,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         response = await call_next(request)
         response.headers.update({'X-Content-Type-Options':'nosniff', 'Referrer-Policy':'no-referrer',
                                  'X-Frame-Options':'DENY', 'Cache-Control':'no-store',
-                                 'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"})
+                                 'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://cdn.discordapp.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"})
         return response
 
     @app.exception_handler(ValueError)
@@ -277,7 +277,11 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     @app.get('/api/me')
     def me(request: Request):
         u = auth(request)
-        return {k:u[k] for k in ['id','name','role','csrf']}
+        avatar_url = None
+        if u.get('discord_id'):
+            did=u['discord_id']
+            avatar_url = ('https://cdn.discordapp.com/avatars/'+did+'/'+u['avatar']+'.png?size=128') if u.get('avatar') else ('https://cdn.discordapp.com/embed/avatars/'+str((int(did)>>22)%6)+'.png')
+        return {k:u[k] for k in ['id','name','role','csrf']} | {'avatar_url':avatar_url}
 
     @app.get('/auth/discord')
     def discord_start(request: Request):
@@ -314,7 +318,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             raise HTTPException(503, 'Discord 返回无效')
         if not store.settings()['public_login']:
             raise HTTPException(403, '公共登录已关闭')
-        u = store.discord_user(str(profile['id']), name)
+        u = store.discord_user(str(profile['id']), name, profile.get('avatar'))
         if u['disabled']:
             raise HTTPException(403, '账号已禁用')
         if store.settings()['policy'] != s['policy']:
@@ -487,12 +491,12 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         u = auth(request)
         data = store.records(u['id'], 10000)['items']
         out = io.StringIO(); writer = csv.writer(out)
-        writer.writerow(['模型','状态','耗时秒','输入Token','输出Token','时间UTC','账号','请求类型'])
+        writer.writerow(['模型','状态','耗时秒','首字耗时秒','输入Token','输出Token','时间UTC','账号','请求类型'])
         for r in data:
             model = r['model']
             if model.lstrip().startswith(('=','+','-','@')):
                 model = "'"+model
-            writer.writerow([model,r['status'],r['duration'],r['input_tokens'],r['output_tokens'],time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime(r['created'])),
+            writer.writerow([model,r['status'],r['duration'],r['first_token_seconds'],r['input_tokens'],r['output_tokens'],time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime(r['created'])),
                              ("'" if (r['account_label'] or '').lstrip().startswith(('=','+','-','@')) else '')+(r['account_label'] or ('账号已删除' if r['account_id'] else '历史未归属')),
                              '生成调用' if r['generation']==1 else '查询 / 其他' if r['generation']==0 else '历史类型未记录'])
         from fastapi.responses import Response
@@ -537,6 +541,10 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                 parsed = dict(parsed, model=base_model)
                 parsed, synthetic_name = await inject(parsed)
                 body = json.dumps(parsed, ensure_ascii=True).encode()
+            if request.method == 'POST' and path == '/v1/chat/completions' and isinstance(parsed,dict) and parsed.get('stream') is True:
+                options=parsed.get('stream_options')
+                parsed=dict(parsed,stream_options=(options if isinstance(options,dict) else {}) | {'include_usage':True})
+                body=json.dumps(parsed,ensure_ascii=True).encode()
             if not model and path.startswith('/v1beta/models/'):
                 model = path.split('/models/',1)[1].split(':',1)[0]
             generation = request.method=='POST' and (path in ['/v1/chat/completions','/v1/completions','/v1/messages','/v1/responses','/v1/images/generations'] or ':generateContent' in path or ':streamGenerateContent' in path)
@@ -575,7 +583,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             raise HTTPException(503, '自己的账号池未就绪，账号可能失效；未使用其他用户账号') from None
 
         async def stream():
-            meter = UsageMeter()
+            meter = UsageMeter(started=start)
             status = response.status_code
             try:
                 async def output():
@@ -598,7 +606,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                 await client.aclose()
                 userlocks[u['id']].release()
                 active.discard(u['id'])
-                store.record(u['id'], u['key_id'], model, status, time.monotonic()-start, meter.finish(), account_id=aid, generation=generation)
+                store.record(u['id'], u['key_id'], model, status, time.monotonic()-start, meter.finish(), account_id=aid, generation=generation, first_token_seconds=meter.first_token_seconds if generation and status < 400 else None)
         return StreamingResponse(stream(), status_code=response.status_code,
             headers={'Content-Type':response.headers.get('content-type','application/json'), 'X-Accel-Buffering':'no'})
 
