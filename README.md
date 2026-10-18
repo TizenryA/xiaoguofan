@@ -19,6 +19,10 @@
 - Lite 只保留上传、额度、使用记录、账号管理四个入口。
 - 管理后台配置 Discord、社区屏蔽、可撤销朋友白名单与资源上限。
 
+## 0.7.2 官方窜改猴脚本
+
+上传页新增官方 Tampermonkey 脚本安装入口。AI Studio 页内手动检查→下载 JSON→返回门户上传，不使用扩展弹窗，不自动上传或持久保存凭据。脚本1.0.0使用 GM_cookie.list/GM.cookie.list，并验证必要Cookie及HttpOnly读取；官方文档注明HttpOnly目前限Beta支持，稳定版不保证可用。读不到则阻止导出。说明见 `xiaoguofan/userscript/使用说明.txt`。隔离数据下载/门户导入回归通过，未做手机官方窜改猴或真实Google登录验收。
+
 ## 0.7.1 扩展兼容修复
 
 扩展更新到 0.3.5：兼容回调式 Chrome API 和 Promise 式 browser API；防止未取得标签页时出现 `tab is undefined`，无独立窗口支持时改为新标签。更新需重新加载扩展，确认界面版本和邮箱输入框。通过真实桌面 Chrome 扩展 API 隔离测试；手机浏览器尚未实机验收，不承诺所有浏览器可用。
@@ -41,7 +45,7 @@
 ## 源码目录
 
 ```text
-xiaoguofan/             小锅饭门户 v0.7.1
+xiaoguofan/             小锅饭门户 v0.7.2
   portal/               FastAPI、账号隔离与 MD3 界面
   extension/            桌面浏览器主动导入扩展源码
   tests/                Python 与扩展核心测试
