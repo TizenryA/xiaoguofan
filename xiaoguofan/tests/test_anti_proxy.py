@@ -12,7 +12,7 @@ def test_alias_api_toggle_isolation_plain_and_stream_quota(tmp_path):
     calls=[]
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(json.dumps({'object':'list','data':[{'id':'gemini-4-argon'},{'id':'gemini-image'}]}).encode())
+            self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(json.dumps({'object':'list','data':[{'id':'gemini-4-argon','name':'Gemini 4 Argon','displayName':'Gemini 4 Argon'},{'id':'gemini-image','name':'Gemini Image'}]}).encode())
         def do_POST(self):
             b=json.loads(self.rfile.read(int(self.headers['Content-Length'])));calls.append(b)
             name=next((t['function']['name'] for t in b.get('tools',[]) if t['function']['name'].startswith('agw_emit_')),None)
@@ -41,7 +41,10 @@ def test_alias_api_toggle_isolation_plain_and_stream_quota(tmp_path):
             assert c.put('/api/preferences',json={'anti_truncation':True}).status_code==403
             r=c.put('/api/preferences',headers={'X-CSRF-Token':csrf},json={'anti_truncation':True});assert r.status_code==200,r.text
             assert c.put('/api/preferences',headers={'X-CSRF-Token':csrf},json={'anti_truncation':'false'}).status_code==422
-            assert '[防截断]gemini-4-argon' in [r['id'] for r in c.get('/v1/models',headers=h).json()['data']]
+            catalogue=c.get('/v1/models',headers=h).json()['data']
+            assert '[防截断]gemini-4-argon' in [r['id'] for r in catalogue]
+            assert [r['name'] for r in catalogue]==['Gemini 4 Argon','Gemini Image','[防截断]Gemini 4 Argon']
+            assert catalogue[-1]['displayName']=='[防截断]Gemini 4 Argon'
             assert '[防截断]' not in c.get('/v1/models',headers=h2).text
             for stream in [False,True]:
                 r=c.post('/v1/chat/completions',headers=h,json={'model':'[防截断]gemini-4-argon','messages':[{'role':'user','content':'fixture'}],'stream':stream});assert r.status_code==200,r.text

@@ -66,3 +66,15 @@ async def test_stream_restores_unicode_across_bytes_and_usage_and_real_tools():
     assert '思考' in raw
     assert raw.count('data: [DONE]')==1
     assert all(e.get('model',PREFIX+'gemini-3.8-flash')==PREFIX+'gemini-3.8-flash' for e in events)
+
+
+def test_alias_display_names_are_distinct_for_named_model_pickers():
+    original={'object':'list','data':[{'id':'gemini-4-argon','name':'Gemini 4 Argon','display_name':'Argon Label','displayName':'Argon Display','object':'model','capability_options':{'aliases':['gemini-argon']}}]}
+    out=augment_models(original)
+    base,alias=out['data']
+    assert base==original['data'][0]
+    assert alias['id']==PREFIX+'gemini-4-argon'
+    for field in ['name','display_name','displayName']:
+        assert alias[field]==PREFIX+base[field]
+    assert len({r['name']:r for r in out['data']})==2
+    assert augment_models(out)==out

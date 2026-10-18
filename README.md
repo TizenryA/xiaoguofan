@@ -19,6 +19,10 @@
 - Lite 只保留上传、额度、使用记录、账号管理四个入口。
 - 管理后台配置 Discord、社区屏蔽、可撤销朋友白名单与资源上限。
 
+## 0.7.4 防截断显示名修复
+
+防截断别名同时为`id`及上游存在的`name`/`display_name`/`displayName`加前缀，避免按显示名展示或合并模型的客户端仍看到普通名称。原模型保持不变，开关及租户隔离逻辑不变。113 Python与14 JS回归通过；升级后在客户端重新拉取模型列表。
+
 ## 0.7.3 修正窜改猴授权
 
 脚本1.0.1修正Cookie对象授权声明为`@grant GM_cookie` / `@grant GM.cookie`，原1.0.0误写`.list`导致官方Beta也不注入接口。已用官网下载的Beta 5.6.6242，在桌面Chromium实际安装脚本，通过真实GM_cookie读取隔离HttpOnly测试Cookie并下载JSON。不是手机或真实Google账号验收。更新脚本后需刷新AI Studio页面。
@@ -49,7 +53,7 @@
 ## 源码目录
 
 ```text
-xiaoguofan/             小锅饭门户 v0.7.3
+xiaoguofan/             小锅饭门户 v0.7.4
   portal/               FastAPI、账号隔离与 MD3 界面
   extension/            桌面浏览器主动导入扩展源码
   tests/                Python 与扩展核心测试

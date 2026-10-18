@@ -25,7 +25,13 @@ def augment_models(body):
     for row in out['data']:
         if not isinstance(row,dict) or not eligible(row.get('id')) or PREFIX+row['id'] in seen:
             continue
-        alias=copy.deepcopy(row);alias['id']=PREFIX+row['id'];added.append(alias);seen.add(alias['id'])
+        alias=copy.deepcopy(row)
+        alias['id']=PREFIX+row['id']
+        for field in ('name', 'display_name', 'displayName'):
+            if isinstance(alias.get(field), str) and alias[field] and not alias[field].startswith(PREFIX):
+                alias[field]=PREFIX+alias[field]
+        added.append(alias)
+        seen.add(alias['id'])
     out['data'].extend(added)
     return out
 
