@@ -39,8 +39,19 @@ def normalize_cookie(cookie):
     return result
 
 
+def validate_selected_identity(data):
+    state=data.get('storage_state',{})
+    identity=state.get('xiaoguofan_identity') if isinstance(state,dict) else None
+    if identity is None:return
+    if not isinstance(identity,dict) or set(identity)!={'email','gaia_id','authuser'}:
+        raise HTTPException(422,'账号选择信息格式无效，请重新导出')
+    if identity['email']!=account_email(data) or not isinstance(identity['gaia_id'],str) or not re.fullmatch(r'[0-9]{1,32}',identity['gaia_id']) or type(identity['authuser']) is not int or not 0<=identity['authuser']<=99:
+        raise HTTPException(422,'登录身份与邮箱不匹配，请重新导出；修改邮箱不能切换账号')
+
+
 def worker_payload(account):
     data=copy.deepcopy(account['payload'])
+    validate_selected_identity(data)
     email=account_email(data)
     if not email:
         raise HTTPException(422,'请在账号管理中补填该账号的 Google 邮箱后重试；无需重新上传凭据')

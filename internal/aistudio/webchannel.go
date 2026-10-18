@@ -430,6 +430,15 @@ func (t *WorkerProtectedTransport) OpenBidiProtected(
 	if err != nil {
 		return nil, err
 	}
+	state, err := lease.ReloadStorageState()
+	if err != nil {
+		return nil, err
+	}
+	authUser, err := ResolveSelectedAuthUser(ctx, client, state)
+	if err != nil {
+		return nil, err
+	}
+	protocolHeaders.Set("X-Goog-AuthUser", authUser)
 	rid, err := newWebChannelRID()
 	if err != nil {
 		return nil, err

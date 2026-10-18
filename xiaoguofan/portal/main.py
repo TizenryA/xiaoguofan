@@ -30,7 +30,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.7.5'
+VERSION = '0.8.0'
 
 
 class Strict(BaseModel):
@@ -386,6 +386,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         rate('import:'+u['id'], 6)
         p = payload.model_dump(exclude_none=True)
         validate_account(p)
+        from portal.accounts import validate_selected_identity
+        validate_selected_identity(p)
         async with userlocks[u['id']]:
             await workers.stop(u['id'])
             aid = store.add_account(u['id'], payload.label, p)
@@ -404,6 +406,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             await workers.stop(u['id'])
             if 'email' in values:
                 data = account['payload'] | {'email':values.pop('email')}
+                from portal.accounts import validate_selected_identity
+                validate_selected_identity(data)
                 store.run('UPDATE accounts SET payload=? WHERE user_id=? AND id=?', (store.encrypt(data),u['id'],aid))
                 values.update(status='unverified',checked=None,note='邮箱已更新，请重新检查')
             store.update_account(u['id'], aid, values)

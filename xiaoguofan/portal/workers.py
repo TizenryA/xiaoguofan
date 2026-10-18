@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from portal.accounts import worker_payload
 
-IMAGE = 'ghcr.io/mag1cfall/aistudio2api:v0.2.12@sha256:455673a62d02b85d019c856c6a98e20d05b99ff80ffbb1f8b24623873f4de96e'
+IMAGE = os.environ.get('PORTAL_WORKER_IMAGE', 'xiaoguofan-worker:0.8.0')
 
 
 class BrokerClient:

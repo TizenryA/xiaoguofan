@@ -123,7 +123,11 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 	}
 	runtime := &goWAARuntime{options: options, client: client, storage: storage}
 	runtime.profile, runtime.userAgent, runtime.acceptLanguage = profileFromFingerprint(fingerprint)
-	runtime.pageURL = aiStudioOrigin + "/prompts/new_chat?model=" + url.QueryEscape(options.Model)
+	authUser, err := ResolveSelectedAuthUser(ctx, client, storage)
+	if err != nil {
+		return nil, err
+	}
+	runtime.pageURL = aiStudioOrigin + "/prompts/new_chat?authuser=" + authUser + "&model=" + url.QueryEscape(options.Model)
 	if options.TemporaryChat {
 		runtime.pageURL += "&temporary=true"
 	}
@@ -157,7 +161,7 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 	runtime.headers = http.Header{}
 	runtime.headers.Set("user-agent", runtime.userAgent)
 	runtime.headers.Set("x-goog-api-key", apiKey)
-	runtime.headers.Set("x-goog-authuser", "0")
+	runtime.headers.Set("x-goog-authuser", authUser)
 	runtime.headers.Set("x-user-agent", "grpc-web-javascript/0.1")
 	runtime.headers.Set("x-aistudio-visit-id", visitID)
 	if extension != "" {
@@ -366,7 +370,11 @@ func (runtime *goWAARuntime) rpcHeaders(apiKey string) (http.Header, error) {
 	headers.Set("Referer", aiStudioOrigin+"/")
 	headers.Set("Content-Type", "application/json+protobuf")
 	headers.Set("X-Goog-Api-Key", apiKey)
-	headers.Set("X-Goog-AuthUser", "0")
+	authUser, err := ResolveSelectedAuthUser(context.Background(), runtime.client, runtime.cookies())
+	if err != nil {
+		return nil, err
+	}
+	headers.Set("X-Goog-AuthUser", authUser)
 	headers.Set("X-User-Agent", "grpc-web-javascript/0.1")
 	headers.Set("Authorization", authorization)
 	headers.Set("Origin", aiStudioOrigin)
@@ -622,14 +630,26 @@ func (runtime *goWAARuntime) Proof(ctx context.Context, digest string, prompt st
 
 // ProtocolHeaders 返回官网 GenerateContent 的六个公共头
 func (runtime *goWAARuntime) ProtocolHeaders(ctx context.Context) (http.Header, error) {
+	authUser, err := ResolveSelectedAuthUser(ctx, runtime.client, runtime.cookies())
+	if err != nil {
+		return nil, err
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return runtime.headers.Clone(), nil
+	headers := runtime.headers.Clone()
+	headers.Set("X-Goog-AuthUser", authUser)
+	return headers, nil
 }
 
 // SendProtected 以官网页面 fetch 的 Firefox 请求形状流式发送受保护请求
 func (runtime *goWAARuntime) SendProtected(ctx context.Context, rawURL string, headers http.Header, body []byte) (*camoufoxnative.ProtectedResponse, error) {
+	authUser, identityErr := ResolveSelectedAuthUser(ctx, runtime.client, runtime.cookies())
+	if identityErr != nil {
+		return nil, identityErr
+	}
+	headers = headers.Clone()
+	headers.Set("X-Goog-AuthUser", authUser)
 	request := headers.Clone()
 	request.Set("Accept", "*/*")
 	request.Set("Referer", aiStudioOrigin+"/")

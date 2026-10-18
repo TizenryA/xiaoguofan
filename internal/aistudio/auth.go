@@ -150,6 +150,9 @@ func WriteStorageState(filePath string, state StorageState) error {
 
 // Validate 校验 storage state 的浏览器字段
 func (s StorageState) Validate() error {
+	if _, err := s.SelectedIdentity(); err != nil {
+		return err
+	}
 	for index, cookie := range s.Cookies {
 		if strings.TrimSpace(cookie.Name) == "" || strings.TrimSpace(cookie.Domain) == "" {
 			return fmt.Errorf("storage state Cookie %d 缺少名称或域", index)

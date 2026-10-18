@@ -148,6 +148,19 @@ func (t *WorkerProtectedTransport) doBrowserPrepared(
 	}
 	headers := rpc.Header.Clone()
 	headers.Set("Authorization", authorization)
+	selectedState, err := lease.ReloadStorageState()
+	if err != nil {
+		return nil, err
+	}
+	client, err := t.transport.clientForProxy(lease.Account().EffectiveProxy(t.transport.globalProxy))
+	if err != nil {
+		return nil, err
+	}
+	authUser, err := ResolveSelectedAuthUser(ctx, client, selectedState)
+	if err != nil {
+		return nil, err
+	}
+	headers.Set("X-Goog-AuthUser", authUser)
 	if lease.CoolingDown(selection.ModelID) {
 		return nil, ErrAccountCoolingDown
 	}

@@ -186,11 +186,20 @@ func (t *MakerSuiteHTTPTransport) Do(ctx context.Context, rpc RPCRequest) (*RPCR
 	if err != nil {
 		return nil, releaseOnError(fmt.Errorf("创建 MakerSuite %s 请求: %w", rpc.Method, err))
 	}
-	request.Header = headers
 	client, err := t.clientForProxy(account.EffectiveProxy(t.globalProxy))
 	if err != nil {
 		return nil, releaseOnError(err)
 	}
+	state, err := lease.ReloadStorageState()
+	if err != nil {
+		return nil, releaseOnError(err)
+	}
+	authUser, err := ResolveSelectedAuthUser(ctx, client, state)
+	if err != nil {
+		return nil, releaseOnError(err)
+	}
+	headers.Set("X-Goog-AuthUser", authUser)
+	request.Header = headers
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, releaseOnError(fmt.Errorf("执行 MakerSuite %s 请求: %w", rpc.Method, err))

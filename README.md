@@ -19,6 +19,12 @@
 - Lite 只保留上传、额度、使用记录、账号管理四个入口。
 - 管理后台配置 Discord、社区屏蔽、可撤销朋友白名单与资源上限。
 
+## 0.8.0 多账号身份选择
+
+脚本 **1.1.0** 向 Google 固定账号列表接口核对填写的邮箱，导出 `storage_state.xiaoguofan_identity`（邮箱、Gaia ID、账号序号）。修改过的 Go worker 按邮箱和 Gaia ID 核对当前会话，并重新解析账号位置；权益查询、WAA、普通/受保护生成与 Bidi 使用所选身份，不再一律落到账号0。身份核对失败即报错，不降级到默认账号。旧文件和旧扩展没有绑定信息，仍只用默认账号0，选择账号需新版重新导出。门户 FREE/PRO 明确为手动参考额度，不是套餐识别。
+
+**选择账号不会缩小 Cookie 权限**：同一浏览器会话文件可能包含其他已登录 Google 账号权限，请用专用浏览器环境。导出只在本机下载，仍须手动上传。桌面官方 Tampermonkey Beta 真实GM接口+隔离双账号响应测试、119 Python、15 JS、Go aistudio/api/app包回归通过；未验证手机实机、真实Google PRO或4a生成。未借用其他用户账号测试。
+
 ## 0.7.5 Playground / Build 分开
 
 按上游`channels`元数据把模型ID和显示名分为`-pg`、`-build`；防截断版本保留后缀。发起请求时剥离后缀并让本人worker通过`UPSTREAM_CHANNELS`只启用指定通道，不跨通道借用；同一租户只保留一个worker，切换通道会重建。旧无后缀ID仍走默认调度；上游无渠道证据的模型保留原样，不编造可用渠道。额度统计归一回原模型。117 Python及14 JS回归通过，部署后真实Docker运行时配置验证两条单渠道；未使用其他用户账号做Google真实生成。
@@ -57,7 +63,7 @@
 ## 源码目录
 
 ```text
-xiaoguofan/             小锅饭门户 v0.7.5
+xiaoguofan/             小锅饭门户 v0.8.0
   portal/               FastAPI、账号隔离与 MD3 界面
   extension/            桌面浏览器主动导入扩展源码
   tests/                Python 与扩展核心测试
@@ -69,7 +75,7 @@ LICENSE                 保留原作者 MIT 版权声明
 THIRD_PARTY_NOTICES.md   来源与素材说明
 ```
 
-小锅饭门户调用固定版本的上游 worker 镜像，**并非把根目录 Go 程序直接当作多租户门户运行**。两者部署方式不同；原版使用说明见 [原项目 README](README_upstream.md)。
+小锅饭门户调用带本仓库身份适配补丁的 worker 镜像（默认 `xiaoguofan-worker:0.8.0`，先在根目录 `docker build -t xiaoguofan-worker:0.8.0 .` 构建；可用 broker 环境变量 `PORTAL_WORKER_IMAGE` 指定），**并非把根目录 Go 程序直接当作多租户门户运行**。两者部署方式不同；原版使用说明见 [原项目 README](README_upstream.md)。
 
 ## 开始部署
 

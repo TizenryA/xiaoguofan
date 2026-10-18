@@ -10,7 +10,7 @@ from portal.main import create_app
 
 def test_userscript_output_accepted_by_real_import_endpoint(tmp_path):
     script=Path(__file__).parents[1]/'portal/static/aistudio-export.user.js'
-    code="""const {buildExport}=require(process.argv[1]);const cookies=['SAPISID','__Secure-1PAPISID','__Secure-3PAPISID','SID'].map(name=>({name,value:'FIXTURE-NOT-REAL-GOOGLE',domain:'.google.com',path:'/',session:false,expirationDate:2000000000,httpOnly:name==='SID',secure:true,sameSite:'no_restriction'}));process.stdout.write(JSON.stringify(buildExport('fixture@example.com','Userscript Fixture',cookies)));"""
+    code="""const {buildExport}=require(process.argv[1]);const cookies=['SAPISID','__Secure-1PAPISID','__Secure-3PAPISID','SID'].map(name=>({name,value:'FIXTURE-NOT-REAL-GOOGLE',domain:'.google.com',path:'/',session:false,expirationDate:2000000000,httpOnly:name==='SID',secure:true,sameSite:'no_restriction'}));process.stdout.write(JSON.stringify(buildExport('fixture@example.com','Userscript Fixture',cookies,{email:'fixture@example.com',gaia_id:'222',authuser:1})));"""
     data=json.loads(subprocess.check_output(['node','-e',code,str(script)],text=True))
     class Broker:
         async def stop(self,uid):return {'ok':True}
@@ -21,5 +21,10 @@ def test_userscript_output_accepted_by_real_import_endpoint(tmp_path):
         r=c.post('/lite/api/accounts/import',json=data,headers={'X-CSRF-Token':csrf})
         assert r.status_code==201,r.text
         rows=c.get('/lite/api/accounts').json();assert len(rows)==1 and rows[0]['email']=='fixture@example.com'
+        account=s.account(u['id'],rows[0]['id'])
+        assert account['payload']['storage_state']['xiaoguofan_identity']=={'email':'fixture@example.com','gaia_id':'222','authuser':1}
+        assert 'xiaoguofan_identity' not in c.get('/lite/api/accounts').text
+        rejected=c.patch('/lite/api/accounts/'+rows[0]['id'],json={'email':'other@example.com'},headers={'X-CSRF-Token':csrf})
+        assert rejected.status_code==422
         public=c.get('/lite/static/aistudio-export.user.js');assert public.status_code==200 and '@grant        GM_cookie\n' in public.text
         assert '/static/aistudio-export.user.js' in c.get('/lite').text

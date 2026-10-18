@@ -1,28 +1,31 @@
-小锅饭 AI Studio 登录文件导出 1.0.1
+小锅饭 AI Studio 登录文件导出 1.1.0
 作者：渡鸦4455
 
 安装：
-1. 安装官方 Tampermonkey（窜改猴），允许它在 AI Studio 运行。
-2. 打开安装地址：https://aistudio.tizenty.xyz/lite/static/aistudio-export.user.js
-3. 如果只看到源码，在窜改猴中新建脚本，用完整源码替换后保存。ZIP文件请先解压。
-4. 同一浏览器只登录一个专用 Google 账号，打开 https://aistudio.google.com/ 并刷新。
+1. 安装官方 Tampermonkey，允许在 AI Studio 运行。
+2. 安装 https://aistudio.tizenty.xyz/lite/static/aistudio-export.user.js?v=1.1.0
+3. 更新时确认新增的 accounts.google.com 身份查询权限，然后刷新 AI Studio。
+4. 如果只显示源码，在窜改猴中新建脚本，完整粘贴保存。ZIP请先解压。
 
-导出：
-1. 点右下“小锅饭 · 导出 JSON”，也可以从窜改猴菜单进入。
-2. 填当前账号邮箱和备注。邮箱只是标记，不会切换浏览器里的Google账号。
-3. 阅读并勾选风险确认，点“检查登录数据”。
-4. 字段检查通过后点“下载 JSON”。
-5. 回小锅饭的“上传”页，填写相同邮箱及备注，选下载文件并上传。
-6. 上传完成后删除下载目录、云同步和回收站里的登录文件。
+使用：
+1. 登录自己的 Google 账号，打开 https://aistudio.google.com/ 。
+2. 点“小锅饭 · 导出 JSON”。
+3. 填要使用的已登录邮箱及备注，勾选授权。
+4. 检查会向 Google 查询该浏览器的登录账号，并核对邮箱与 Google 账号ID。
+5. 身份及必要 Cookie 检查通过后下载 JSON。
+6. 小锅饭上传页填写相同邮箱，上传新文件。
+7. 多个账号可分别导出，不能只改邮箱复用旧JSON。
+8. 上传后删除下载目录、云同步和回收站中的登录文件。
 
-重要限制：
-- 使用官方 GM_cookie.list / GM.cookie.list，不使用网页document.cookie作为替代。
-- 官方文档当前注明：HttpOnly Cookie 读取仅Beta支持。即使是官方稳定版，也不保证可用。若提示缺接口或读不到HttpOnly，本脚本会阻止下载。
-- 不自动上传、不访问外部API、不保存Cookie到浏览器持久存储、不显示Cookie原值。
-- JSON是高敏感账号通行证，只给你信任的小锅饭站点；不要发群里。
-- 字段通过和导出成功不代表Google会话有效、模型有权限或生成成功。
-- 1.0.1修正权限声明：@grant GM_cookie 与 @grant GM.cookie，不能写成 .list。
-- 已加载官网下载的Tampermonkey Beta 5.6.6242，在桌面Chromium通过真实GM_cookie接口读取HttpOnly测试Cookie并下载JSON。测试Cookie为隔离假数据，非真实Google会话。
-- Node字段映射/失败拦截、三尺寸下载交互、门户导入测试通过；手机实机和真实Google登录仍未验收。
+变化与限制：
+- 文件带 xiaoguofan_identity；服务端按邮箱+Google账号ID核对实时账号位置。
+- 权益查询、WAA及生成使用同一身份；身份不匹配或查询失败时拒绝，不默认切回0。
+- 原文件及旧扩展没有账号绑定信息，仍只使用默认账号0；需要选择账号时用新版重新导出。
+- 仅向 accounts.google.com 固定接口查询身份，不自动上传 Cookie 到小锅饭，不持久存储或展示原值。
+- 选择账号不缩小 Cookie 权限！文件可能包含整个浏览器Google会话，影响多个已登录账号。强烈建议专用浏览器环境，不混入重要账号。
+- JSON是高敏感通行证，仅给可信站点，绝不能发群里。
+- 官方文档当前注明 HttpOnly读取仅Beta支持；接口缺失或必要字段不完整时禁止下载。
+- 桌面官方Tampermonkey Beta真实GM接口+隔离双账号响应、HttpOnly测试Cookie下载通过。不是Google真实登录/PRO/生成验收，也不是手机实机验收。
+- 门户显示的FREE/PRO是手动参考额度，不是Google套餐自动识别，不代表模型权限。
 
 官方文档：https://www.tampermonkey.net/documentation.php?locale=en&q=GM_cookie
