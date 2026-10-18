@@ -33,8 +33,8 @@ class BrokerClient:
                 raise HTTPException(r.status_code, detail)
             return r.json()
 
-    async def ensure(self, uid, accounts, limit):
-        return await self.call('/ensure', {'uid': uid, 'accounts': accounts, 'limit': limit})
+    async def ensure(self, uid, accounts, limit, channel=''):
+        return await self.call('/ensure', {'uid': uid, 'accounts': accounts, 'limit': limit, 'channel': channel})
 
     async def stop(self, uid):
         return await self.call('/stop', {'uid': uid})
@@ -76,7 +76,9 @@ class WorkerManager:
                 if time.time()-v['used'] > 900:
                     await self.stop(old)
 
-    async def ensure(self, uid, accounts, limit):
+    async def ensure(self, uid, accounts, limit, channel=''):
+        if channel not in ('', 'playground', 'build'):
+            raise ValueError('invalid worker channel')
         payloads = [worker_payload(a) for a in accounts]
         async with self.lock:
             # A worker's lifetime is bounded; no fallback to another tenant is ever possible.
@@ -86,7 +88,7 @@ class WorkerManager:
             revision = [a['id'] for a in accounts]
             if uid in self.items:
                 v = self.items[uid]
-                if v['revision'] == revision:
+                if v['revision'] == revision and v.get('channel', '') == channel:
                     v['used'] = time.time()
                     return {'url': v['url'], 'key': v['key']}
                 await self.stop(uid)
@@ -107,7 +109,7 @@ class WorkerManager:
                     '-e', 'ADMIN_AUTH_ENABLED=true', '-e', 'ADMIN_USERNAME=admin', '-e', 'ADMIN_PASSWORD='+password,
                     '-e', 'PROXY_API_KEY='+key, '-e', 'LOG_FILE=false', '-e', 'REQUEST_BODY_LOG=false',
                     '-e', 'MAX_ACTIVE_WORKERS=1', '-e', 'WARM_WORKER_LIMIT=1', '-e', 'WARM_STARTUP_CONCURRENCY=1',
-                    '-e', 'PER_ACCOUNT_CONCURRENCY=1',
+                    '-e', 'PER_ACCOUNT_CONCURRENCY=1', '-e', 'UPSTREAM_CHANNELS='+(channel or 'playground,build'),
                     '-e', 'INIT_TIMEOUT=2m', '-e', 'REQUEST_TIMEOUT=5m', IMAGE)
                 port = (await self.docker('port', name, '2048/tcp')).strip().split(':')[-1]
                 if not port.isdigit():
@@ -133,7 +135,7 @@ class WorkerManager:
                     if accounts:
                         r = await c.post('/api/control/start')
                         r.raise_for_status()
-                self.items[uid] = {'url': url, 'key': key, 'revision': revision, 'used': time.time()}
+                self.items[uid] = {'url': url, 'key': key, 'revision': revision, 'channel': channel, 'used': time.time()}
                 return {'url': url, 'key': key}
             except BaseException as exc:
                 import logging
@@ -186,6 +188,9 @@ def create_broker():
             return {'ok': True}
         if action != 'ensure' or not isinstance(p.get('accounts'), list) or len(p['accounts']) > 20:
             raise HTTPException(400)
-        return await manager.ensure(uid, p['accounts'], min(8, max(1, int(p.get('limit', 6)))))
+        channel = p.get('channel', '')
+        if channel not in ('', 'playground', 'build'):
+            raise HTTPException(400, 'invalid worker channel')
+        return await manager.ensure(uid, p['accounts'], min(8, max(1, int(p.get('limit', 6)))), channel=channel)
 
     return app

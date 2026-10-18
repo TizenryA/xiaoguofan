@@ -2,6 +2,8 @@
 import time
 from datetime import datetime, timedelta, timezone
 
+from portal.channels import split_model
+
 CST=timezone(timedelta(hours=8))
 
 
@@ -10,7 +12,7 @@ def day_start(now):
 
 
 def model_group(model):
-    name=model.removeprefix('[防截断]').removeprefix('models/')
+    name,_=split_model(model.removeprefix('[防截断]').removeprefix('models/'))
     if name in {'4a','gemini-4-argon'}:return '4a'
     if name in {'3.8f','gemini-3.8-flash'}:return '3.8f'
     return 'other'

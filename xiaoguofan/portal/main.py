@@ -23,13 +23,14 @@ from starlette.routing import Mount, compile_path
 
 from portal.accounts import normalize_cookie, normalize_email
 from portal.anti_truncation import PREFIX, augment_models, eligible, inject, normalize, transform_stream
+from portal.channels import split_catalogue, split_model
 from portal.oauth import OAuthStates, discord_identity
 from portal.quota import choose_account, reference_quota
 from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.7.4'
+VERSION = '0.7.5'
 
 
 class Strict(BaseModel):
@@ -522,11 +523,17 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         except ValueError:
             pass
         model = str(parsed.get('model','')) if isinstance(parsed,dict) else ''
+        path_model = ''
+        if not model and path.startswith(('/v1beta/models/', '/v1/models/')):
+            path_model = path.split('/models/', 1)[1].split(':', 1)[0]
+            model = path_model
         anti = model.startswith(PREFIX)
         enabled = store.preferences(u['id'])['anti_truncation']
-        base_model = model.removeprefix(PREFIX) if anti else model
+        base_model, channel = split_model(model.removeprefix(PREFIX) if anti else model)
         if anti and (not enabled or request.method != 'POST' or path != '/v1/chat/completions' or not eligible(base_model)):
             raise HTTPException(400, '请先开启防截断，仅支持带前缀的 OpenAI 聊天模型')
+        if channel and path_model:
+            path = path.replace('/models/'+path_model, '/models/'+base_model, 1)
         if not anti and PREFIX in path:
             raise HTTPException(400, '防截断模型仅支持 OpenAI /v1/chat/completions')
         if len(active) >= s['global_concurrency'] or userlocks[u['id']].locked():
@@ -537,6 +544,9 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         aid, generation, synthetic_name, buffered = None, False, '', None
         client = httpx.AsyncClient(timeout=httpx.Timeout(330, connect=15), follow_redirects=False)
         try:
+            if channel and isinstance(parsed, dict):
+                parsed = dict(parsed, model=base_model)
+                body = json.dumps(parsed, ensure_ascii=True).encode()
             if anti:
                 parsed = dict(parsed, model=base_model)
                 parsed, synthetic_name = await inject(parsed)
@@ -551,7 +561,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             accounts = [store.account(u['id'], a['id']) for a in store.accounts(u['id']) if a['enabled']]
             selected=choose_account(accounts,store,u['id'],base_model or model)
             aid=selected['id'] if selected else None
-            worker = await workers.ensure(u['id'], [selected] if selected else [], s['max_workers'])
+            worker_args = (u['id'], [selected] if selected else [], s['max_workers'])
+            worker = await workers.ensure(*worker_args, channel=channel) if channel else await workers.ensure(*worker_args)
             # User supplied cookies, upstream keys, forwarding headers and target URLs never pass through.
             headers = {'Authorization':'Bearer '+worker['key']}
             for h in ['content-type','accept','anthropic-version']:
@@ -560,7 +571,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             params = [(k,v) for k,v in request.query_params.multi_items() if k not in ['key','api_key']]
             req = client.build_request(request.method, worker['url']+path, params=params, headers=headers, content=body)
             response = await client.send(req, stream=True)
-            catalogue = request.method == 'GET' and path == '/v1/models' and enabled
+            catalogue = request.method == 'GET' and path == '/v1/models'
             if response.is_success and (catalogue or (anti and 'text/event-stream' not in response.headers.get('content-type',''))):
                 raw_response = bytearray()
                 async for part in response.aiter_bytes():
@@ -568,7 +579,11 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                     if len(raw_response) > 16 * 1024 * 1024:
                         raise ValueError('防截断响应过大')
                 payload = json.loads(raw_response)
-                result = augment_models(payload) if catalogue else await normalize(payload, synthetic_name, model)
+                if catalogue:
+                    result = split_catalogue(payload)
+                    if enabled:result = augment_models(result)
+                else:
+                    result = await normalize(payload, synthetic_name, model)
                 buffered = json.dumps(result, ensure_ascii=False).encode()
         except BaseException as exc:
             await client.aclose()
