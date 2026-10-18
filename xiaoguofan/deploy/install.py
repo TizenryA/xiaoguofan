@@ -4,6 +4,8 @@ import pathlib
 import secrets
 import subprocess
 
+# Validate runtime before touching services or persisted data.
+subprocess.run(['node','--version'],check=True,stdout=subprocess.DEVNULL)
 ROOT=pathlib.Path('/data/aistudio-portal')
 SOURCE=pathlib.Path('/data/aistudio-portal-src')
 ROOT.mkdir(mode=0o700,exist_ok=True)

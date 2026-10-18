@@ -6,12 +6,14 @@ import threading
 import time
 
 import httpx
+import pytest
 import uvicorn
 
 from portal.main import create_app
 
 
-def test_live_sse_disconnect_releases_user_and_global_slots(tmp_path):
+@pytest.mark.parametrize('anti',[False,True])
+def test_live_sse_disconnect_releases_user_and_global_slots(tmp_path,anti):
     seen=[]
     class Upstream(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
@@ -35,7 +37,7 @@ def test_live_sse_disconnect_releases_user_and_global_slots(tmp_path):
     users=[store.discord_user(str(100000000000000001+i),'user'+str(i)) for i in range(3)]
     keys=[]
     for u in users:
-        store.add_account(u['id'],'own',{});keys.append(store.create_key(u['id'],'test')['key'])
+        store.add_account(u['id'],'own',{});keys.append(store.create_key(u['id'],'test')['key']);store.save_preferences(u['id'],anti)
     sock=socket.socket();sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
     server=uvicorn.Server(uvicorn.Config(app,log_level='critical',access_log=False))
     thread=threading.Thread(target=lambda:server.run(sockets=[sock]),daemon=True);thread.start()
@@ -46,7 +48,7 @@ def test_live_sse_disconnect_releases_user_and_global_slots(tmp_path):
     async def exercise():
         async with httpx.AsyncClient(base_url=f'http://127.0.0.1:{port}',timeout=5) as c:
             async def request(i):
-                return await c.send(c.build_request('POST','/v1/chat/completions',headers={'Authorization':'Bearer '+keys[i]},json={'model':'fixture','stream':True}),stream=True)
+                return await c.send(c.build_request('POST','/v1/chat/completions',headers={'Authorization':'Bearer '+keys[i]},json={'model':('[防截断]' if anti else '')+'fixture','stream':True}),stream=True)
             a=await request(0);assert a.status_code==200
             lines=a.aiter_lines()
             assert 'fixture' in (await anext(lines))

@@ -18,21 +18,26 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from starlette.routing import Mount, compile_path
 
 from portal.accounts import normalize_cookie, normalize_email
+from portal.anti_truncation import PREFIX, augment_models, eligible, inject, normalize, transform_stream
 from portal.oauth import OAuthStates, discord_identity
 from portal.quota import choose_account, reference_quota
 from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.5.1'
+VERSION = '0.6.0'
 
 
 class Strict(BaseModel):
     model_config = ConfigDict(extra='forbid')
+
+
+class Preferences(Strict):
+    anti_truncation: StrictBool
 
 
 class Login(Strict):
@@ -454,6 +459,14 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     def stats(request: Request):
         return store.stats(auth(request)['id'])
 
+    @app.get('/api/preferences')
+    def get_preferences(request: Request):
+        return store.preferences(auth(request)['id'])
+
+    @app.put('/api/preferences')
+    def put_preferences(request: Request, values: Preferences):
+        return store.save_preferences(auth(request, csrf=True)['id'], values.anti_truncation)
+
     @app.get('/api/quota')
     def quota(request: Request):
         u = auth(request)
@@ -498,22 +511,37 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             raise HTTPException(503, '未导入自己的 Google 账号，不会使用其他用户账号')
         if len(active) >= s['global_concurrency'] or userlocks[u['id']].locked():
             raise HTTPException(429, '当前请求繁忙，请稍后重试')
+        body = await request.body()
+        parsed = None
+        try:
+            parsed = json.loads(body) if body else None
+        except ValueError:
+            pass
+        model = str(parsed.get('model','')) if isinstance(parsed,dict) else ''
+        anti = model.startswith(PREFIX)
+        enabled = store.preferences(u['id'])['anti_truncation']
+        base_model = model.removeprefix(PREFIX) if anti else model
+        if anti and (not enabled or request.method != 'POST' or path != '/v1/chat/completions' or not eligible(base_model)):
+            raise HTTPException(400, '请先开启防截断，仅支持带前缀的 OpenAI 聊天模型')
+        if not anti and PREFIX in path:
+            raise HTTPException(400, '防截断模型仅支持 OpenAI /v1/chat/completions')
+        if len(active) >= s['global_concurrency'] or userlocks[u['id']].locked():
+            raise HTTPException(429, '当前请求繁忙，请稍后重试')
         active.add(u['id'])
         await userlocks[u['id']].acquire()
-        start, model = time.monotonic(), ''
-        aid, generation = None, False
+        start = time.monotonic()
+        aid, generation, synthetic_name, buffered = None, False, '', None
         client = httpx.AsyncClient(timeout=httpx.Timeout(330, connect=15), follow_redirects=False)
         try:
-            body = await request.body()
-            try:
-                model = str(json.loads(body).get('model','')) if body else ''
-            except (ValueError, AttributeError):
-                pass
+            if anti:
+                parsed = dict(parsed, model=base_model)
+                parsed, synthetic_name = await inject(parsed)
+                body = json.dumps(parsed, ensure_ascii=True).encode()
             if not model and path.startswith('/v1beta/models/'):
                 model = path.split('/models/',1)[1].split(':',1)[0]
             generation = request.method=='POST' and (path in ['/v1/chat/completions','/v1/completions','/v1/messages','/v1/responses','/v1/images/generations'] or ':generateContent' in path or ':streamGenerateContent' in path)
             accounts = [store.account(u['id'], a['id']) for a in store.accounts(u['id']) if a['enabled']]
-            selected=choose_account(accounts,store,u['id'],model)
+            selected=choose_account(accounts,store,u['id'],base_model or model)
             aid=selected['id'] if selected else None
             worker = await workers.ensure(u['id'], [selected] if selected else [], s['max_workers'])
             # User supplied cookies, upstream keys, forwarding headers and target URLs never pass through.
@@ -524,6 +552,16 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             params = [(k,v) for k,v in request.query_params.multi_items() if k not in ['key','api_key']]
             req = client.build_request(request.method, worker['url']+path, params=params, headers=headers, content=body)
             response = await client.send(req, stream=True)
+            catalogue = request.method == 'GET' and path == '/v1/models' and enabled
+            if response.is_success and (catalogue or (anti and 'text/event-stream' not in response.headers.get('content-type',''))):
+                raw_response = bytearray()
+                async for part in response.aiter_bytes():
+                    raw_response.extend(part)
+                    if len(raw_response) > 16 * 1024 * 1024:
+                        raise ValueError('防截断响应过大')
+                payload = json.loads(raw_response)
+                result = augment_models(payload) if catalogue else await normalize(payload, synthetic_name, model)
+                buffered = json.dumps(result, ensure_ascii=False).encode()
         except BaseException as exc:
             await client.aclose()
             userlocks[u['id']].release()
@@ -540,7 +578,16 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             meter = UsageMeter()
             status = response.status_code
             try:
-                async for chunk in response.aiter_bytes():
+                async def output():
+                    if buffered is not None:
+                        yield buffered
+                    elif anti and response.is_success and 'text/event-stream' in response.headers.get('content-type',''):
+                        async for part in transform_stream(response.aiter_bytes(), synthetic_name, model):
+                            yield part
+                    else:
+                        async for part in response.aiter_bytes():
+                            yield part
+                async for chunk in output():
                     meter.feed(chunk)
                     yield chunk
             except BaseException:

@@ -10,6 +10,10 @@
 
 xiaoguofan/ 中门户、扩展、测试、部署脚本由渡鸦4455维护，采用 MIT，见 LICENSE-XIAOGUOFAN。依赖库按各自许可证使用。
 
+## 防截断核心
+
+`xiaoguofan/portal/anti_core/synthetic/` 融合自 damoshen123/Antigravity-anti-truncation-gateway-node，提交 e66dbbb4ae79b9366136b1dc41bdb9e922140941，MIT 许可保留于该目录 LICENSE。其设计来源为 Xeltra233/Antigravity-anti-truncation-gateway。小锅饭适配详见同目录 NOTICE.md。
+
 ## 插画与品牌
 
 登录欢迎图、猫娘拒绝图为站点维护者提供的展示素材，保留相关权利，**不因程序源码使用 MIT 而自动获得 MIT 授权**。本项目不声称素材为上游作者所作；其他部署者请自行确认使用权或替换为自有图片。

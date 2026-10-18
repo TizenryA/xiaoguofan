@@ -19,10 +19,18 @@
 - Lite 只保留上传、额度、使用记录、账号管理四个入口。
 - 管理后台配置 Discord、社区屏蔽、可撤销朋友白名单与资源上限。
 
-## 目录
+## 防截断模型（0.6.0）
+
+在 Lite「账号管理 → 防截断模式」开启，刷新客户端模型列表，即可选用 `[防截断]gemini-4-argon`、`[防截断]gemini-3.8-flash` 等前缀模型。普通模型原样保留；关闭后前缀模型不再显示或接受调用。
+
+核心直接融合自 [Antigravity-anti-truncation-gateway-node](https://github.com/damoshen123/Antigravity-anti-truncation-gateway-node)，不是另一个外部网关。支持 OpenAI Chat Completions 普通/流式文本回复，不支持 Responses/Gemini 原生接口和图片音频模型；不自动重试。仍只使用本人账号，前缀模型与原模型合并参考额度计数。
+
+需要 Node.js 18+，通过私有管道运行内置转换组件，不监听新端口。来源和 MIT 许可见 `xiaoguofan/portal/anti_core/NOTICE.md` 和 `LICENSE`。防截断不能保证消除所有截断，也不能突破模型硬限制。
+
+## 源码目录
 
 ```text
-xiaoguofan/             小锅饭门户 v0.5.1
+xiaoguofan/             小锅饭门户 v0.6.0
   portal/               FastAPI、账号隔离与 MD3 界面
   extension/            桌面浏览器主动导入扩展源码
   tests/                Python 与扩展核心测试

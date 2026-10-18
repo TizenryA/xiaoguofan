@@ -45,6 +45,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS sessions(hash TEXT PRIMARY KEY, user_id TEXT, csrf TEXT, expires REAL);
         CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY, payload TEXT, policy INTEGER DEFAULT 1);
         CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS preferences(user_id TEXT PRIMARY KEY, anti_truncation INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, user_id TEXT, key_id TEXT, model TEXT, status INTEGER, duration REAL,
           input_tokens INTEGER, output_tokens INTEGER, created REAL);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, actor TEXT, action TEXT, created REAL);
@@ -124,6 +125,14 @@ class Store:
                 return False
             self.run('UPDATE users SET verified=?,policy=? WHERE id=?', (time.time(), current, uid))
             return True
+
+    def preferences(self, uid):
+        row = self.one('SELECT anti_truncation FROM preferences WHERE user_id=?', (uid,))
+        return {'anti_truncation': bool(row and row['anti_truncation'])}
+
+    def save_preferences(self, uid, enabled):
+        self.run('INSERT INTO preferences(user_id,anti_truncation) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET anti_truncation=excluded.anti_truncation', (uid, int(enabled)))
+        return self.preferences(uid)
 
     def user(self, uid):
         return self.one('SELECT * FROM users WHERE id=?', (uid,))
