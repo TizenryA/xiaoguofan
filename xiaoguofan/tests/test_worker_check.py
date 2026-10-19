@@ -6,15 +6,15 @@ import pytest
 from portal.workers import BrokerClient, WorkerManager
 
 
-def test_check_stops_worker_when_catalog_request_fails(monkeypatch):
+def test_check_releases_worker_when_catalog_request_fails(monkeypatch):
     calls=[]
     class Broker(BrokerClient):
-        async def ensure(self,*args):return {'url':'http://worker','key':'k'}
-        async def stop(self,uid):calls.append(uid)
+        async def ensure(self,*args,**kwargs):return {'url':'http://worker','key':'k','lease':'lease1'}
+        async def release(self,uid,lease):calls.append((uid,lease))
     async def fail(*args,**kwargs):raise httpx.ConnectError('network')
     monkeypatch.setattr(httpx.AsyncClient,'get',fail)
     with pytest.raises(httpx.ConnectError):asyncio.run(Broker().check('alice',{},1))
-    assert calls==['alice']
+    assert calls==[('alice','lease1')]
 
 
 def test_worker_cancelled_start_removes_created_container(tmp_path):

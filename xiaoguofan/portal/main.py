@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -30,7 +31,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.8.2'
+VERSION = '0.9.0'
 
 
 class Strict(BaseModel):
@@ -87,8 +88,8 @@ class Settings(Strict):
     requests_per_minute: int = Field(default=20, ge=1, le=120)
     max_accounts: int = Field(default=5, ge=1, le=20)
     max_keys: int = Field(default=10, ge=1, le=30)
-    max_workers: int = Field(default=6, ge=1, le=8)
-    global_concurrency: int = Field(default=3, ge=1, le=4)
+    max_workers: int = Field(default=6, ge=1, le=100)
+    global_concurrency: int = Field(default=3, ge=1, le=100)
 
     @field_validator('discord_allowlist')
     @classmethod
@@ -495,6 +496,20 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     def records(request: Request, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000)):
         return store.records(auth(request)['id'], limit, offset)
 
+    @app.get('/api/load')
+    async def project_load(request: Request):
+        auth(request)
+        from portal.resources import ProjectResources
+        try:
+            data = await asyncio.wait_for(workers.load(), 3)
+        except Exception:
+            data = ProjectResources('/nonexistent-xiaoguofan-metrics').snapshot()
+            data['pool'] = {'running':None,'active':None,'idle':None,'starting':None,'evictions':None}
+        data['pool']['limit'] = store.settings()['max_workers']
+        data['requests'] = {'active':len(active), 'limit':store.settings()['global_concurrency']}
+        data['refresh_seconds'] = 3
+        return JSONResponse(data,headers={'Cache-Control':'no-store'})
+
     @app.get('/api/records.csv')
     def records_csv(request: Request):
         import csv
@@ -552,6 +567,14 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         await userlocks[u['id']].acquire()
         start = time.monotonic()
         aid, generation, synthetic_name, buffered = None, False, '', None
+        worker = None
+
+        async def release_worker():
+            if worker and worker.get('lease'):
+                try:
+                    await asyncio.shield(workers.release(u['id'], worker['lease']))
+                except Exception:
+                    logging.getLogger(__name__).error('worker lease release failed')
         client = httpx.AsyncClient(timeout=httpx.Timeout(330, connect=15), follow_redirects=False)
         try:
             if channel and isinstance(parsed, dict):
@@ -572,7 +595,10 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             selected=choose_account(accounts,store,u['id'],base_model or model)
             aid=selected['id'] if selected else None
             worker_args = (u['id'], [selected] if selected else [], s['max_workers'])
-            worker = await workers.ensure(*worker_args, channel=channel) if channel else await workers.ensure(*worker_args)
+            if hasattr(workers, 'acquire'):
+                worker = await workers.acquire(*worker_args, channel=channel)
+            else:
+                worker = await workers.ensure(*worker_args, channel=channel) if channel else await workers.ensure(*worker_args)
             # User supplied cookies, upstream keys, forwarding headers and target URLs never pass through.
             headers = {'Authorization':'Bearer '+worker['key']}
             for h in ['content-type','accept','anthropic-version']:
@@ -596,6 +622,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                     result = await normalize(payload, synthetic_name, model)
                 buffered = json.dumps(result, ensure_ascii=False).encode()
         except BaseException as exc:
+            await release_worker()
             await client.aclose()
             userlocks[u['id']].release()
             active.discard(u['id'])
@@ -603,7 +630,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             store.record(u['id'], u['key_id'], model, status, time.monotonic()-start, account_id=aid, generation=generation)
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            if isinstance(exc, HTTPException) and exc.status_code == 422:
+            if isinstance(exc, HTTPException) and (exc.status_code == 422 or exc.detail in {'项目内存预算已满，请稍后重试','项目资源保护未就绪，请稍后重试','自己的账号池正在处理请求，请稍后重试'}):
                 raise
             raise HTTPException(503, '自己的账号池未就绪，账号可能失效；未使用其他用户账号') from None
 
@@ -627,6 +654,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                 status = 499
                 raise
             finally:
+                await release_worker()
                 await response.aclose()
                 await client.aclose()
                 userlocks[u['id']].release()
