@@ -50,6 +50,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, user_id TEXT, key_id TEXT, model TEXT, status INTEGER, duration REAL,
           input_tokens INTEGER, output_tokens INTEGER, created REAL);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, actor TEXT, action TEXT, created REAL);
+        CREATE TABLE IF NOT EXISTS native_pending(token TEXT PRIMARY KEY, owner TEXT, session TEXT, expires REAL, encrypted TEXT);
         ''')
         columns = {r[1] for r in self.db.execute('PRAGMA table_info(accounts)')}
         for name, ddl in [('enabled','INTEGER NOT NULL DEFAULT 1'), ('status',"TEXT NOT NULL DEFAULT 'unverified'"), ('checked','REAL'), ('note',"TEXT NOT NULL DEFAULT ''")]:

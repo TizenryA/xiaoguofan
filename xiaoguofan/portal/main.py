@@ -31,7 +31,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.9.3'
+VERSION = '0.9.4'
 
 
 class Strict(BaseModel):
@@ -74,6 +74,18 @@ class Import(Label):
     locale: str = 'en-US'
     timezone: str = 'America/Los_Angeles'
     fingerprint: dict | None = None
+
+
+class NativeVerify(Strict):
+    cookie: str = Field(min_length=1,max_length=65536,repr=False)
+    accounts_cookie: str = Field(default='',max_length=65536,repr=False)
+    consent: StrictBool
+
+
+class NativeImport(Label):
+    ticket: str = Field(min_length=20,max_length=128,repr=False)
+    authuser: int = Field(ge=0,le=99,strict=True)
+    consent: StrictBool
 
 
 class Settings(Strict):
@@ -148,6 +160,17 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     workers = broker or BrokerClient(os.environ.get('PORTAL_BROKER', '/run/aistudio-portal/broker.sock'))
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
+    native_slots=asyncio.Semaphore(4)
+
+    from fastapi.exceptions import RequestValidationError
+    @app.exception_handler(RequestValidationError)
+    async def safe_validation(request,exc):
+        # Never echo sensitive Cookie values from Pydantic's `input` field.
+        if '/api/accounts/native/' in request.url.path:
+            return JSONResponse({'detail':'导入参数格式无效；请检查授权、长度和账号选择'},422)
+        from fastapi.exception_handlers import request_validation_exception_handler
+        return await request_validation_exception_handler(request,exc)
+
     states = OAuthStates()
     limits = defaultdict(deque)
     userlocks = defaultdict(asyncio.Lock)
@@ -189,6 +212,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
 
     @app.middleware('http')
     async def security(request: Request, call_next):
+        store.run('DELETE FROM native_pending WHERE expires<?',(time.time(),))
         length = request.headers.get('content-length')
         if length and (not length.isdigit() or int(length) > 2*1024*1024):
             return JSONResponse({'detail':'请求体过大'}, 413)
@@ -271,6 +295,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     @app.post('/api/auth/logout')
     def logout(request: Request):
         auth(request, csrf=True)
+        store.run('DELETE FROM native_pending WHERE owner=? AND session=?',(auth(request)['id'],digest(auth(request)['csrf'])))
         store.run('DELETE FROM sessions WHERE hash=?', (digest(request.cookies.get('portal_session','')),))
         r = JSONResponse({'ok':True})
         r.delete_cookie('portal_session', path=cookie_path)
@@ -399,6 +424,67 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             await workers.stop(u['id'])
             aid = store.add_account(u['id'], payload.label, p)
         return {'id':aid, 'label':payload.label, 'status':'待首次调用验证'}
+
+    @app.post('/api/accounts/native/verify')
+    async def native_verify(payload: NativeVerify, request: Request):
+        u=auth(request,csrf=True)
+        rate('native:'+u['id'],3)
+        if not payload.consent:raise HTTPException(422,'请先确认本人授权')
+        if len(store.accounts(u['id']))>=store.settings()['max_accounts']:
+            raise HTTPException(422,'账号数量达到限制')
+        from portal.native_cookie import verify_native
+        if native_slots.locked():raise HTTPException(429,'身份查询繁忙，请稍后重试')
+        async with native_slots:
+            try:
+                p,rows=await asyncio.wait_for(verify_native(payload.cookie,payload.accounts_cookie),25)
+            except TimeoutError:
+                raise HTTPException(504,'Google 身份查询超时，未保存；请稍后重试') from None
+        # Recheck access after network I/O before issuing a session-bound ticket.
+        u=auth(request,csrf=True)
+        ticket=secrets.token_urlsafe(32)
+        with store.lock:
+            store.run('DELETE FROM native_pending WHERE expires<? OR owner=?',(time.time(),u['id']))
+            if store.one('SELECT COUNT(*) n FROM native_pending')['n']>=500:
+                raise HTTPException(503,'待确认数量已满，请稍后重试')
+            store.run('INSERT INTO native_pending VALUES (?,?,?,?,?)',
+                      (digest(ticket),u['id'],digest(u['csrf']),time.time()+300,store.encrypt({'payload':p,'rows':rows})))
+        return {'ticket':ticket,'expires_in':300,'accounts':[{'email':r['email'],'authuser':r['authuser']} for r in rows],
+                'message':'Google 身份已核对；未验证 AI Studio 模型权限。选择账号后确认保存。'}
+
+    @app.post('/api/accounts/native/import',status_code=201)
+    async def native_import(payload: NativeImport, request: Request):
+        u=auth(request,csrf=True)
+        if not payload.consent:raise HTTPException(422,'请先确认本人授权')
+        if not payload.label.strip():raise HTTPException(422,'请填写账号备注')
+        async with userlocks[u['id']]:
+            row=store.one('SELECT * FROM native_pending WHERE token=? AND owner=? AND session=? AND expires>?',
+                          (digest(payload.ticket),u['id'],digest(u['csrf']),time.time()))
+            if not row:raise HTTPException(422,'确认已过期或不属于当前会话，请重新核对 Cookie')
+            pending=store.decrypt(row['encrypted'])
+            selected=[r for r in pending['rows'] if r['authuser']==payload.authuser]
+            if len(selected)!=1:raise HTTPException(422,'请选择 Google 返回的账号，不能手动更换邮箱')
+            p=pending['payload']|{'email':selected[0]['email'],'label':payload.label}
+            p['storage_state']['xiaoguofan_identity']=selected[0]
+            validate_account(p)
+            from portal.accounts import validate_selected_identity
+            validate_selected_identity(p)
+            if len(store.accounts(u['id']))>=store.settings()['max_accounts']:raise HTTPException(422,'账号数量达到限制')
+            await workers.stop(u['id'])
+            auth(request,csrf=True)
+            if row['expires']<=time.time():raise HTTPException(422,'确认已过期，请重新核对 Cookie')
+            # Serialized one-use consumption within the owner lock; no destructive overwrites.
+            with store.lock:
+                if not store.one('SELECT token FROM native_pending WHERE token=? AND owner=? AND session=? AND expires>?',(digest(payload.ticket),u['id'],digest(u['csrf']),time.time())):
+                    raise HTTPException(422,'确认已取消或过期，请重新核对 Cookie')
+                aid=store.add_account(u['id'],payload.label,p)
+                store.run('DELETE FROM native_pending WHERE token=?',(digest(payload.ticket),))
+            return {'id':aid,'label':payload.label,'status':'身份已核对，模型权限待检查'}
+
+    @app.delete('/api/accounts/native/pending')
+    def native_cancel(request: Request):
+        u=auth(request,csrf=True)
+        store.run('DELETE FROM native_pending WHERE owner=? AND session=?',(u['id'],digest(u['csrf'])))
+        return {'ok':True}
 
     @app.patch('/api/accounts/{aid}')
     async def account_update(aid: str, payload: AccountUpdate, request: Request):
