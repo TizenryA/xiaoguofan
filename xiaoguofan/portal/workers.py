@@ -184,9 +184,13 @@ class WorkerManager:
             runtime = self.root/'runtime'
             runtime.mkdir(parents=True, exist_ok=True)
             name = 'asp-'+uid
+            instance = os.environ.get('PORTAL_INSTANCE','')
+            if instance and not re.fullmatch(r'[a-f0-9]{32}',instance):
+                raise RuntimeError('invalid instance label')
             self.starting += 1
             try:
                 container_id = (await self.docker('run', '-d', '--name', name, '--label', 'aistudio-portal.worker=1', '--init',
+                    *(['--label','xiaoguofan.instance='+instance] if instance else []),
                     '--memory', '650m', '--memory-swap', '650m',
                     *(['--cgroup-parent', 'xiaoguofan.slice'] if self.enforced else []), '--cpus', '0.7', '--pids-limit', '160', '--cap-drop', 'ALL',
                     '--security-opt', 'no-new-privileges', '--read-only', '--tmpfs', '/tmp:rw,size=64m',
@@ -261,6 +265,13 @@ def create_broker():
             while True:
                 await asyncio.sleep(60)
                 await manager.reap()
+        instance = os.environ.get('PORTAL_INSTANCE','')
+        if instance:
+            if not re.fullmatch(r'[a-f0-9]{32}',instance):
+                raise RuntimeError('invalid instance label')
+            ids = (await manager.docker('ps','-aq','--filter','label=xiaoguofan.instance='+instance)).split()
+            if ids:
+                await manager.docker('rm','-f',*ids)
         task = asyncio.create_task(maintain())
         try:
             yield

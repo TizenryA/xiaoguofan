@@ -1,0 +1,10 @@
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs docker.io ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY xiaoguofan/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY xiaoguofan/portal /app/portal
+COPY xiaoguofan/packaging/runtime.py /runtime.py
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 XGF_CONFIG=/config/config.json
+ENTRYPOINT ["python","/runtime.py"]
+CMD ["portal"]
