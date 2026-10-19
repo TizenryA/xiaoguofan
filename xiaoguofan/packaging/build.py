@@ -30,7 +30,7 @@ def main():
     OUT.mkdir(parents=True,exist_ok=True)
     run('npm','ci',cwd=ROOT/'web');run('npm','run','build',cwd=ROOT/'web')
     run('go','test','-p=2','./cmd/...','./internal/...',env=os.environ|{'GOMAXPROCS':'2'})
-    commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
+    commit=(ROOT/'BUILD_SOURCE_COMMIT').read_text().strip() if (ROOT/'BUILD_SOURCE_COMMIT').exists() else subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     for arch in arches:
         binary=ROOT/'build-binaries'/('linux-'+arch);binary.mkdir(parents=True,exist_ok=True)
         run('go','build','-p=2','-trimpath','-ldflags=-s -w','-o',str(binary/'aistudio2api'),'./cmd/aistudio2api',env=os.environ|{'GOOS':'linux','GOARCH':arch,'CGO_ENABLED':'0','GOMAXPROCS':'2'})
