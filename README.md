@@ -19,6 +19,10 @@
 - Lite 提供上传、额度、使用记录、账号管理与实时负载。
 - 管理后台配置 Discord、社区屏蔽、可撤销朋友白名单与资源上限。
 
+## 0.9.1 Docker / Linux 发行包
+
+新增amd64、arm64的Docker Compose版与Linux systemd安装版，含worker镜像、受限配置、随机管理员密码、持久化/在线备份和2GiB项目总预算。Linux版仍依赖Docker动态用户池，不是免Docker单文件；Docker版仅broker具备Docker socket权限，门户无此权限。先阅读[xiaoguofan/packaging/README.md](xiaoguofan/packaging/README.md)，不要把包内安装器直接覆盖现有生产目录。Linux版首次安装仍需联网安装Python依赖。ARM64按交叉构建/QEMU验证标注，不等同物理ARM服务器验收。
+
 ## 0.9.0 动态用户池与实时负载
 
 - 请求入口并发与用户池名额可配置至100；不代表能同时运行100个生成请求。

@@ -134,6 +134,8 @@ def main():
         rollback=root.parent/(root.name+'-rollback-'+stamp);shutil.copytree(root,rollback,ignore=shutil.ignore_patterns('.venv','rollback-*'))
         run('systemctl','stop',*(['xiaoguofan-portal','xiaoguofan-broker'] if a.mode=='linux' else ['xiaoguofan-compose']))
     else:
+        for existing in ['xiaoguofan-portal','xiaoguofan-broker','xiaoguofan-compose']:
+            assert subprocess.run(['systemctl','is-active','--quiet',existing]).returncode!=0,'另一套小锅饭发行安装正在运行，拒绝覆盖'
         assert not data.exists() or not any(data.iterdir()),'数据目录非空，拒绝覆盖既有数据'
         assert not root.exists() or not any(root.iterdir()),'安装目录非空，拒绝覆盖'
         with socket.socket() as probe:probe.bind(('127.0.0.1',a.port))
