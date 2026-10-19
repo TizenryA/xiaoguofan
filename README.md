@@ -19,6 +19,10 @@
 - Lite 提供上传、额度、使用记录、账号管理与实时负载。
 - 管理后台配置 Discord、社区屏蔽、可撤销朋友白名单与资源上限。
 
+## 0.9.2 手机导出入口修复
+
+导出脚本1.1.2改用逐项创建DOM，避免Trusted Types下innerHTML注入失败；增加Shadow DOM不可用时的普通DOM兜底、早期启动/页面重绘恢复和触屏入口。缺少Cookie API也显示面板并明确提示；不以document.cookie伪造完整登录文件，保留HttpOnly/Google身份核对。移动模拟、无Shadow/无dialog/Trusted Types等9场景和官方Tampermonkey Beta桌面隔离导出通过；Via/Edge手机实机尚待用户确认。重新点击站点安装脚本并刷新AI Studio。0.9.1历史发行附件不变，最新脚本从站点或本分支获取。
+
 ## 0.9.1 Docker / Linux 发行包
 
 新增amd64、arm64的Docker Compose版与Linux systemd安装版，含worker镜像、受限配置、随机管理员密码、持久化/在线备份和2GiB项目总预算。Linux版仍依赖Docker动态用户池，不是免Docker单文件；Docker版仅broker具备Docker socket权限，门户无此权限。先阅读[xiaoguofan/packaging/README.md](xiaoguofan/packaging/README.md)，不要把包内安装器直接覆盖现有生产目录。Linux版首次安装仍需联网安装Python依赖。ARM64按交叉构建/QEMU验证标注，不等同物理ARM服务器验收。
