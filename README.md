@@ -19,6 +19,10 @@
 - Lite 提供上传、额度、使用记录、账号管理与实时负载。
 - 管理后台配置 Discord、社区屏蔽、可撤销朋友白名单与资源上限。
 
+## 0.9.3 身份查询会话兼容
+
+导出脚本1.1.3先读完整Cookie，再通过Tampermonkey官方cookie参数将同一份Accounts域Cookie用于固定Google身份接口；区分空账号列表、失效会话和邮箱不匹配。缺少HttpOnly/身份不匹配仍阻止导出，不自动上传、不显示Cookie。官方Tampermonkey Beta真实扩展+本地TLS接收端核对请求Cookie、身份绑定及下载通过；用户手机的真实Google登录仍待确认。旧0.9.1发行附件未重编译，站点脚本和本分支已更新。
+
 ## 0.9.2 手机导出入口修复
 
 导出脚本1.1.2改用逐项创建DOM，避免Trusted Types下innerHTML注入失败；增加Shadow DOM不可用时的普通DOM兜底、早期启动/页面重绘恢复和触屏入口。缺少Cookie API也显示面板并明确提示；不以document.cookie伪造完整登录文件，保留HttpOnly/Google身份核对。移动模拟、无Shadow/无dialog/Trusted Types等9场景和官方Tampermonkey Beta桌面隔离导出通过；Via/Edge手机实机尚待用户确认。重新点击站点安装脚本并刷新AI Studio。0.9.1历史发行附件不变，最新脚本从站点或本分支获取。

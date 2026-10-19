@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小锅饭 · AI Studio 登录文件导出
 // @namespace    https://github.com/TizenryA/xiaoguofan
-// @version      1.1.2
+// @version      1.1.3
 // @description  在本人确认后读取 AI Studio 登录状态，仅下载到本机，不自动上传。官方 Tampermonkey Cookie API，HttpOnly 支持取决于版本。
 // @author       渡鸦4455
 // @match        https://aistudio.google.com/*
@@ -19,7 +19,7 @@
 // ==/UserScript==
 'use strict';
 (function(){
- const VERSION='1.1.2';
+ const VERSION='1.1.3';
  const REQUIRED=['SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'];
  function decodeAccounts(raw){
   let text=String(raw).trim();if(text.startsWith('"')){try{text=JSON.parse(text)}catch{throw Error('Google 账号列表格式变化，请稍后重试。')}}
@@ -28,13 +28,32 @@
   const rows=fields(bytes);if(rows.length>100)throw Error('登录账号过多。');return rows.map(([n,w,b],index)=>{if(n!==1||w!==2)throw Error('Google 账号列表协议已变化。');const f=fields(b),s=k=>{const x=f.find(x=>x[0]===k&&x[1]===2);return x?new TextDecoder().decode(x[2]):''},v=(k,d)=>{const x=f.find(x=>x[0]===k&&x[1]===0);return x?!!x[2]:d};return {email:s(3).toLowerCase(),gaia_id:s(10),authuser:index,valid:v(9,true)&&!v(14,false)&&v(15,true)}});
  }
  function selectIdentity(email,rows){
-  email=String(email).trim().toLowerCase();const matched=rows.filter(x=>x.email===email&&x.valid&&/^\d{1,32}$/.test(x.gaia_id));
+  email=String(email).trim().toLowerCase();
+  if(!rows.length)throw Error('Google 未返回任何已登录账号（不是邮箱填写错误）。身份查询未取得登录会话，请更新脚本、检查 Cookie 授权后重试。');
+  if(!rows.some(x=>x.valid))throw Error('Google 返回的账号均已退出或会话失效，请在此浏览器重新登录。');
+  const matched=rows.filter(x=>x.email===email&&x.valid&&/^\d{1,32}$/.test(x.gaia_id));
   if(matched.length!==1)throw Error('邮箱与当前登录会话不匹配，或账号已退出。请填写此浏览器已登录的邮箱，不要只改备注。');
   const x=matched[0];return {email:x.email,gaia_id:x.gaia_id,authuser:x.authuser};
  }
- function readIdentity(api,email){
+ function identityCookieHeader(cookies){
+  if(!Array.isArray(cookies)||!cookies.length)throw Error('未读取到完整登录 Cookie；请先检查脚本管理器的 Cookie/HttpOnly 支持。');
+  const byName=new Map(),now=Date.now()/1000;
+  for(const c of cookies){
+   if(!c||typeof c.domain!=='string'||c.partitionKey||c.firstPartyDomain)continue;
+   const domain=c.domain.replace(/^\./,'').toLowerCase();
+   if(!['google.com','accounts.google.com'].includes(domain)||c.path!=='/'||(domain==='google.com'&&!c.domain.startsWith('.')))continue;
+   if(c.session!==true&&typeof c.expirationDate==='number'&&c.expirationDate!==-1&&c.expirationDate<=now)continue;
+   if(typeof c.name!=='string'||!/^[-!#$%&'*+.^_`|~0-9A-Za-z]+$/.test(c.name)||typeof c.value!=='string'||/[\x00-\x20\x7f;,]/.test(c.value))throw Error('Cookie 格式不安全，请刷新登录后重试。');
+   if(byName.has(c.name)&&byName.get(c.name)!==c.value)throw Error('身份查询 Cookie 有冲突，请使用专用浏览器环境重新登录。');
+   byName.set(c.name,c.value);
+  }
+  if(!byName.size||![...byName].some(([n,v])=>v&&['SID','__Secure-1PSID','__Secure-3PSID'].includes(n)))throw Error('没有可用于 Google 身份查询的登录 Cookie。当前脚本管理器可能未提供完整 HttpOnly 数据。');
+  return [...byName].map(([n,v])=>n+'='+v).join('; ');
+ }
+ function readIdentity(api,email,cookies){
   return new Promise((resolve,reject)=>{if(typeof api.GM_xmlhttpRequest!=='function')return reject(Error('缺少身份查询权限，请更新脚本并确认新增权限。'));
-   api.GM_xmlhttpRequest({method:'POST',data:' ',headers:{'Content-Type':'application/x-www-form-urlencoded','Origin':'https://www.google.com'},url:'https://accounts.google.com/ListAccounts?gpsia=1&source=ChromiumBrowser&json=standard&laf=b64bin',timeout:20000,anonymous:false,redirect:'error',onload:r=>{try{if(r.status!==200||String(r.responseText).length>100000||r.finalUrl&&!r.finalUrl.startsWith('https://accounts.google.com/ListAccounts?'))throw Error('Google 身份查询失败，请确认浏览器仍登录该账号。');resolve(selectIdentity(email,decodeAccounts(r.responseText)))}catch(e){reject(e)}},onerror:()=>reject(Error('无法查询 Google 登录身份，请检查脚本的 accounts.google.com 授权。')),ontimeout:()=>reject(Error('Google 身份查询超时，请重试。'))});
+   let cookie;try{cookie=identityCookieHeader(cookies)}catch(e){return reject(e)}
+   api.GM_xmlhttpRequest({method:'POST',data:' ',headers:{'Content-Type':'application/x-www-form-urlencoded','Origin':'https://www.google.com'},url:'https://accounts.google.com/ListAccounts?gpsia=1&source=ChromiumBrowser&json=standard&laf=b64bin',timeout:20000,anonymous:false,cookie,redirect:'error',onload:r=>{try{if(r.status!==200||String(r.responseText).length>100000||r.finalUrl&&!r.finalUrl.startsWith('https://accounts.google.com/ListAccounts?'))throw Error('Google 身份查询失败，请确认浏览器仍登录该账号。');resolve(selectIdentity(email,decodeAccounts(r.responseText)))}catch(e){reject(e)}},onerror:()=>reject(Error('无法查询 Google 登录身份，请检查脚本的 accounts.google.com 授权。')),ontimeout:()=>reject(Error('Google 身份查询超时，请重试。'))});
   });
  }
  function readCookiesAt(api,url){
@@ -198,7 +217,7 @@
   // Validate form before invoking privileged API.
   if(!$('#email').value.trim()||!$('#email').checkValidity()||!$('#label').value.trim()){$('#status').textContent='请先填完整邮箱和备注。';return}
   const current=revision;busy=true;$('#read').disabled=true;
-  try{const identity=await readIdentity(api,$('#email').value);const cookies=await readCookies(api);if(revision!==current||!dialog.open)return;prepared=buildExport($('#email').value,$('#label').value,cookies,identity);$('#save').disabled=false;$('#status').textContent=`身份已核对：${prepared.email}（账号 ${identity.authuser}），${prepared.storage_state.cookies.length} 项，包含 HttpOnly。未验证模型权限；点击“下载 JSON”保存到本机。`}
+  try{const cookies=await readCookies(api);buildExport($('#email').value,$('#label').value,cookies);const identity=await readIdentity(api,$('#email').value,cookies);if(revision!==current||!dialog.open)return;prepared=buildExport($('#email').value,$('#label').value,cookies,identity);$('#save').disabled=false;$('#status').textContent=`身份已核对：${prepared.email}（账号 ${identity.authuser}），${prepared.storage_state.cookies.length} 项，包含 HttpOnly。未验证模型权限；点击“下载 JSON”保存到本机。`}
   catch(e){clear();$('#status').textContent=e.message}
   finally{busy=false;$('#read').disabled=false}
  };
