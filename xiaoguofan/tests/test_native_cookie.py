@@ -145,4 +145,51 @@ def test_core_identity_conflict_still_rejected_before_network(name):
 def test_rotation_is_not_permission_to_accept_empty_google_result():
     with pytest.raises(HTTPException) as e:
         asyncio.run(verify_native(RAW+'; SIDCC=ISOLATED-OLD','SIDCC=ISOLATED-NEW; OSID=ISOLATED-OSID',transport=httpx.MockTransport(lambda r:httpx.Response(200,content=b''))))
-    assert 'Google 未返回' in e.value.detail
+    assert 'Google 未返回' in e.value.detail or '默认账号页' in e.value.detail
+
+
+
+def myaccount_html(email='fixture@example.com',gaia='123456789012345678901'):
+    import json
+    data={'oPEP7c':email,'qDCSke':gaia,'W3Yyqf':gaia,'S06Grb':gaia}
+    return '<html><head><base href="https://myaccount.google.com/u/0/"><script nonce="fixture">window.WIZ_global_data = '+json.dumps(data)+';</script></head></html>'
+
+
+def test_empty_list_fallback_requires_live_structured_default_identity():
+    calls=[]
+    def receive(req):
+        calls.append(req.url.host)
+        if req.url.host=='accounts.google.com':return httpx.Response(200,content=b'')
+        assert str(req.url)=='https://myaccount.google.com/u/0/' and req.method=='GET'
+        c=parse_header(req.headers['cookie'])
+        assert c['OSID']=='ISOLATED-OSID' and c['__Secure-OSID']=='ISOLATED-SECURE-OSID'
+        assert 'GAPS' not in c
+        return httpx.Response(200,text=myaccount_html(),headers={'Content-Type':'text/html'})
+    p,rows=asyncio.run(verify_native(RAW,'OSID=ISOLATED-OSID; __Secure-OSID=ISOLATED-SECURE-OSID; GAPS=ISOLATED-GAPS',transport=httpx.MockTransport(receive)))
+    assert calls==['accounts.google.com','myaccount.google.com']
+    assert rows==[{'email':'fixture@example.com','gaia_id':'123456789012345678901','authuser':0}]
+    assert p['storage_state']['xiaoguofan_identity_verification']['method']=='myaccount-default-v1'
+    for name in ['OSID','__Secure-OSID']:
+        assert {c['domain'] for c in p['storage_state']['cookies'] if c['name']==name}=={'accounts.google.com','myaccount.google.com'}
+    assert all(c['domain']=='accounts.google.com' for c in p['storage_state']['cookies'] if c['name']=='GAPS')
+
+
+@pytest.mark.parametrize('status,body',[(302,''),(200,'fixture@example.com 123456789012345678901'),(200,myaccount_html().replace('"W3Yyqf": "123456789012345678901"','"W3Yyqf": "999999999999999999999"')),(200,myaccount_html().replace('https://myaccount.google.com/u/0/','https://evil.example/')),(200,myaccount_html()*2),(200,'x'*2100000)])
+def test_myaccount_fallback_never_accepts_text_mismatch_redirect_or_oversize(status,body):
+    def receive(req):
+        if req.url.host=='accounts.google.com':return httpx.Response(200,content=b'')
+        return httpx.Response(status,text=body,headers={'Content-Type':'text/html'})
+    with pytest.raises(HTTPException):asyncio.run(verify_native(RAW,'OSID=ISOLATED-OSID',transport=httpx.MockTransport(receive)))
+
+
+
+def test_signed_out_accounts_do_not_fallback_to_other_pages():
+    email=b'fixture@example.com';gaia=b'123456789012345678901'
+    row=bytes([26,len(email)])+email+bytes([72,0,82,len(gaia)])+gaia
+    response=base64.b64encode(bytes([10,len(row)])+row)
+    def receive(req):
+        assert req.url.host=='accounts.google.com'
+        return httpx.Response(200,content=response)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(verify_native(RAW,'OSID=ISOLATED-OSID',transport=httpx.MockTransport(receive)))
+    assert '已退出' in exc.value.detail

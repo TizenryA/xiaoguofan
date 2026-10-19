@@ -19,6 +19,10 @@
 - Lite 提供上传、额度、使用记录、账号管理与实时负载。
 - 管理后台配置 Discord、社区屏蔽、可撤销朋友白名单与资源上限。
 
+## 0.9.6 默认账号身份回退
+
+实测同一Cookie在HD的ListAccounts返回空，但Google账号管理页可返回已登录结构化身份。新增严格回退：仅请求固定myaccount.google.com/u/0/、禁止重定向、限制响应体；核对唯一WIZ_global_data中的邮箱和三处一致Gaia字段，不扫描页面任意邮箱。只支持默认账号，明确标记验证来源；OSID仅补入Accounts及MyAccount明确作用域，不泄漏到AI Studio/其他域。Go worker同步在每次使用时重新向Google核对邮箱+Gaia，身份变化拒绝；不靠跳过核对放行。HD部署worker以旧镜像为运行底座替换已验证新二进制，门户0.9.6。真实Google身份回退已验证，不代表生成或模型权限通过；旧发行附件未重编译。
+
 ## 0.9.5 修复原生 Cookie 合并
 
 修复同一会话两处Cookie中SIDCC等支持/刷新项变化被误判为不同登录的问题。只允许明确列出的支持项采用Accounts补充快照，SID/SAPISID等核心项不一致仍拒绝；查询和最终加密保存使用同一合并结果，避免验新存旧。补入Accounts域OSID及__Secure-OSID，限定保存在Accounts域，统计项不转发。真实Google账号返回为空仍拒绝保存，不用手填邮箱绕过验证；使用隔离fixture验证，不使用群聊凭据。旧发行附件未重编译。

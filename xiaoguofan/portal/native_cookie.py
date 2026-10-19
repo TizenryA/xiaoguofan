@@ -65,7 +65,8 @@ def decode_accounts(raw):
         if text.startswith('"'):text=json.loads(text)
         data=base64.b64decode(text+'='*((-len(text))%4),validate=True)
         rows=[]
-        for index,(num,typ,body) in enumerate(fields(data)):
+        account_fields=fields(data)
+        for index,(num,typ,body) in enumerate(account_fields):
             if num!=1 or typ!=2 or index>=100:raise ValueError()
             f=fields(body)
             def get(n,t,default):
@@ -77,6 +78,7 @@ def decode_accounts(raw):
             if valid and re.fullmatch(r'[^\s@]{1,200}@[^\s@]{1,100}',email) and re.fullmatch(r'\d{1,32}',gaia):
                 rows.append({'email':email,'gaia_id':gaia,'authuser':index})
         if len({x['gaia_id'] for x in rows})!=len(rows):raise ValueError()
+        if account_fields and not rows:raise HTTPException(422,'Google 返回的账号已退出或身份字段无效，未保存；不会使用其他页面绕过失效状态')
         return rows
     except (ValueError,TypeError,UnicodeError):
         raise HTTPException(422,'Google 账号响应无法识别，未保存 Cookie；请改用 JSON 导出或稍后重试') from None
@@ -106,9 +108,20 @@ async def verify_native(raw,accounts_raw='',*,transport=None):
     except httpx.HTTPError:
         raise HTTPException(502,'服务器无法连接 Google 身份接口，未保存 Cookie；请稍后重试') from None
     rows=decode_accounts(bytes(body))
-    if not rows:raise HTTPException(422,'Google 未返回已登录账号。可补充同一浏览器 Accounts 页的原生 Cookie，或改用 JSON 导出；未保存')
+    verification=None
+    if not rows:
+        if not (extra.get('OSID') or extra.get('__Secure-OSID')):
+            raise HTTPException(422,'Google 未返回账号列表，且缺少账号管理页 OSID。请在同一浏览器打开 myaccount.google.com，原生复制到补充栏；未保存')
+        from portal.myaccount_identity import verify_myaccount
+        row=await verify_myaccount(main|{k:v for k,v in extra.items() if k in {'OSID','__Secure-OSID'}},transport)
+        rows=[row]
+        verification={'method':'myaccount-default-v1','default_account_only':True,'verified_at':time.time()}
+
     # Explicit target-scoped reconstruction, not claims about original Domain/HttpOnly/expiry.
     cookies=[{'name':k,'value':v,'domain':'.google.com','path':'/'} for k,v in main.items()]
     cookies += [{'name':k,'value':v,'domain':'accounts.google.com','path':'/'} for k,v in extra.items() if k not in main]
-    state={'cookies':cookies,'origins':[], 'xiaoguofan_cookie_source':{'kind':'native_header','attributes_known':False,'scope_policy':'google-auth-allowlist-v1','expiry_policy':'unknown-session-until-upstream-rejects','verified_at':time.time()}}
+    if verification:
+        cookies += [{'name':k,'value':v,'domain':'myaccount.google.com','path':'/'} for k,v in extra.items() if k in {'OSID','__Secure-OSID'}]
+    state={'cookies':cookies,'origins':[], 'xiaoguofan_cookie_source':{'kind':'native_header','attributes_known':False,'scope_policy':'google-auth-allowlist-v2','expiry_policy':'unknown-session-until-upstream-rejects','verified_at':time.time()}}
+    if verification:state['xiaoguofan_identity_verification']=verification
     return {'storage_state':state,'locale':'en-US','timezone':'America/Los_Angeles'},rows

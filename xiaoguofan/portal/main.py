@@ -31,7 +31,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.9.5'
+VERSION = '0.9.6'
 
 
 class Strict(BaseModel):
@@ -436,7 +436,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         if native_slots.locked():raise HTTPException(429,'身份查询繁忙，请稍后重试')
         async with native_slots:
             try:
-                p,rows=await asyncio.wait_for(verify_native(payload.cookie,payload.accounts_cookie),25)
+                p,rows=await asyncio.wait_for(verify_native(payload.cookie,payload.accounts_cookie),45)
             except TimeoutError:
                 raise HTTPException(504,'Google 身份查询超时，未保存；请稍后重试') from None
         # Recheck access after network I/O before issuing a session-bound ticket.
@@ -449,7 +449,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             store.run('INSERT INTO native_pending VALUES (?,?,?,?,?)',
                       (digest(ticket),u['id'],digest(u['csrf']),time.time()+300,store.encrypt({'payload':p,'rows':rows})))
         return {'ticket':ticket,'expires_in':300,'accounts':[{'email':r['email'],'authuser':r['authuser']} for r in rows],
-                'message':'Google 身份已核对；未验证 AI Studio 模型权限。选择账号后确认保存。'}
+                'message':('Google 默认账号页身份已核对（账号列表接口为空，仅支持默认账号）；未验证模型权限。选择后确认保存。' if p['storage_state'].get('xiaoguofan_identity_verification') else 'Google 身份已核对；未验证 AI Studio 模型权限。选择账号后确认保存。')}
 
     @app.post('/api/accounts/native/import',status_code=201)
     async def native_import(payload: NativeImport, request: Request):

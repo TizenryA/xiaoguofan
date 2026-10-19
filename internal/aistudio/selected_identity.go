@@ -186,5 +186,8 @@ func ResolveSelectedAuthUser(ctx context.Context, client *http.Client, state Sto
 	if err != nil {
 		return "", err
 	}
+	if len(rows) == 0 {
+		return resolveMyAccountDefault(ctx, &isolated, state, *id)
+	}
 	return matchSelectedIdentity(rows, *id)
 }

@@ -10,19 +10,19 @@ from portal.main import create_app
 original=native.verify_native
 
 def handler(request):
-    assert request.url.host=='accounts.google.com'
+    assert request.url.host in ['accounts.google.com','myaccount.google.com']
     assert 'SID=ISOLATED-SID' in request.headers['cookie']
     for k in ['SIDCC','__Secure-1PSIDCC','__Secure-3PSIDCC']:
         assert k+'=ISOLATED-NEW' in request.headers['cookie']
     assert 'OSID=ISOLATED-OSID' in request.headers['cookie']
     assert '__Secure-OSID=ISOLATED-SECURE-OSID' in request.headers['cookie']
     assert 'ISOLATED-OLD' not in request.headers['cookie']
-    rows=b''
-    import base64
-    for email,gid in [('fixture@example.com','111'),('second@example.com','222')]:
-        row=bytes([26,len(email)])+email.encode()+bytes([72,1,82,len(gid)])+gid.encode()
-        rows+=bytes([10,len(row)])+row
-    return httpx.Response(200,content=base64.b64encode(rows))
+    if request.url.host=='accounts.google.com':return httpx.Response(200,content=b'')
+    assert str(request.url)=='https://myaccount.google.com/u/0/'
+    import json
+    d={'oPEP7c':'fixture@example.com','qDCSke':'123456789012345678901','W3Yyqf':'123456789012345678901','S06Grb':'123456789012345678901'}
+    text='<html><head><base href="https://myaccount.google.com/u/0/"><script>window.WIZ_global_data = '+json.dumps(d)+';</script></head></html>'
+    return httpx.Response(200,text=text,headers={'Content-Type':'text/html'})
 
 async def verify(raw,accounts):
     return await original(raw,accounts,transport=httpx.MockTransport(handler))
