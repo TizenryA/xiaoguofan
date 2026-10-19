@@ -38,7 +38,7 @@ def compose(c,uid,gid):
     # host networking is intentional: workers publish random loopback ports on the host.
     volumes=[c['root']+'/config.json:/config/config.json:ro',c['data']+':'+c['data'],c['socket_dir']+':'+c['socket_dir']]
     portal=common|{'command':['portal'],'user':f'{uid}:{gid}','volumes':volumes,'mem_limit':'200m','memswap_limit':'200m'}
-    broker=common|{'command':['broker'],'user':f'{uid}:{gid}','group_add':[str(Path('/var/run/docker.sock').stat().st_gid)],'volumes':volumes+['/var/run/docker.sock:/var/run/docker.sock','/sys/fs/cgroup:/sys/fs/cgroup:ro'],'mem_limit':'150m','memswap_limit':'150m'}
+    broker=common|{'command':['broker'],'user':f'{uid}:{gid}','group_add':[str(c['docker_gid'])],'volumes':volumes+['/var/run/docker.sock:/var/run/docker.sock','/sys/fs/cgroup:/sys/fs/cgroup:ro'],'mem_limit':'150m','memswap_limit':'150m'}
     # Both processes need read-only project metrics, but only broker has Docker privilege.
     portal['volumes']=volumes+['/sys/fs/cgroup:/sys/fs/cgroup:ro']
     return {'name':'xiaoguofan-release','services':{'broker':broker,'portal':portal}}
@@ -163,6 +163,7 @@ def main():
     c={'root':str(root),'data':str(data),'mode':a.mode,'origin':a.origin.rstrip('/'),'port':a.port,
        'socket_dir':'/run/xiaoguofan-release','socket':'/run/xiaoguofan-release/broker.sock',
        'worker_image':'xiaoguofan-worker:'+VERSION,'portal_image':'xiaoguofan-portal:'+VERSION,
+       'docker_gid':Path('/var/run/docker.sock').stat().st_gid,
        'instance':old['instance'] if old else secrets.token_hex(16),'python':str(root/'app/.venv/bin/python')}
     (root/'config.json').write_text(json.dumps(c));os.chown(root/'config.json',0,pw.pw_gid);(root/'config.json').chmod(0o640);(root/'runtime.py').chmod(0o644)
     run('docker','load','-i',str(HERE/'images/worker.tar.gz'),stdout=subprocess.DEVNULL)

@@ -22,9 +22,9 @@ def broker(path,body):
 
 assert request('/health')['version']=='0.9.1'
 password=json.loads((data/'credentials.json').read_text())['password']
-assert request('/api/login',{'password':password})
+assert request('/api/auth/admin',{'password':password})
 load=request('/api/load');assert load['available'] and load['memory']['limit_bytes']==2147483648
-assert request('/api/admin/stats')['summary']['registered_users']==0
+assert request('/api/admin/stats')['totals']['registered_users']==0
 assert request('/api/admin/settings')['public_login'] is False
 slice=Path('/sys/fs/cgroup/xiaoguofan.slice');assert (slice/'memory.max').read_text().strip()=='2147483648'
 assert (slice/'memory.swap.max').read_text().strip()=='0'
