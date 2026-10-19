@@ -24,7 +24,7 @@ class BrokerClient:
             if r.status_code >= 400:
                 detail = '独立账号池未就绪，请稍后重试或重新导入账号'
                 if r.status_code == 422:
-                    safe = {'请在账号管理中补填该账号的 Google 邮箱后重试；无需重新上传凭据', 'Google 登录凭据已过期，请重新登录并导出；不会延长原凭据有效期', 'Cookie SameSite 格式无效，请重新导出认证文件', 'Cookie 有效期格式错误', 'Cookie 格式错误', '尚未完成 Google 登录，请在画面中完成验证', '无法核对 Google 身份，请完成登录后重试', '无法核对 Google 身份', '无法唯一核对登录账号；请只登录一个专用 Google 账号', 'Google 账号已变化，请重新核对', '输入格式无效'}
+                    safe = {'登录会话与所选 Google 账号不匹配，请重新导出', '请在账号管理中补填该账号的 Google 邮箱后重试；无需重新上传凭据', 'Google 登录凭据已过期，请重新登录并导出；不会延长原凭据有效期', 'Cookie SameSite 格式无效，请重新导出认证文件', 'Cookie 有效期格式错误', 'Cookie 格式错误', '尚未完成 Google 登录，请在画面中完成验证', '无法核对 Google 身份，请完成登录后重试', '无法核对 Google 身份', '无法唯一核对登录账号；请只登录一个专用 Google 账号', 'Google 账号已变化，请重新核对', '输入格式无效'}
                     try:
                         candidate = r.json().get('detail')
                         detail = candidate if isinstance(candidate,str) and candidate in safe else '认证文件格式无效，请重新导出'
@@ -144,6 +144,14 @@ class WorkerManager:
                 await self.stop(uid)
                 if isinstance(exc, asyncio.CancelledError):
                     raise
+                if response is not None and response.request.url.path == '/api/control/start':
+                    try:
+                        message = response.json().get('error',{}).get('message','')
+                        identity_error = '登录会话与所选 Google 账号不匹配，请重新导出'
+                        if isinstance(message,str) and identity_error in message:
+                            raise HTTPException(422, identity_error) from None
+                    except (ValueError,AttributeError):
+                        pass
                 raise HTTPException(503, '独立账号池启动失败') from None
 
 

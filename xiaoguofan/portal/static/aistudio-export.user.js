@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         小锅饭 · AI Studio 登录文件导出
 // @namespace    https://github.com/TizenryA/xiaoguofan
-// @version      1.1.0
+// @version      1.1.1
 // @description  在本人确认后读取 AI Studio 登录状态，仅下载到本机，不自动上传。官方 Tampermonkey Cookie API，HttpOnly 支持取决于版本。
 // @author       渡鸦4455
 // @match        https://aistudio.google.com/*
+// @include      https://accounts.google.com/*
 // @grant        GM_cookie
 // @grant        GM.cookie
 // @grant        GM_registerMenuCommand
@@ -16,7 +17,7 @@
 // ==/UserScript==
 'use strict';
 (function(){
- const VERSION='1.1.0';
+ const VERSION='1.1.1';
  const REQUIRED=['SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'];
  function decodeAccounts(raw){
   let text=String(raw).trim();if(text.startsWith('"')){try{text=JSON.parse(text)}catch{throw Error('Google 账号列表格式变化，请稍后重试。')}}
@@ -34,20 +35,25 @@
    api.GM_xmlhttpRequest({method:'POST',data:' ',headers:{'Content-Type':'application/x-www-form-urlencoded','Origin':'https://www.google.com'},url:'https://accounts.google.com/ListAccounts?gpsia=1&source=ChromiumBrowser&json=standard&laf=b64bin',timeout:20000,anonymous:false,redirect:'error',onload:r=>{try{if(r.status!==200||String(r.responseText).length>100000||r.finalUrl&&!r.finalUrl.startsWith('https://accounts.google.com/ListAccounts?'))throw Error('Google 身份查询失败，请确认浏览器仍登录该账号。');resolve(selectIdentity(email,decodeAccounts(r.responseText)))}catch(e){reject(e)}},onerror:()=>reject(Error('无法查询 Google 登录身份，请检查脚本的 accounts.google.com 授权。')),ontimeout:()=>reject(Error('Google 身份查询超时，请重试。'))});
   });
  }
- function readCookies(api){
+ function readCookiesAt(api,url){
   return new Promise((resolve,reject)=>{
    let settled=false;
    const finish=(cookies,error)=>{if(settled)return;settled=true;clearTimeout(timer);if(error)return reject(Error('Cookie 读取被拒绝或不可用，请检查窜改猴的授权与版本；不要关闭浏览器的安全保护。'));if(!Array.isArray(cookies))return reject(Error('Cookie 接口没有返回登录数据。'));resolve(cookies)};
    const timer=setTimeout(()=>finish(null,true),12000);
    try{
     if(typeof api.GM_cookie?.list==='function'){
-     const result=api.GM_cookie.list({url:'https://aistudio.google.com/'},finish);
+     const result=api.GM_cookie.list({url},finish);
      if(result&&typeof result.then==='function')result.then(c=>finish(c),()=>finish(null,true));
     }else if(typeof api.GM?.cookie?.list==='function'){
-     Promise.resolve(api.GM.cookie.list({url:'https://aistudio.google.com/'})).then(c=>finish(c),()=>finish(null,true));
+     Promise.resolve(api.GM.cookie.list({url})).then(c=>finish(c),()=>finish(null,true));
     }else{settled=true;clearTimeout(timer);reject(Error('当前窜改猴没有 GM_cookie 接口。请更新官方版；官方文档注明 HttpOnly 读取目前限 Beta 支持。'))}
    }catch{finish(null,true)}
   });
+ }
+ async function readCookies(api){
+  const batches=await Promise.all(['https://aistudio.google.com/','https://accounts.google.com/'].map(url=>readCookiesAt(api,url)));
+  const byKey=new Map();for(const c of batches.flat()){const key=JSON.stringify([c?.domain,c?.path,c?.name,c?.partitionKey,c?.firstPartyDomain]);const old=byKey.get(key);if(old&&old.value!==c.value)throw Error('登录会话在读取时变化，请刷新 AI Studio 后重新检查。');if(!old)byKey.set(key,c)}
+  return [...byKey.values()];
  }
  function buildExport(email,label,cookies,identity){
   email=typeof email==='string'?email.trim().toLowerCase():'';
@@ -59,7 +65,7 @@
   const normalized=cookies.filter(c=>{
    if(!c||typeof c.domain!=='string'||c.partitionKey||c.firstPartyDomain)return false;
    const domain=c.domain.replace(/^\./,'');
-   if(!['google.com','aistudio.google.com'].includes(domain)||c.path!=='/')return false;
+   if(!['google.com','aistudio.google.com','accounts.google.com'].includes(domain)||c.path!=='/')return false;
    const expiry=c.session===true?-1:(c.expirationDate??-1);
    return typeof expiry==='number'&&Number.isFinite(expiry)&&(expiry===-1||expiry>now);
   }).map(c=>{
