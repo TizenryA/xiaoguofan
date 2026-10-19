@@ -38,7 +38,7 @@ def compose(c,uid,gid):
     # host networking is intentional: workers publish random loopback ports on the host.
     volumes=[c['root']+'/config.json:/config/config.json:ro',c['data']+':'+c['data'],c['socket_dir']+':'+c['socket_dir']]
     portal=common|{'command':['portal'],'user':f'{uid}:{gid}','volumes':volumes,'mem_limit':'200m','memswap_limit':'200m'}
-    broker=common|{'command':['broker'],'user':f'0:{gid}','volumes':volumes+['/var/run/docker.sock:/var/run/docker.sock','/sys/fs/cgroup:/sys/fs/cgroup:ro'],'mem_limit':'150m','memswap_limit':'150m'}
+    broker=common|{'command':['broker'],'user':f'{uid}:{gid}','group_add':[str(Path('/var/run/docker.sock').stat().st_gid)],'volumes':volumes+['/var/run/docker.sock:/var/run/docker.sock','/sys/fs/cgroup:/sys/fs/cgroup:ro'],'mem_limit':'150m','memswap_limit':'150m'}
     # Both processes need read-only project metrics, but only broker has Docker privilege.
     portal['volumes']=volumes+['/sys/fs/cgroup:/sys/fs/cgroup:ro']
     return {'name':'xiaoguofan-release','services':{'broker':broker,'portal':portal}}

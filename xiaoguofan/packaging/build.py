@@ -21,7 +21,9 @@ def run(*args,**kw):
 
 def image_archive(tag,dest):
     # Docker load supports gzip-compressed image archives.
-    with gzip.open(dest,'wb',compresslevel=3) as out:run('docker','save',tag,stdout=out)
+    p=subprocess.Popen(['docker','save',tag],stdout=subprocess.PIPE)
+    with gzip.open(dest,'wb',compresslevel=3) as out:shutil.copyfileobj(p.stdout,out)
+    if p.wait():raise RuntimeError('docker save failed')
 
 
 def main():
