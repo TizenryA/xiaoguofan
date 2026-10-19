@@ -2,7 +2,7 @@
 const portalBase=document.documentElement.dataset.portalBase||'';
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 let csrf='',offset=0,total=0,editId='',toastTimer,viewGeneration=0;
-const titles={upload:'上传',quota:'额度',records:'使用记录',accounts:'账号管理',load:'实时负载',guide:'扩展使用教程'};
+const titles={upload:'上传',quota:'额度',records:'使用记录',accounts:'账号管理',load:'实时负载',guide:'账号导入教程'};
 function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e}
 function notify(t){$('#toast').textContent=t;$('#toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').hidden=true,6500)}
 async function api(path,opt={}){const r=await fetch(portalBase+path,{...opt,credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,...opt.headers}});const j=await r.json().catch(()=>({detail:'服务器返回异常'}));if(!r.ok)throw Error(typeof j.detail==='string'?j.detail:'输入格式错误');return j}
