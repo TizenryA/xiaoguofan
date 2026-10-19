@@ -30,7 +30,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.8.0'
+VERSION = '0.8.1'
 
 
 class Strict(BaseModel):
@@ -358,6 +358,12 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             raise HTTPException(422, '开放公共登录前须配置 Discord 和 HTTPS')
         store.save_settings(p)
         return store.settings(public=True) | {'callback_url':redirect_uri}
+
+    @app.get('/api/admin/stats')
+    def admin_stats(request: Request, days: int = Query(7,ge=1,le=30), limit: int = Query(20,ge=1,le=100), offset: int = Query(0,ge=0), q: str = Query('',max_length=100)):
+        auth(request, admin=True)
+        from portal.admin_stats import admin_statistics
+        return admin_statistics(store,days=days,limit=limit,offset=offset,query=q.strip())
 
     @app.get('/api/admin/users')
     def users(request: Request):
