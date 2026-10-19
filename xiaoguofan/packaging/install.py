@@ -117,6 +117,15 @@ def main():
     for old in ['aistudio-portal','aistudio-portal-broker']:
         assert subprocess.run(['systemctl','is-active','--quiet',old]).returncode!=0,'检测到活动旧门户，先完整迁移'
     root=Path(a.root);data=Path(a.data);old=None
+    arch={'x86_64':'amd64','aarch64':'arm64'}[platform.machine()]
+    assert json.loads((HERE/'build-info.json').read_text())['arch']==arch,'架构包不匹配'
+    assert (HERE/'images/worker.tar.gz').exists()
+    if a.mode=='linux':
+        assert shutil.which('uv') and shutil.which('node'),'请先安装uv和Node18+'
+        assert int(subprocess.check_output(['node','--version'],text=True).strip().lstrip('v').split('.')[0])>=18
+    else:
+        run('docker','compose','version',stdout=subprocess.DEVNULL)
+        assert (HERE/'images/portal.tar.gz').exists()
     if root.joinpath('config.json').exists():
         old=json.loads((root/'config.json').read_text());assert a.upgrade,'已有安装，升级须加--upgrade'
         assert (old['mode'],old['data'],old['port'])==(a.mode,a.data,a.port),'升级不能改变模式/数据目录/端口'
@@ -159,14 +168,14 @@ def main():
     run('docker','load','-i',str(HERE/'images/worker.tar.gz'),stdout=subprocess.DEVNULL)
     if a.mode=='linux':
         env=os.environ|{'UV_PYTHON_INSTALL_DIR':str(root/'python'),'UV_CACHE_DIR':str(root/'uv-cache')}
-        run('uv','venv','--python','3.12',str(root/'app/.venv'),env=env)
+        run('uv','venv','--python','3.12','--managed-python',str(root/'app/.venv'),env=env)
         run('uv','pip','install','--python',c['python'],'-r',str(root/'app/requirements.txt'),env=env)
         for name in ['python','app/.venv']:
             for path,dirs,files in os.walk(root/name):
                 os.chmod(path,0o755)
                 for f in files:
                     item=Path(path)/f
-                    if not item.is_symlink():item.chmod(item.stat().st_mode|0o044)
+                    if not item.is_symlink():item.chmod(0o755 if item.stat().st_mode&0o100 else 0o644)
     else:
         run('docker','load','-i',str(HERE/'images/portal.tar.gz'),stdout=subprocess.DEVNULL)
         (root/'compose.yaml').write_text(json.dumps(compose(c,pw.pw_uid,pw.pw_gid),indent=2))

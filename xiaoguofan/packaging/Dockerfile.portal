@@ -1,5 +1,7 @@
+FROM docker:29-cli AS dockercli
 FROM python:3.12-slim-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends nodejs docker.io ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /app
 COPY xiaoguofan/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
