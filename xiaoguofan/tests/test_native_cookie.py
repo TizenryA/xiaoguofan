@@ -53,7 +53,7 @@ def test_two_step_encrypted_owner_bound_one_use_import(tmp_path,monkeypatch):
     async def verify(raw,accounts):return await verify_native(raw,accounts,transport=httpx.MockTransport(lambda r:httpx.Response(200,content=wire())))
     monkeypatch.setattr(native,'verify_native',verify)
     c,s,a,b,csrf,broker=setup(tmp_path);h={'X-CSRF-Token':csrf}
-    data={'cookie':RAW,'accounts_cookie':'','consent':True}
+    data={'cookie':RAW+'; SIDCC=ISOLATED-OLD','accounts_cookie':'SIDCC=ISOLATED-NEW; OSID=ISOLATED-OSID; __Secure-OSID=ISOLATED-SECURE-OSID','consent':True}
     assert c.post('/api/accounts/native/verify',json=data).status_code==403
     assert c.post('/api/accounts/native/verify',json=data|{'consent':False},headers=h).status_code==422
     r=c.post('/api/accounts/native/verify',json=data,headers=h);assert r.status_code==200,r.text
@@ -67,6 +67,10 @@ def test_two_step_encrypted_owner_bound_one_use_import(tmp_path,monkeypatch):
     r=c.post('/api/accounts/native/import',json=payload,headers=h);assert r.status_code==201,r.text
     saved=s.account(a['id'],r.json()['id']);assert saved['payload']['email']=='second@example.com'
     assert saved['payload']['storage_state']['xiaoguofan_identity']['gaia_id']=='222'
+    cookies=saved['payload']['storage_state']['cookies']
+    assert next(x for x in cookies if x['name']=='SIDCC')['value']=='ISOLATED-NEW'
+    assert next(x for x in cookies if x['name']=='OSID')['domain']=='accounts.google.com'
+    assert 'ISOLATED-OLD' not in str(saved)
     assert 'ISOLATED' not in s.one('SELECT payload FROM accounts WHERE id=?',(saved['id'],))['payload']
     assert c.post('/api/accounts/native/import',json=payload,headers=h).status_code==422
     assert s.accounts(b['id'])==[]
@@ -105,3 +109,40 @@ def test_cancel_only_current_owner(tmp_path,monkeypatch):
     c.post('/api/accounts/native/verify',json={'cookie':RAW,'consent':True},headers=h)
     assert c.delete('/api/accounts/native/pending',headers=h).status_code==200
     assert not s.one('SELECT * FROM native_pending')
+
+
+ROTATING=['SIDCC','__Secure-1PSIDCC','__Secure-3PSIDCC','__Secure-1PSIDTS','__Secure-3PSIDTS','NID','AEC','__Secure-ENID']
+
+
+def test_same_session_rotation_uses_accounts_snapshot_in_request_and_saved_state():
+    main=RAW+'; '+'; '.join(k+'=ISOLATED-OLD' for k in ROTATING)
+    accounts=RAW+'; '+'; '.join(k+'=ISOLATED-NEW' for k in ROTATING)+'; OSID=ISOLATED-OSID; __Secure-OSID=ISOLATED-SECURE-OSID; OTZ=ignored'
+    def handler(req):
+        sent=parse_header(req.headers['cookie'])
+        assert all(sent[k]=='ISOLATED-NEW' for k in ROTATING)
+        assert sent['OSID']=='ISOLATED-OSID' and sent['__Secure-OSID']=='ISOLATED-SECURE-OSID'
+        assert 'OTZ' not in sent and 'UNKNOWN' not in sent
+        return httpx.Response(200,content=wire())
+    p,rows=asyncio.run(verify_native(main,accounts,transport=httpx.MockTransport(handler)))
+    assert len(rows)==2
+    cs=p['storage_state']['cookies']
+    for k in ROTATING:
+        assert [c['value'] for c in cs if c['name']==k]==['ISOLATED-NEW']
+    for k in ['OSID','__Secure-OSID']:
+        assert next(c for c in cs if c['name']==k)['domain']=='accounts.google.com'
+    assert 'ISOLATED-OLD' not in str(p)
+
+
+@pytest.mark.parametrize('name',['SID','__Secure-1PSID','__Secure-3PSID','HSID','SSID','APISID','SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'])
+def test_core_identity_conflict_still_rejected_before_network(name):
+    main=parse_header(RAW);main[name]='ISOLATED-ONE'
+    def never(req):raise AssertionError('conflicting identity must never reach Google')
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(verify_native('; '.join(k+'='+v for k,v in main.items()),name+'=ISOLATED-TWO',transport=httpx.MockTransport(never)))
+    assert e.value.status_code==422
+
+
+def test_rotation_is_not_permission_to_accept_empty_google_result():
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(verify_native(RAW+'; SIDCC=ISOLATED-OLD','SIDCC=ISOLATED-NEW; OSID=ISOLATED-OSID',transport=httpx.MockTransport(lambda r:httpx.Response(200,content=b''))))
+    assert 'Google 未返回' in e.value.detail

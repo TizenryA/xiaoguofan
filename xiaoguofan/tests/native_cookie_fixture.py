@@ -12,6 +12,11 @@ original=native.verify_native
 def handler(request):
     assert request.url.host=='accounts.google.com'
     assert 'SID=ISOLATED-SID' in request.headers['cookie']
+    for k in ['SIDCC','__Secure-1PSIDCC','__Secure-3PSIDCC']:
+        assert k+'=ISOLATED-NEW' in request.headers['cookie']
+    assert 'OSID=ISOLATED-OSID' in request.headers['cookie']
+    assert '__Secure-OSID=ISOLATED-SECURE-OSID' in request.headers['cookie']
+    assert 'ISOLATED-OLD' not in request.headers['cookie']
     rows=b''
     import base64
     for email,gid in [('fixture@example.com','111'),('second@example.com','222')]:

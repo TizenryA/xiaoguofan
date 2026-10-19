@@ -11,7 +11,9 @@ IDENTITY_URL='https://accounts.google.com/ListAccounts?gpsia=1&source=ChromiumBr
 GOOGLE_NAMES={'SID','HSID','SSID','APISID','SAPISID','SIDCC','__Secure-1PSID','__Secure-3PSID',
               '__Secure-1PAPISID','__Secure-3PAPISID','__Secure-1PSIDTS','__Secure-3PSIDTS',
               '__Secure-1PSIDCC','__Secure-3PSIDCC','NID','AEC','__Secure-ENID','__Secure-BUCKET'}
-ACCOUNTS_NAMES=GOOGLE_NAMES|{'GAPS','LSID','__Host-GAPS','__Host-1PLSID','__Host-3PLSID','__Host-LSID','ACCOUNT_CHOOSER'}
+# Only these overlapping support/refresh items may differ; never relax SID/SAPISID identity anchors.
+ROTATING_NAMES={'SIDCC','__Secure-1PSIDCC','__Secure-3PSIDCC','__Secure-1PSIDTS','__Secure-3PSIDTS','NID','AEC','__Secure-ENID','__Secure-BUCKET'}
+ACCOUNTS_NAMES=GOOGLE_NAMES|{'OSID','__Secure-OSID','GAPS','LSID','__Host-GAPS','__Host-1PLSID','__Host-3PLSID','__Host-LSID','ACCOUNT_CHOOSER'}
 
 
 def parse_header(raw):
@@ -85,8 +87,13 @@ async def verify_native(raw,accounts_raw='',*,transport=None):
     if not {'SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'}<=main.keys() or not any(main.get(n) for n in ['SID','__Secure-1PSID','__Secure-3PSID']) or any(not v for v in main.values()):
         raise HTTPException(422,'缺少 Google 会话关键项，请使用浏览器原生复制 Cookie；document.cookie 不能代替完整会话')
     extra={k:v for k,v in parse_header(accounts_raw).items() if k in ACCOUNTS_NAMES} if accounts_raw else {}
+    if any(not v for v in extra.values()):raise HTTPException(422,'补充 Cookie 包含空认证项，请重新复制')
     for k in main.keys()&extra.keys():
-        if main[k]!=extra[k]:raise HTTPException(422,'两处 Cookie 的登录会话冲突，请在同一浏览器重新复制')
+        if main[k]!=extra[k] and k not in ROTATING_NAMES:
+            raise HTTPException(422,'两处 Cookie 的核心登录项冲突，请确认同一浏览器、同一会话后重新复制')
+    # Accounts is the authoritative snapshot for its own identity request. Keep the
+    # exact same selected shared values in the worker state; do not verify NEW then save OLD.
+    main.update({k:v for k,v in extra.items() if k in main and k in ROTATING_NAMES})
     selected=main|extra
     try:
         async with httpx.AsyncClient(timeout=20,follow_redirects=False,trust_env=False,transport=transport) as client:
