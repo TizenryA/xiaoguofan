@@ -15,7 +15,7 @@ const (
 	termsOnboardingSource = 5
 )
 
-// EnsureTermsAccepted 读取账户的官网日志上下文，账户尚未同意 AI Studio 条款时按官网条款对话框或 onboarding 表单发送 AcceptTerms
+// EnsureTermsAccepted 读取账户的官网日志上下文，账户尚未同意 AI Studio 条款时要求用户自行到官网确认，不代发 AcceptTerms
 func (c *Client) EnsureTermsAccepted(ctx context.Context, accountID string) error {
 	accountID = strings.TrimSpace(accountID)
 	c.termsMu.Lock()
@@ -38,15 +38,7 @@ func (c *Client) EnsureTermsAccepted(ctx context.Context, accountID string) erro
 		return err
 	}
 	if body != nil {
-		response, err := c.do(ctx, "AcceptTerms", accountID, "", body, false)
-		if err != nil {
-			return err
-		}
-		_, err = io.Copy(io.Discard, response.Body)
-		response.Body.Close()
-		if err != nil {
-			return fmt.Errorf("读取 AcceptTerms: %w", err)
-		}
+		return fmt.Errorf("请先在 Google AI Studio 官网自行阅读并同意条款，再重试；本站不会代为确认")
 	}
 	c.termsMu.Lock()
 	c.termsAccepted[accountID] = struct{}{}

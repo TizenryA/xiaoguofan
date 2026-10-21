@@ -58,3 +58,19 @@ def test_dynamic_budget_rejects_when_all_busy(tmp_path,monkeypatch):
         with pytest.raises(HTTPException):await m.stop('a')
         assert 'a' in m.items
     asyncio.run(run())
+
+
+def test_worker_browser_home_is_on_existing_private_writable_tmpfs(tmp_path,monkeypatch):
+    real=httpx.AsyncClient
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kw:real(transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'token':'x'})),**kw))
+    commands=[]
+    class M(WorkerManager):
+        async def docker(self,*a,**kw):
+            commands.append(a)
+            return '127.0.0.1:9999' if a[0]=='port' else 'fixture'
+    asyncio.run(M(tmp_path).ensure('fixture',[],2))
+    run=next(a for a in commands if a[0]=='run')
+    assert 'HOME=/data' in run
+    assert '--read-only' in run
+    assert '/data:rw,size=160m' in run
+    assert '650m' in run and '160' in run

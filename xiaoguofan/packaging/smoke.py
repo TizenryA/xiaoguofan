@@ -20,7 +20,7 @@ def broker(path,body):
     out=subprocess.check_output(['curl','--fail','--silent','--show-error','--max-time','90','--unix-socket',c['socket'],'-H','Content-Type: application/json','-d',json.dumps(body),'http://broker/'+path],text=True)
     return json.loads(out)
 
-assert request('/health')['version']=='0.9.9'
+assert request('/health')['version']=='0.9.10'
 password=json.loads((data/'credentials.json').read_text())['password']
 assert request('/api/auth/admin',{'password':password})
 load=request('/api/load');assert load['available'] and load['memory']['limit_bytes']==2147483648

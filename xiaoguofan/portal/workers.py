@@ -208,7 +208,7 @@ class WorkerManager:
                         '--security-opt', 'no-new-privileges', '--read-only', '--tmpfs', '/tmp:rw,size=64m',
                         '--tmpfs', '/data:rw,size=160m',
                         '-p', '127.0.0.1::2048', '-e', 'WAA_BACKEND=go', '-e', 'AUTO_START=false',
-                        '-e', 'AISTUDIO_AUTH_STATES=auth', '-e', 'XDG_CACHE_HOME=/data/.cache', '-e', 'LISTEN_ADDR=0.0.0.0:2048',
+                        '-e', 'HOME=/data', '-e', 'AISTUDIO_AUTH_STATES=auth', '-e', 'XDG_CACHE_HOME=/data/.cache', '-e', 'LISTEN_ADDR=0.0.0.0:2048',
                         '-e', 'ADMIN_AUTH_ENABLED=true', '-e', 'ADMIN_USERNAME=admin', '-e', 'ADMIN_PASSWORD='+password,
                         '-e', 'PROXY_API_KEY='+key, '-e', 'LOG_FILE=false', '-e', 'REQUEST_BODY_LOG=false',
                         '-e', 'MAX_ACTIVE_WORKERS=1', '-e', 'WARM_WORKER_LIMIT=1', '-e', 'WARM_STARTUP_CONCURRENCY=1',
