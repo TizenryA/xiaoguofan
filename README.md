@@ -23,7 +23,7 @@
 
 同步上游至 `370a313`，保留小锅饭租户隔离、Discord 登录、手机原生导入、Google 身份重核与防截断。上游新增 API 试用、代码助手、Deep Research、媒体链接和导入流程；这些底层功能不等于已全部接入 Lite。门户现有 `-pg` / `-build` 仍表示 Playground / Build API；新代码助手显示为 `-assistant`，转发时还原上游模型，避免抢占旧别名。上游媒体 URL 默认关闭，Lite 未新增公开媒体路由；在线二进制更新由小锅饭管理，不自动覆盖回上游发行版。新账户自动同意 AI Studio 条款是上游新增副作用，生产升级前需评估，用户应先在官网自行确认。
 
-升级 Vue 与 markdown-it 修复依赖高危项，仍有 KaTeX 链路两项低危告警。仅完成源码集成和隔离验证，不代表 Google 真实生成、桌面版或 HD 新 worker 已验收；HD 仍为门户 0.9.8 / worker 0.9.6。上游 README 存于 `README_upstream.md`。
+升级 Vue 与 markdown-it 修复依赖高危项，仍有 KaTeX 链路两项低危告警。仅完成源码集成和隔离验证，不代表 Google 真实生成、桌面版或 HD 新 worker 已验收；HD 仍为门户 0.9.8 / worker 0.9.6。上游 README 存于 `README_upstream.md`。当前 GitHub 凭据无 workflow 权限，保留 Fork 原有构建工作流，上游新增桌面打包 CI 未同步。
 
 ## 0.9.8 操作超时与弹窗错误修复
 
