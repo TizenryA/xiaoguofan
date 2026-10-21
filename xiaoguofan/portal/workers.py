@@ -12,6 +12,8 @@ from fastapi import FastAPI, HTTPException, Request
 from portal.accounts import worker_payload
 from portal.resources import BASE_RESERVE, HEADROOM, HIGH, LIMIT, WORKER_BYTES, ProjectResources
 
+STARTUP_TIMEOUT = 75
+
 IMAGE = os.environ.get('PORTAL_WORKER_IMAGE', 'xiaoguofan-worker:0.8.0')
 
 
@@ -27,7 +29,7 @@ class BrokerClient:
                 if r.status_code in (409,429,503):
                     try:
                         candidate = r.json().get('detail')
-                        allowed = {'账号池正在处理请求，请结束后重试','自己的账号池正在处理请求，请稍后重试','项目内存预算已满，请稍后重试','项目资源保护未就绪，请稍后重试'}
+                        allowed = {'账号池正在处理请求，请结束后重试','自己的账号池正在处理请求，请稍后重试','项目内存预算已满，请稍后重试','项目资源保护未就绪，请稍后重试','账号池正在启动或维护，请稍后重试','账号池启动超时，已结束本轮启动；请稍后重试'}
                         if candidate in allowed:
                             detail = candidate
                     except (ValueError,AttributeError,TypeError):
@@ -92,7 +94,14 @@ class WorkerManager:
 
     async def docker(self, *args, check=True):
         p = await asyncio.create_subprocess_exec('docker', *args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = await asyncio.wait_for(p.communicate(), 240)
+        try:
+            out, err = await asyncio.wait_for(p.communicate(), 15 if args[:2] == ('rm','-f') else 30)
+        except BaseException:
+            if p.returncode is None:
+                try:p.kill()
+                except ProcessLookupError:pass
+                await p.wait()
+            raise
         if check and p.returncode:
             raise RuntimeError('worker operation failed')
         return out.decode()
@@ -164,6 +173,8 @@ class WorkerManager:
         if channel not in ('', 'playground', 'build'):
             raise ValueError('invalid worker channel')
         payloads = [worker_payload(a) for a in accounts]
+        if self.lock.locked():
+            raise HTTPException(503, '账号池正在启动或维护，请稍后重试')
         async with self.lock:
             if self.enforced and not self.resources.snapshot()['available']:
                 raise HTTPException(503, '项目资源保护未就绪，请稍后重试')
@@ -189,50 +200,55 @@ class WorkerManager:
                 raise RuntimeError('invalid instance label')
             self.starting += 1
             try:
-                container_id = (await self.docker('run', '-d', '--name', name, '--label', 'aistudio-portal.worker=1', '--init',
-                    *(['--label','xiaoguofan.instance='+instance] if instance else []),
-                    '--memory', '650m', '--memory-swap', '650m',
-                    *(['--cgroup-parent', 'xiaoguofan.slice'] if self.enforced else []), '--cpus', '0.7', '--pids-limit', '160', '--cap-drop', 'ALL',
-                    '--security-opt', 'no-new-privileges', '--read-only', '--tmpfs', '/tmp:rw,size=64m',
-                    '--tmpfs', '/data:rw,size=160m',
-                    '-p', '127.0.0.1::2048', '-e', 'WAA_BACKEND=go', '-e', 'AUTO_START=false',
-                    '-e', 'AISTUDIO_AUTH_STATES=auth', '-e', 'XDG_CACHE_HOME=/data/.cache', '-e', 'LISTEN_ADDR=0.0.0.0:2048',
-                    '-e', 'ADMIN_AUTH_ENABLED=true', '-e', 'ADMIN_USERNAME=admin', '-e', 'ADMIN_PASSWORD='+password,
-                    '-e', 'PROXY_API_KEY='+key, '-e', 'LOG_FILE=false', '-e', 'REQUEST_BODY_LOG=false',
-                    '-e', 'MAX_ACTIVE_WORKERS=1', '-e', 'WARM_WORKER_LIMIT=1', '-e', 'WARM_STARTUP_CONCURRENCY=1',
-                    '-e', 'PER_ACCOUNT_CONCURRENCY=1', '-e', 'UPSTREAM_CHANNELS='+(channel or 'playground,build'),
-                    '-e', 'INIT_TIMEOUT=2m', '-e', 'REQUEST_TIMEOUT=5m', IMAGE)).strip()
-                port = (await self.docker('port', name, '2048/tcp')).strip().split(':')[-1]
-                if not port.isdigit():
-                    raise ValueError('invalid worker port')
-                url = 'http://127.0.0.1:'+port
-                async with httpx.AsyncClient(base_url=url, timeout=180) as c:
-                    for _ in range(80):
-                        try:
-                            r = await c.get('/health')
-                            if r.status_code == 200:
-                                break
-                        except httpx.HTTPError:
-                            pass
-                        await asyncio.sleep(.5)
-                    r = await c.post('/api/auth/login', json={'username': 'admin', 'password': password})
-                    r.raise_for_status()
-                    for payload in payloads:
-                        r = await c.post('/api/pairing')
+                async with asyncio.timeout(STARTUP_TIMEOUT):
+                    container_id = (await self.docker('run', '-d', '--name', name, '--label', 'aistudio-portal.worker=1', '--init',
+                        *(['--label','xiaoguofan.instance='+instance] if instance else []),
+                        '--memory', '650m', '--memory-swap', '650m',
+                        *(['--cgroup-parent', 'xiaoguofan.slice'] if self.enforced else []), '--cpus', '0.7', '--pids-limit', '160', '--cap-drop', 'ALL',
+                        '--security-opt', 'no-new-privileges', '--read-only', '--tmpfs', '/tmp:rw,size=64m',
+                        '--tmpfs', '/data:rw,size=160m',
+                        '-p', '127.0.0.1::2048', '-e', 'WAA_BACKEND=go', '-e', 'AUTO_START=false',
+                        '-e', 'AISTUDIO_AUTH_STATES=auth', '-e', 'XDG_CACHE_HOME=/data/.cache', '-e', 'LISTEN_ADDR=0.0.0.0:2048',
+                        '-e', 'ADMIN_AUTH_ENABLED=true', '-e', 'ADMIN_USERNAME=admin', '-e', 'ADMIN_PASSWORD='+password,
+                        '-e', 'PROXY_API_KEY='+key, '-e', 'LOG_FILE=false', '-e', 'REQUEST_BODY_LOG=false',
+                        '-e', 'MAX_ACTIVE_WORKERS=1', '-e', 'WARM_WORKER_LIMIT=1', '-e', 'WARM_STARTUP_CONCURRENCY=1',
+                        '-e', 'PER_ACCOUNT_CONCURRENCY=1', '-e', 'UPSTREAM_CHANNELS='+(channel or 'playground,build'),
+                        '-e', 'INIT_TIMEOUT=2m', '-e', 'REQUEST_TIMEOUT=5m', IMAGE)).strip()
+                    port = (await self.docker('port', name, '2048/tcp')).strip().split(':')[-1]
+                    if not port.isdigit():
+                        raise ValueError('invalid worker port')
+                    url = 'http://127.0.0.1:'+port
+                    async with httpx.AsyncClient(base_url=url, timeout=180) as c:
+                        for _ in range(80):
+                            try:
+                                r = await c.get('/health')
+                                if r.status_code == 200:
+                                    break
+                            except httpx.HTTPError:
+                                pass
+                            await asyncio.sleep(.5)
+                        r = await c.post('/api/auth/login', json={'username': 'admin', 'password': password})
                         r.raise_for_status()
-                        token = r.json()['token']
-                        r = await c.post('/api/pairing/accounts', headers={'Authorization':'Bearer '+token}, json=payload)
-                        r.raise_for_status()
-                    if accounts:
-                        r = await c.post('/api/control/start')
-                        r.raise_for_status()
+                        for payload in payloads:
+                            r = await c.post('/api/pairing')
+                            r.raise_for_status()
+                            token = r.json()['token']
+                            r = await c.post('/api/pairing/accounts', headers={'Authorization':'Bearer '+token}, json=payload)
+                            r.raise_for_status()
+                        if accounts:
+                            r = await c.post('/api/control/start')
+                            r.raise_for_status()
                 self.items[uid] = {'url': url, 'key': key, 'revision': revision, 'channel': channel, 'used': time.time(), 'leases':set(), 'container_id':container_id}
                 return self.result(self.items[uid], lease)
             except BaseException as exc:
                 import logging
                 response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
                 logging.getLogger(__name__).error('worker startup failed: %s stage=%s http=%s', type(exc).__name__, response.request.url.path if response is not None else 'runtime', response.status_code if response is not None else '-')
-                await self.stop(uid)
+                # Cleanup must finish even after request cancellation, but never hang the admission lock.
+                try:
+                    await asyncio.wait_for(self.stop(uid),20)
+                except Exception:
+                    logging.getLogger(__name__).error('worker cleanup did not complete')
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 if response is not None and response.request.url.path == '/api/control/start':
@@ -243,6 +259,8 @@ class WorkerManager:
                             raise HTTPException(422, identity_error) from None
                     except (ValueError,AttributeError):
                         pass
+                if isinstance(exc,TimeoutError):
+                    raise HTTPException(503, '账号池启动超时，已结束本轮启动；请稍后重试') from None
                 raise HTTPException(503, '独立账号池启动失败') from None
             finally:
                 self.starting -= 1
@@ -295,6 +313,8 @@ def create_broker():
         if action == 'release':
             return await manager.release(uid,str(p.get('lease','')))
         if action == 'stop':
+            if manager.lock.locked():
+                raise HTTPException(409, '账号池正在启动或维护，请稍后重试')
             async with manager.lock:
                 await manager.stop(uid)
             return {'ok': True}

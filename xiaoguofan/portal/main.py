@@ -31,7 +31,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.9.7'
+VERSION = '0.9.8'
 
 
 class Strict(BaseModel):
@@ -174,6 +174,14 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     states = OAuthStates()
     limits = defaultdict(deque)
     userlocks = defaultdict(asyncio.Lock)
+    from contextlib import asynccontextmanager
+    @asynccontextmanager
+    async def account_operation(uid):
+        lock=userlocks[uid]
+        if lock.locked():
+            raise HTTPException(409,'账号操作进行中，请稍后重试；不要重复点击检查')
+        async with lock:
+            yield
     active = set()
     secure = origin.startswith('https://')
     redirect_uri = origin + '/auth/discord/callback'
@@ -401,10 +409,10 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         auth(request, admin=True, csrf=True)
         if uid == 'admin' or not store.user(uid):
             raise HTTPException(404)
-        store.run('UPDATE users SET disabled=1-disabled WHERE id=?', (uid,))
-        store.run('DELETE FROM sessions WHERE user_id=?', (uid,))
-        async with userlocks[uid]:
+        async with account_operation(uid):
             await workers.stop(uid)
+            store.run('UPDATE users SET disabled=1-disabled WHERE id=?', (uid,))
+            store.run('DELETE FROM sessions WHERE user_id=?', (uid,))
         store.audit('admin', 'user_access_toggled')
         return {'ok':True}
 
@@ -420,7 +428,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         validate_account(p)
         from portal.accounts import validate_selected_identity
         validate_selected_identity(p)
-        async with userlocks[u['id']]:
+        async with account_operation(u['id']):
             await workers.stop(u['id'])
             aid = store.add_account(u['id'], payload.label, p)
         return {'id':aid, 'label':payload.label, 'status':'待首次调用验证'}
@@ -456,7 +464,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         u=auth(request,csrf=True)
         if not payload.consent:raise HTTPException(422,'请先确认本人授权')
         if not payload.label.strip():raise HTTPException(422,'请填写账号备注')
-        async with userlocks[u['id']]:
+        async with account_operation(u['id']):
             row=store.one('SELECT * FROM native_pending WHERE token=? AND owner=? AND session=? AND expires>?',
                           (digest(payload.ticket),u['id'],digest(u['csrf']),time.time()))
             if not row:raise HTTPException(422,'确认已过期或不属于当前会话，请重新核对 Cookie')
@@ -489,7 +497,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     @app.patch('/api/accounts/{aid}')
     async def account_update(aid: str, payload: AccountUpdate, request: Request):
         u = auth(request, csrf=True)
-        async with userlocks[u['id']]:
+        async with account_operation(u['id']):
             account = store.account(u['id'], aid)
             if not account:
                 raise HTTPException(404, '账号不存在')
@@ -511,14 +519,16 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     async def account_check(aid: str, request: Request):
         u = auth(request, csrf=True)
         rate('check:'+u['id'], 3)
-        async with userlocks[u['id']]:
+        async with account_operation(u['id']):
             account = store.account(u['id'], aid)
             if not account:
                 raise HTTPException(404, '账号不存在')
             try:
-                result = await workers.check(u['id'], account, store.settings()['max_workers'])
+                result = await asyncio.wait_for(workers.check(u['id'], account, store.settings()['max_workers']),95)
+            except TimeoutError:
+                result = {'status':'error','models':0,'message':'账号检查超时，请稍后再试；不要连续点击检查'}
             except HTTPException as exc:
-                message = exc.detail if exc.status_code == 422 else '独立账号池未就绪，请稍后重试或重新导入账号'
+                message = exc.detail if exc.status_code in (409,422,503) else '独立账号池未就绪，请稍后重试或重新导入账号'
                 result = {'status':'error', 'models':0, 'message':message}
             except Exception:
                 result = {'status':'error', 'models':0, 'message':'检查未通过：登录失效、网络故障或服务器繁忙，请稍后重试'}
@@ -529,7 +539,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     @app.delete('/api/accounts/{aid}')
     async def account_delete(aid: str, request: Request):
         u = auth(request, csrf=True)
-        async with userlocks[u['id']]:
+        async with account_operation(u['id']):
             if not store.account(u['id'], aid):
                 raise HTTPException(404, '账号不存在')
             await workers.stop(u['id'])
@@ -539,7 +549,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     @app.post('/api/pool/stop')
     async def pool_stop(request: Request):
         u = auth(request, csrf=True)
-        async with userlocks[u['id']]:
+        async with account_operation(u['id']):
             await workers.stop(u['id'])
         return {'ok':True}
 

@@ -19,7 +19,7 @@ def test_extension_download_and_upload_help(tmp_path):
             assert z.testzip() is None
             assert set(z.namelist()) == {'manifest.json', 'core.js', 'compat.js', 'popup.js', 'background.js', 'popup.html', 'popup.css', '使用说明.txt'}
             m = json.loads(z.read('manifest.json'))
-            assert m['version'] == '0.3.5'
+            assert m['version'] == '0.3.6'
             assert 'host_permissions' not in m
             assert m['permissions'] == ['activeTab', 'scripting', 'cookies']
             assert 'externally_connectable' not in m
