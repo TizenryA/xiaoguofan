@@ -46,7 +46,7 @@ const form = reactive<ServiceConfig>({
   active_proxy: '',
   proxy_pool: [],
   init_timeout: '2m',
-  request_timeout: '5m',
+  request_timeout: '30m',
   warm_worker_limit: 5,
   max_active_workers: 10,
   warm_startup_concurrency: 5,
@@ -54,8 +54,11 @@ const form = reactive<ServiceConfig>({
   routing_strategy: 'round-robin',
   upstream_channels: ['playground', 'build'],
   model_mapping: '',
+  model_channels: '',
   waa_backend: 'camoufox',
   temporary_chat: false,
+  media_output: 'inline',
+  media_base_url: '',
 })
 
 type SectionID = 'service' | 'capacity' | 'upstream' | 'network' | 'security'
@@ -73,7 +76,14 @@ const sections: {
     label: 'settings.section.service',
     description: 'settings.section.serviceHelp',
     icon: 'service',
-    fields: ['auto_start', 'listen_addr', 'proxy_api_key', 'auth_states'],
+    fields: [
+      'auto_start',
+      'listen_addr',
+      'proxy_api_key',
+      'auth_states',
+      'media_output',
+      'media_base_url',
+    ],
   },
   {
     id: 'capacity',
@@ -96,6 +106,7 @@ const sections: {
     fields: [
       'upstream_channels',
       'model_mapping',
+      'model_channels',
       'build_native_nonstream',
       'waa_backend',
       'temporary_chat',
@@ -240,7 +251,7 @@ async function saveConfig(): Promise<void> {
           v-for="item in sections"
           :key="item.id"
           type="button"
-          class="flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap transition-colors"
+          class="flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap transition-colors md:whitespace-normal"
           :class="
             section === item.id
               ? 'bg-raised text-white'
@@ -352,6 +363,35 @@ async function saveConfig(): Promise<void> {
                 id="setting-auth-path"
                 v-model.trim="form.auth_states"
                 :class="inputClass"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.mediaOutput')"
+              control-id="setting-media-output"
+              :description="t('settings.mediaOutputHelp')"
+              effect="service"
+              :changed="changedFields.has('media_output')"
+            >
+              <UiSelect id="setting-media-output" v-model="form.media_output" :class="inputClass">
+                <option value="inline">{{ t('settings.mediaOutputInline') }}</option>
+                <option value="url">{{ t('settings.mediaOutputURL') }}</option>
+              </UiSelect>
+            </SettingRow>
+            <SettingRow
+              v-if="form.media_output === 'url'"
+              :label="t('settings.mediaBaseURL')"
+              control-id="setting-media-base-url"
+              :description="t('settings.mediaBaseURLHelp')"
+              effect="service"
+              :changed="changedFields.has('media_base_url')"
+            >
+              <input
+                id="setting-media-base-url"
+                v-model.trim="form.media_base_url"
+                :class="inputClass"
+                placeholder="https://example.com"
                 autocomplete="off"
                 spellcheck="false"
               />
@@ -479,6 +519,22 @@ async function saveConfig(): Promise<void> {
                 v-model.trim="form.model_mapping"
                 :class="inputClass"
                 placeholder="claude-haiku-5-5:gemini-3.8-flash"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.modelChannels')"
+              control-id="setting-model-channels"
+              :description="t('settings.modelChannelsHelp')"
+              effect="immediate"
+              :changed="changedFields.has('model_channels')"
+            >
+              <input
+                id="setting-model-channels"
+                v-model.trim="form.model_channels"
+                :class="inputClass"
+                placeholder="gemini-4-argon:playground"
                 autocomplete="off"
                 spellcheck="false"
               />

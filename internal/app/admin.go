@@ -160,7 +160,7 @@ func (admin *runtimeAdmin) Accounts(context.Context) ([]api.AdminAccount, error)
 	return accounts, nil
 }
 
-func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountCreateInput) (api.AdminAccount, error) {
+func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountCreateInput, view *camoufoxnative.LiveView) (api.AdminAccount, error) {
 	accountConfig := aistudio.DefaultAccountConfig("")
 	accountConfig.Proxy = strings.TrimSpace(input.Proxy)
 	if locale := strings.TrimSpace(input.Locale); locale != "" {
@@ -181,7 +181,7 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 	admin.requests.log("auth", "INFO", "账户添加 | 1/2 | 等待隔离登录")
 	result, err := admin.login.Login(ctx, aistudio.IsolatedLoginRequest{
 		AccountID: "new", Directory: directory, Proxy: admin.effectiveProxy(accountConfig.Proxy),
-		Locale: accountConfig.Locale, Timezone: accountConfig.Timezone,
+		Locale: accountConfig.Locale, Timezone: accountConfig.Timezone, View: view,
 	})
 	if err != nil {
 		admin.requests.log("auth", "ERROR", fmt.Sprintf(
@@ -192,6 +192,9 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 	}
 	if result.DriveError != "" {
 		admin.requests.log("auth", "WARN", "账户添加 | Drive 授权失败 | 错误="+result.DriveError)
+	}
+	if result.CloseError != "" {
+		admin.requests.log("auth", "WARN", "账户添加 | 关闭 Camoufox 失败 | 错误="+result.CloseError)
 	}
 	admin.requests.log("auth", "INFO", "账户添加 | 2/2 | 保存认证状态")
 	if _, err := aistudio.NewSigner().Sign(result.StorageState); err != nil {
@@ -240,6 +243,60 @@ func (admin *runtimeAdmin) ChromeImportProfiles(context.Context) ([]api.ChromeIm
 		})
 	}
 	return profiles, nil
+}
+
+// CookieBrowsers 列出本机开启远程调试的浏览器，读取其 Cookie 并识别其中登录 AI Studio 的账户
+func (admin *runtimeAdmin) CookieBrowsers(ctx context.Context) ([]api.CookieBrowser, error) {
+	addresses, err := chromeauth.DebugAddresses(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]struct{})
+	for _, status := range admin.pool.Status() {
+		existing[strings.ToLower(strings.TrimSpace(status.ID))] = struct{}{}
+	}
+	browsers := make([]api.CookieBrowser, len(addresses))
+	var group sync.WaitGroup
+	for index, address := range addresses {
+		group.Go(func() {
+			browser := api.CookieBrowser{Address: address}
+			name, err := chromeauth.DebugBrowserName(ctx, address)
+			if err != nil {
+				browser.Error = err.Error()
+				browsers[index] = browser
+				return
+			}
+			browser.Browser = name
+			err = admin.readCookieBrowser(ctx, &browser)
+			browser.SignedOut = errors.Is(err, chromeauth.ErrSignedOut) || errors.Is(err, aistudio.ErrLoginCookieMissing)
+			if err != nil && !browser.SignedOut {
+				browser.Error = err.Error()
+			}
+			_, browser.Imported = existing[strings.ToLower(browser.Email)]
+			browsers[index] = browser
+		})
+	}
+	group.Wait()
+	return browsers, nil
+}
+
+// readCookieBrowser 读取调试浏览器的语言、时区与 Cookie，填入其中登录 AI Studio 的账户邮箱
+func (admin *runtimeAdmin) readCookieBrowser(ctx context.Context, browser *api.CookieBrowser) error {
+	source, err := chromeauth.ReadCDPBrowser(ctx, browser.Address)
+	if err != nil {
+		return err
+	}
+	browser.Locale, browser.Timezone = source.Locale, source.Timezone
+	state, err := aistudio.ParseCookieText(source.Cookies)
+	if err != nil {
+		return err
+	}
+	verification, err := chromeauth.Verify(ctx, &state, admin.effectiveProxy(""))
+	if err != nil {
+		return err
+	}
+	browser.Email = strings.ToLower(verification.Email)
+	return nil
 }
 
 func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.ChromeImportInput) ([]api.AdminAccount, error) {
@@ -295,9 +352,21 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 	return accounts, nil
 }
 
-// ImportAccountState 导入远程配对上传的认证状态与 Camoufox 指纹
+// ImportAccountState 导入远程配对上传或 Cookie 导入的认证状态与 Camoufox 指纹，未给标签时以 Cookie 登录的账户邮箱为标签
 func (admin *runtimeAdmin) ImportAccountState(ctx context.Context, input api.AccountStateInput) (api.AdminAccount, error) {
-	accountConfig := aistudio.DefaultAccountConfig(strings.TrimSpace(input.Label))
+	label := strings.TrimSpace(input.Label)
+	if label == "" {
+		verification, err := chromeauth.Verify(ctx, &input.StorageState, admin.effectiveProxy(input.Proxy))
+		if errors.Is(err, chromeauth.ErrSignedOut) {
+			return api.AdminAccount{}, &adminOperationError{status: http.StatusBadRequest, code: "signed_out", message: err.Error()}
+		}
+		if err != nil {
+			return api.AdminAccount{}, invalidAccount(err)
+		}
+		label = strings.ToLower(verification.Email)
+	}
+	accountConfig := aistudio.DefaultAccountConfig(label)
+	accountConfig.Proxy = strings.TrimSpace(input.Proxy)
 	if locale := strings.TrimSpace(input.Locale); locale != "" {
 		accountConfig.Locale = locale
 	}
@@ -342,7 +411,7 @@ func (admin *runtimeAdmin) ImportAccountState(ctx context.Context, input api.Acc
 	if err != nil {
 		return api.AdminAccount{}, err
 	}
-	admin.requests.log("auth", "INFO", "远程配对账户已导入 | 账户="+account.Label)
+	admin.requests.log("auth", "INFO", "认证状态账户已导入 | 账户="+account.Label)
 	return account, nil
 }
 
@@ -472,7 +541,7 @@ func (admin *runtimeAdmin) DeleteAccount(_ context.Context, accountID string) er
 	return nil
 }
 
-func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (api.AdminAccount, error) {
+func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string, view *camoufoxnative.LiveView) (api.AdminAccount, error) {
 	lease, err := admin.pool.AcquireAccount(ctx, accountID)
 	if err != nil {
 		return api.AdminAccount{}, accountOperationError(err)
@@ -491,7 +560,9 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	}
 	startedAt := time.Now()
 	admin.requests.log(account.Config.Label, "INFO", "账户登录 | 1/2 | 等待隔离登录")
-	result, err := admin.login.Login(ctx, admin.loginRequest(account, directory))
+	request := admin.loginRequest(account, directory)
+	request.View = view
+	result, err := admin.login.Login(ctx, request)
 	if err != nil {
 		admin.requests.log(account.Config.Label, "ERROR", fmt.Sprintf(
 			"账户登录失败 | 耗时=%s | 错误=%s",
@@ -506,6 +577,9 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	}
 	if result.DriveError != "" {
 		admin.requests.log(account.Config.Label, "WARN", "账户登录 | Drive 授权失败 | 错误="+result.DriveError)
+	}
+	if result.CloseError != "" {
+		admin.requests.log(account.Config.Label, "WARN", "账户登录 | 关闭 Camoufox 失败 | 错误="+result.CloseError)
 	}
 	admin.requests.log(account.Config.Label, "INFO", "账户登录 | 2/2 | 保存认证状态")
 	if _, err := aistudio.NewSigner().Sign(result.StorageState); err != nil {
@@ -813,8 +887,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
 		ModelMapping:           strings.TrimSpace(value.ModelMapping),
+		ModelChannels:          strings.TrimSpace(value.ModelChannels),
 		TemporaryChat:          value.TemporaryChat,
 		WAABackend:             value.WAABackend,
+		MediaOutput:            strings.ToLower(strings.TrimSpace(value.MediaOutput)),
+		MediaBaseURL:           strings.TrimSpace(value.MediaBaseURL),
 	}
 	if err := cfg.Validate(); err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(err)
@@ -823,7 +900,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		return api.RuntimeConfig{}, err
 	}
 	admin.pool.SetRoutingStrategy(cfg.RoutingStrategy)
+	admin.pool.SetModelChannels(modelChannels(cfg.ModelChannels))
 	admin.requests.log("service", "INFO", "服务配置已保存")
+	if models, err := admin.CatalogModels(context.Background()); err == nil {
+		admin.requests.publish(api.AdminEvent{Type: "models", Data: map[string]any{"models": models}})
+	}
 	value = runtimeConfigDTO(cfg)
 	value.ActiveProxy = admin.config.Proxy
 	value.ProxyPool = admin.proxyPoolStatus()
@@ -840,9 +921,11 @@ func (admin *runtimeAdmin) Cooldowns(context.Context) ([]api.AdminCooldown, erro
 			models[modelID] = struct{}{}
 		}
 		effective := make(map[string]aistudio.CooldownState)
+		scopes := make(map[string]string)
 		if global, ok := account.Cooldowns["*"]; ok && global.Active(now) {
 			for modelID := range models {
 				effective[modelID] = global
+				scopes[modelID] = "*"
 			}
 		}
 		for key, cooldown := range account.Cooldowns {
@@ -855,6 +938,7 @@ func (admin *runtimeAdmin) Cooldowns(context.Context) ([]api.AdminCooldown, erro
 			}
 			if current, ok := effective[key]; !ok || cooldown.Until.After(current.Until) {
 				effective[key] = cooldown
+				scopes[key] = key
 			}
 		}
 		modelIDs := make([]string, 0, len(effective))
@@ -868,14 +952,35 @@ func (admin *runtimeAdmin) Cooldowns(context.Context) ([]api.AdminCooldown, erro
 			modelID, build := strings.CutPrefix(key, string(aistudio.ChannelBuild)+":")
 			if build {
 				channel = string(aistudio.ChannelBuild)
+			} else if admin.pool.AssistantModel(modelID) {
+				channel = string(aistudio.ChannelAssistant)
 			}
 			cooldowns = append(cooldowns, api.AdminCooldown{
 				AccountID: account.ID, AccountLabel: account.Label, Channel: channel,
-				ModelID: modelID, Until: cooldown.Until, Reason: cooldown.Reason,
+				ModelID: modelID, Scope: scopes[key], Until: cooldown.Until, Reason: cooldown.Reason,
 			})
 		}
 	}
 	return cooldowns, nil
+}
+
+// ClearCooldown 手动清除账户在一个作用域上的冷却，并推送新的冷却列表与账户状态
+func (admin *runtimeAdmin) ClearCooldown(ctx context.Context, accountID string, scope string) error {
+	account, err := admin.account(accountID)
+	if err != nil {
+		return err
+	}
+	if err := admin.pool.ClearCooldown(accountID, scope); err != nil {
+		return err
+	}
+	admin.requests.log(account.Label, "INFO", "冷却已手动清除 | 范围="+scope)
+	if cooldowns, err := admin.Cooldowns(ctx); err == nil {
+		admin.requests.publish(api.AdminEvent{Type: "cooldowns", Data: cooldowns})
+	}
+	if accounts, err := admin.Accounts(ctx); err == nil {
+		admin.requests.publish(api.AdminEvent{Type: "accounts", Data: map[string]any{"accounts": accounts}})
+	}
+	return nil
 }
 
 func (admin *runtimeAdmin) Requests(context.Context) ([]api.AdminRequest, error) {
@@ -1388,7 +1493,17 @@ func (registry *requestRegistry) publish(event api.AdminEvent) {
 	registry.mu.Unlock()
 }
 
+// version 是分发方编译时以 -ldflags "-X github.com/Mag1cFall/AIStudio2API/internal/app.version=<版本>" 写入的版本号
+var version string
+
+// managedBy 是分发方编译时以 -ldflags "-X github.com/Mag1cFall/AIStudio2API/internal/app.managedBy=<分发方>" 写入的更新管理方，非空时在线更新由该分发方负责
+var managedBy = "xiaoguofan"
+
+// buildVersion 返回链接时写入的版本号，没有时读取 Go 构建信息
 func buildVersion() string {
+	if version != "" {
+		return version
+	}
 	info, ok := debug.ReadBuildInfo()
 	if !ok || info.Main.Version == "" {
 		return "(devel)"
@@ -1413,8 +1528,11 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		RoutingStrategy:        cfg.RoutingStrategy,
 		UpstreamChannels:       cfg.UpstreamChannels,
 		ModelMapping:           cfg.ModelMapping,
+		ModelChannels:          cfg.ModelChannels,
 		TemporaryChat:          cfg.TemporaryChat,
 		WAABackend:             cfg.WAABackend,
+		MediaOutput:            cfg.MediaOutput,
+		MediaBaseURL:           cfg.MediaBaseURL,
 	}
 }
 

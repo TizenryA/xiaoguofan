@@ -287,6 +287,13 @@ func encodeBuildTools(tools Tools) ([]any, bool, error) {
 			if declaration.Description != "" {
 				encoded["description"] = declaration.Description
 			}
+			behavior, _, err := functionBehavior(declaration)
+			if err != nil {
+				return nil, false, fmt.Errorf("function declaration %d: %w", index, err)
+			}
+			if behavior != "" {
+				encoded["behavior"] = behavior
+			}
 			if len(bytes.TrimSpace(declaration.Parameters)) > 0 {
 				parameters, err := normalizeFunctionParameters(declaration.Parameters)
 				if err != nil {
@@ -445,7 +452,13 @@ type buildResponse struct {
 				EndIndex   int    `json:"endIndex"`
 			} `json:"citationSources"`
 		} `json:"citationMetadata"`
-		GroundingMetadata *buildGrounding `json:"groundingMetadata"`
+		GroundingMetadata  *buildGrounding `json:"groundingMetadata"`
+		URLContextMetadata *struct {
+			URLMetadata []struct {
+				RetrievedURL       string `json:"retrievedUrl"`
+				URLRetrievalStatus string `json:"urlRetrievalStatus"`
+			} `json:"urlMetadata"`
+		} `json:"urlContextMetadata"`
 	} `json:"candidates"`
 	PromptFeedback *struct {
 		BlockReason        string `json:"blockReason"`
@@ -508,10 +521,12 @@ var buildChunkSources = map[string]string{"web": "web", "retrievedContext": "ret
 type BuildStreamDecoder struct {
 	usage    *Usage
 	finished bool
+	frames   int
 }
 
 // Decode 解码一个 Gemini API GenerateContentResponse JSON
 func (d *BuildStreamDecoder) Decode(raw []byte) ([]Event, error) {
+	d.frames++
 	var response buildResponse
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return nil, &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$chunk", Detail: err.Error(), Raw: cloneRaw(raw)}
@@ -558,8 +573,17 @@ func (d *BuildStreamDecoder) Decode(raw []byte) ([]Event, error) {
 			events = append(events, Event{Kind: EventCitation, Citation: &citation})
 		}
 	}
-	if grounding := candidate.GroundingMetadata; grounding != nil {
-		events = append(events, Event{Kind: EventGrounding, Grounding: decodeBuildGrounding(*grounding)})
+	if candidate.GroundingMetadata != nil || candidate.URLContextMetadata != nil {
+		grounding := &GroundingMetadata{}
+		if candidate.GroundingMetadata != nil {
+			grounding = decodeBuildGrounding(*candidate.GroundingMetadata)
+		}
+		if candidate.URLContextMetadata != nil {
+			for _, item := range candidate.URLContextMetadata.URLMetadata {
+				grounding.URLContext = append(grounding.URLContext, URLMetadata{RetrievedURL: item.RetrievedURL, Status: item.URLRetrievalStatus})
+			}
+		}
+		events = append(events, Event{Kind: EventGrounding, Grounding: grounding})
 	}
 	if candidate.FinishReason != "" && !d.finished {
 		if d.usage != nil {
@@ -577,7 +601,7 @@ func (d *BuildStreamDecoder) End() error {
 	if d.finished {
 		return nil
 	}
-	return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: "流结束前没有 finishReason"}
+	return &StreamInterruptedError{Method: buildProxyStreamedMethod, Frames: d.frames, Err: errMissingFinishFrame}
 }
 
 // buildEnumName 把 Gemini API 枚举名转换为规范小写名称
@@ -688,21 +712,26 @@ func decodeBuildGrounding(value buildGrounding) *GroundingMetadata {
 
 // DecodeBuildStream 解码 ProxyStreamedCall 响应：field 1 为 [["<JSON>"]...]，其后可带 google.rpc 状态
 func DecodeBuildStream(source io.Reader, decoder *BuildStreamDecoder, emit func(Event) error) error {
-	stream := json.NewDecoder(newSparseJSONReader(source))
+	reader := &streamReadRecorder{source: source}
+	stream := json.NewDecoder(newSparseJSONReader(reader))
 	stream.UseNumber()
+	index := 0
+	fail := func(path string, detail string) error {
+		return reader.failure(buildProxyStreamedMethod, index, &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: path, Detail: detail})
+	}
 	if token, err := stream.Token(); err != nil || token != json.Delim('[') {
-		return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: "根值不是数组"}
+		return fail("$", "根值不是数组")
 	}
 	if !stream.More() {
-		return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: "根数组缺少响应列表"}
+		return fail("$", "根数组缺少响应列表")
 	}
 	if token, err := stream.Token(); err != nil || token != json.Delim('[') {
-		return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$[0]", Detail: "响应列表不是数组"}
+		return fail("$[0]", "响应列表不是数组")
 	}
-	for index := 0; stream.More(); index++ {
+	for ; stream.More(); index++ {
 		var raw json.RawMessage
 		if err := stream.Decode(&raw); err != nil {
-			return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: fmt.Sprintf("$[0][%d]", index), Detail: err.Error()}
+			return fail(fmt.Sprintf("$[0][%d]", index), err.Error())
 		}
 		chunk, err := buildProxyResponseBody(raw, fmt.Sprintf("$[0][%d]", index))
 		if err != nil {
@@ -719,16 +748,19 @@ func DecodeBuildStream(source io.Reader, decoder *BuildStreamDecoder, emit func(
 		}
 	}
 	if token, err := stream.Token(); err != nil || token != json.Delim(']') {
-		return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$[0]", Detail: "响应列表没有正常结束"}
+		return fail("$[0]", "响应列表没有正常结束")
 	}
 	for stream.More() {
 		var raw json.RawMessage
 		if err := stream.Decode(&raw); err != nil {
-			return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: err.Error()}
+			return fail("$", err.Error())
 		}
 		if err := buildTrailerError(raw); err != nil {
 			return err
 		}
+	}
+	if err := reader.failure(buildProxyStreamedMethod, index, nil); err != nil {
+		return err
 	}
 	return decoder.End()
 }
@@ -737,7 +769,7 @@ func DecodeBuildStream(source io.Reader, decoder *BuildStreamDecoder, emit func(
 func DecodeBuildUnary(source io.Reader, decoder *BuildStreamDecoder, emit func(Event) error) error {
 	raw, err := io.ReadAll(source)
 	if err != nil {
-		return fmt.Errorf("读取 AI Studio %s: %w", buildProxyUnaryMethod, err)
+		return &StreamInterruptedError{Method: buildProxyUnaryMethod, Err: err}
 	}
 	decoded, err := decodeJSONValue(raw)
 	if err != nil {

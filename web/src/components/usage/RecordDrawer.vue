@@ -57,7 +57,7 @@ const summary = computed(() => {
     { label: t('usage.dimension.account'), value: record.account || '—' },
     { label: t('usage.dimension.channel'), value: dimensionLabel('channel', record.channel) },
     { label: t('usage.dimension.protocol'), value: dimensionLabel('protocol', record.protocol) },
-    { label: t('usage.path'), value: record.path },
+    { label: t('usage.path'), value: record.path, wide: true },
     { label: t('usage.dimension.status'), value: String(record.status) },
     { label: t('usage.duration'), value: duration(record.duration_ms) },
     { label: t('usage.firstEvent'), value: duration(record.first_event_ms) },
@@ -101,7 +101,7 @@ async function copy(kind: string, text: string): Promise<void> {
       <DialogOverlay class="fixed inset-0 z-[70] bg-black/60" />
       <DialogContent
         v-if="record"
-        class="ui-sheet fixed inset-y-0 right-0 z-[71] flex w-full max-w-2xl flex-col border-l border-line bg-panel shadow-2xl focus:outline-none"
+        class="fixed top-1/2 left-1/2 z-[71] flex max-h-[85vh] w-[calc(100vw-2rem)] max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col rounded-lg border border-line bg-panel shadow-2xl focus:outline-none"
       >
         <header class="flex items-start gap-3 border-b border-line px-5 py-4">
           <div class="min-w-0 flex-1">
@@ -129,7 +129,7 @@ async function copy(kind: string, text: string): Promise<void> {
             <UiIcon name="close" :size="16" />
           </DialogClose>
         </header>
-        <div class="flex-1 space-y-5 overflow-y-auto px-5 py-4 text-sm">
+        <div class="min-h-0 flex-1 space-y-5 overflow-y-auto px-5 py-4 text-sm">
           <section>
             <h3 class="mb-2 text-xs font-medium tracking-wide text-gray-500 uppercase">
               {{ t('usage.detailSummary') }}
@@ -159,6 +159,7 @@ async function copy(kind: string, text: string): Promise<void> {
                 v-for="item in summary"
                 :key="item.label"
                 class="flex min-w-0 justify-between gap-3"
+                :class="item.wide ? 'sm:col-span-2' : ''"
               >
                 <dt class="shrink-0 text-gray-500">{{ item.label }}</dt>
                 <dd v-tooltip="item.value" class="truncate text-right text-gray-200 tabular-nums">
@@ -172,7 +173,7 @@ async function copy(kind: string, text: string): Promise<void> {
               {{ t('usage.detailError') }}
             </h3>
             <pre
-              class="rounded-md border border-red-500/30 bg-red-500/5 p-3 font-mono text-xs leading-5 whitespace-pre-wrap break-words text-red-200"
+              class="rounded-md border border-red-500/30 bg-red-500/5 p-3 font-mono text-xs leading-5 whitespace-pre-wrap [overflow-wrap:anywhere] text-red-200"
               >{{ record.error }}</pre>
           </section>
           <section>
@@ -197,7 +198,9 @@ async function copy(kind: string, text: string): Promise<void> {
                     duration(attempt.duration_ms)
                   }}</span>
                 </div>
-                <p class="mt-0.5 font-mono break-words text-red-300/90">{{ attempt.error }}</p>
+                <p class="mt-0.5 font-mono [overflow-wrap:anywhere] text-red-300/90">
+                  {{ attempt.error }}
+                </p>
               </li>
             </ol>
           </section>
@@ -251,7 +254,7 @@ async function copy(kind: string, text: string): Promise<void> {
                   </button>
                 </div>
                 <pre
-                  class="max-h-80 overflow-auto rounded-md border border-line bg-canvas p-3 font-mono text-xs leading-5 whitespace-pre-wrap break-words text-gray-300"
+                  class="max-h-80 overflow-auto rounded-md border border-line bg-canvas p-3 font-mono text-xs leading-5 whitespace-pre-wrap [overflow-wrap:anywhere] text-gray-300"
                   >{{ pretty(part.text) }}</pre>
               </div>
             </template>

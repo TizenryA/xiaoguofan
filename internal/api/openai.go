@@ -38,6 +38,18 @@ type chatRequest struct {
 	WebSearchOptions    json.RawMessage   `json:"web_search_options"`
 	Functions           []json.RawMessage `json:"functions"`
 	FunctionCall        json.RawMessage   `json:"function_call"`
+	ExtraBody           chatExtraBody     `json:"extra_body"`
+}
+
+// chatExtraBody 是 Gemini OpenAI 兼容层的 extra_body 扩展
+type chatExtraBody struct {
+	Google struct {
+		ThinkingConfig *struct {
+			IncludeThoughts *bool  `json:"include_thoughts"`
+			ThinkingLevel   string `json:"thinking_level"`
+			ThinkingBudget  *int64 `json:"thinking_budget"`
+		} `json:"thinking_config"`
+	} `json:"google"`
 }
 
 type chatStreamOptions struct {
@@ -212,6 +224,10 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	if err := s.restoreMediaLinks(generateRequest.Contents); err != nil {
+		writeOpenAIRequestError(w, err)
+		return
+	}
 	if err := inlineRemoteMedia(r.Context(), generateRequest.Contents); err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -252,7 +268,14 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.thoughtSignatures.Remember(results[index].toolCalls)
 	}
 	choices.record(r.Context(), results)
-	writeJSON(w, http.StatusOK, buildChatCompletion(requestID, created, request.Model, results, request.Tools))
+	media := s.mediaOutputFor(r)
+	for index := range results {
+		if err := media.saveEvents(results[index].events); err != nil {
+			writeOpenAIRequestError(w, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, buildChatCompletion(requestID, created, request.Model, results, request.Tools, media))
 }
 
 // mergeLegacyFunctions 把旧式 functions 与 function_call 并入 tools 与 tool_choice，旧式函数每轮最多一个调用
@@ -841,6 +864,18 @@ func (request chatRequest) generationConfig() (aistudio.GenerationConfig, error)
 			config.ReasoningEffort = reasoning.Effort
 		}
 	}
+	if thinking := request.ExtraBody.Google.ThinkingConfig; thinking != nil {
+		if thinking.ThinkingLevel != "" {
+			config.ReasoningEffort = thinking.ThinkingLevel
+		}
+		// thinking_budget -1 为动态思考，使用模型默认思考设置
+		if thinking.ThinkingBudget != nil && *thinking.ThinkingBudget != -1 {
+			config.ThinkingBudget = thinking.ThinkingBudget
+		}
+		if thinking.IncludeThoughts != nil {
+			config.HideThinking = !*thinking.IncludeThoughts
+		}
+	}
 	if len(request.ResponseFormat) > 0 && string(request.ResponseFormat) != "null" {
 		var format struct {
 			Type       string `json:"type"`
@@ -891,7 +926,7 @@ func normalizeStopSequences(values []string) []string {
 	return normalized
 }
 
-func buildChatCompletion(id string, created int64, model string, results []generationResult, tools []openAITool) map[string]any {
+func buildChatCompletion(id string, created int64, model string, results []generationResult, tools []openAITool, media mediaOutput) map[string]any {
 	choices := make([]any, 0, len(results))
 	response := map[string]any{
 		"id":      id,
@@ -900,7 +935,7 @@ func buildChatCompletion(id string, created int64, model string, results []gener
 		"model":   model,
 	}
 	for index := range results {
-		choices = append(choices, chatCompletionChoice(index, results[index], tools))
+		choices = append(choices, chatCompletionChoice(index, results[index], tools, media))
 		if results[index].providerModel != "" && response["provider_model"] == nil {
 			response["provider_model"] = results[index].providerModel
 		}
@@ -913,8 +948,8 @@ func buildChatCompletion(id string, created int64, model string, results []gener
 }
 
 // chatCompletionChoice 构造非流式响应中第 index 个 choice
-func chatCompletionChoice(index int, result generationResult, tools []openAITool) map[string]any {
-	rendered, spans := renderedContent(result.events)
+func chatCompletionChoice(index int, result generationResult, tools []openAITool, media mediaOutput) map[string]any {
+	rendered, spans := renderedContent(result.events, media)
 	content := any(rendered)
 	if rendered == "" && len(result.toolCalls) > 0 {
 		content = nil
@@ -963,14 +998,15 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 		defer writing.Unlock()
 		return writeSSEHeartbeat(w)
 	}
+	media := s.mediaOutputFor(r)
 	results, err := choices.run(func(index int, events <-chan aistudio.Event) (generationResult, error) {
-		choice := &chatStreamChoice{server: s, tools: request.Tools, index: index, write: write}
+		choice := &chatStreamChoice{server: s, tools: request.Tools, index: index, write: write, media: media}
 		result, err := consumeStreamEvents(choices.ctx, events, choice.emit, heartbeat)
 		if err != nil {
 			return result, err
 		}
 		if len(result.citations) > 0 {
-			rendered, spans := renderedContent(result.events)
+			rendered, spans := renderedContent(result.events, media)
 			_ = write(index, map[string]any{"annotations": openAICitations(result.citations, rendered, spans)}, nil)
 		}
 		finish := chatFinishReason(result, request.Tools)
@@ -986,7 +1022,7 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 			status := statusFromError(err)
 			code := openAIErrorCode(err)
 			_ = writeSSE(w, "", map[string]any{"error": map[string]any{
-				"message": err.Error(),
+				"message": publicErrorMessage(status, err.Error()),
 				"type":    openAIErrorType(status, code),
 				"param":   nil,
 				"code":    code,
@@ -1020,6 +1056,7 @@ type chatStreamChoice struct {
 	toolIndex              int
 	hasContent             bool
 	contentEndsWithNewline bool
+	media                  mediaOutput
 }
 
 // emit 写出一个上游事件对应的 delta
@@ -1048,7 +1085,10 @@ func (choice *chatStreamChoice) emit(event aistudio.Event) error {
 		if event.Media == nil {
 			return nil
 		}
-		content := renderMediaMarkdown(*event.Media)
+		if err := choice.media.save(*event.Media); err != nil {
+			return err
+		}
+		content := choice.media.markdown(*event.Media)
 		if choice.hasContent && !choice.contentEndsWithNewline {
 			content = "\n" + content
 		}
@@ -1207,7 +1247,7 @@ func openAIUsage(usage *aistudio.Usage) map[string]any {
 }
 
 // renderedContent 返回 Chat 消息正文与其中各段连续正文的位置：正文原样拼接，媒体与代码执行渲染为 Markdown
-func renderedContent(events []aistudio.Event) (string, []textSpan) {
+func renderedContent(events []aistudio.Event, media mediaOutput) (string, []textSpan) {
 	var content strings.Builder
 	var spans []textSpan
 	source, joined := 0, false
@@ -1230,7 +1270,7 @@ func renderedContent(events []aistudio.Event) (string, []textSpan) {
 			if content.Len() > 0 && !strings.HasSuffix(content.String(), "\n") {
 				content.WriteByte('\n')
 			}
-			content.WriteString(renderMediaMarkdown(*event.Media))
+			content.WriteString(media.markdown(*event.Media))
 		case aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
 			rendered := renderCodeExecution(event)
 			if rendered == "" {

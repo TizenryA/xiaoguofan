@@ -15,19 +15,39 @@
 
 <p>
   Playground + Build Dual Quota Channels &nbsp;•&nbsp;
-  High-Concurrency Multi-Account &nbsp;•&nbsp;
-  Camoufox and Pure Go WAA Backends<br>
+  Build Code Assistant Chat Channel &nbsp;•&nbsp;
+  High-Concurrency Multi-Account<br>
+  Camoufox and Pure Go WAA Backends &nbsp;•&nbsp;
   Claude Code, Codex, and Other Agent Clients &nbsp;•&nbsp;
   Nano Banana, Veo, TTS, and Omni
 </p>
 
 </div>
 
+<table>
+  <tr>
+    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/accounts-dark.webp"><img src="docs/images/accounts-light.webp" alt="Accounts"></picture><br><b>Accounts</b>: Tier, egress and state of every account; add, sign in and refresh from here</td>
+    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/usage-dark.webp"><img src="docs/images/usage-light.webp" alt="Usage"></picture><br><b>Usage</b>: Requests, success rate, tokens, estimated cost and first-token latency, filtered by model, account or channel</td>
+    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/logs-dark.webp"><img src="docs/images/logs-light.webp" alt="Logs"></picture><br><b>Logs</b>: Model, account, tokens, speed and first-token time of every request</td>
+  </tr>
+  <tr>
+    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/models-dark.webp"><img src="docs/images/models-light.webp" alt="Model catalog"></picture><br><b>Model catalog</b>: Models and capabilities merged from each account’s live catalog</td>
+    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/settings-dark.webp"><img src="docs/images/settings-light.webp" alt="Settings"></picture><br><b>Settings</b>: Every <code>.env</code> option can be changed in the UI</td>
+    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/image-dark.webp"><img src="docs/images/image-light.webp" alt="Image generation"></picture><br><b>Image generation</b>: Nano Banana text-to-image and editing with the same run settings as AI Studio</td>
+  </tr>
+  <tr>
+    <td colspan="3"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/chat-dark.webp"><img src="docs/images/chat-light.webp" alt="API playground: chat with thinking, math tables and code blocks" width="100%"></picture><br><b>API playground</b>: The AI Studio chat page with thinking, math tables and code blocks</td>
+  </tr>
+</table>
+
+**Get started in three steps**: download a [release](https://github.com/Mag1cFall/AIStudio2API/releases) and launch it → add a Google account on the Accounts page → click "Start service" and use `http://127.0.0.1:2048` as the Base URL of your OpenAI, Anthropic or Gemini client
+
 ---
 
 ## Core Capabilities
 
 - **Dual Quota Channels**: Every account has separate Playground and Build app proxy quotas, and `UPSTREAM_CHANNELS` enables either or both; when one channel hits its limit, the same account continues on the other
+- **Build Chat Models**: Every model selectable in the Build chat panel is also listed as `<model>-build` (for example `gemini-3.8-flash-build`), answered by the Build code assistant with its system prompt and billed to the Build chat quota (free requests or the Google AI subscription). ⚠️ Every request to these models carries the Build code assistant's own injected system prompt, which shapes the answer's style, format, and persona; evaluate whether that fits your use
 - **High-Concurrency Multi-Account**: Detects Free, Pro, Ultra, and Plus benefits and routes across accounts by the live model catalog with round-robin or fill-first
 - **Two WAA Backends**: Camoufox holds the official WAA lifecycle by default; with `WAA_BACKEND=go`, pure Go generates the official proof and no browser is downloaded or launched at runtime
 - **Four API Protocols**: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent; Responses supports context compaction through `/v1/responses/compact` and `compaction` and `compaction_trigger` input items
@@ -40,6 +60,7 @@
 - **TTS Speech Generation**: Gemini TTS models for single-speaker and multi-speaker audio
 - **Image Generation**: Nano Banana image generation
 - **Video Generation**: Veo video generation and image-to-video; Gemini Omni accepts text, image, and video input and returns text and MP4 video through the four generation APIs
+- **Deep Research**: Pro and Ultra accounts can run Deep Research through the four generation APIs and the Interactions `agent` field, returning the research process, a cited report, and charts
 - **YouTube Input**: Paste a video URL to attach and read the external video
 - **Smart Model Switching**: Discover models from AI Studio and route through the `model` field
 - **Google Tools**: Search, Image Search, URL Context, Code Execution, and Maps
@@ -47,13 +68,17 @@
 - **Live and Robotics**: WebSocket text, audio, JPEG images, media end, tool calls, resumption, and interruption
 - **Anti-Fingerprinting**: Camoufox holds the official WAA lifecycle with a stable browser fingerprint and network exit per account
 - **GUI Launcher**: Manage accounts, service controls, live logs, models, requests, usage statistics, and configuration in the web UI, with dark and light color themes
+- **Desktop App**: Windows, macOS, and Linux desktop apps show the management UI in a window and keep running in the system tray after the window is closed
+- **Online Update**: The Version page shows the latest release and its notes; the Windows and macOS desktop apps and the Linux and macOS command-line builds download, verify, and restart into the new version in one click, while the Linux desktop app points to the new installer
 - **Modular Architecture**: Go handles protocols, scheduling, APIs, and management; Camoufox hosts WAA and isolated login
 
 ## System Requirements
 
-- **Windows Release Runtime**: Windows 10 or later, `aistudio2api.exe`, and `start.bat`
-- **Linux Release Runtime**: Extract `linux-amd64.tar.gz` and run `./aistudio2api`; Camoufox needs the Firefox system libraries, on Debian/Ubuntu run `sudo apt install libgtk-3-0 libasound2 libnss3 libdbus-glib-1-2 libxtst6 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxfixes3 fonts-liberation`
-- **Source Build**: Go 1.26.0+, Node.js 22.13+ or 24+, and its bundled npm
+- **Windows Release Runtime**: Windows 10 or later; on systems without the WebView2 Runtime, the desktop app opens the management UI in the default browser
+- **macOS Desktop App**: macOS 12 or later, universal for Apple silicon and Intel
+- **Linux Desktop App**: GTK 4 and WebKitGTK 6.0, such as Ubuntu 24.04, Debian 13, or later; the deb installs these and the Camoufox libraries, while the AppImage also needs the Camoufox libraries listed on the next line
+- **Linux Release Runtime**: Extract `linux-amd64.tar.gz` and run `./aistudio2api`; Camoufox needs the Firefox system libraries, on Debian/Ubuntu run `sudo apt install libgtk-3-0 libasound2 libnss3 libdbus-glib-1-2 libxtst6 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxfixes3 xvfb`
+- **Source Build**: Go 1.26.0+, Node.js 22.18+, 24.11+, or 26+, and its bundled npm
 - **Operating System**: Windows, macOS, Linux
 - **Memory**: 2GB+ available memory for one account; each resident prewarmed account adds about 0.6GB
 - **Network**: Stable internet connection to Google AI Studio
@@ -62,7 +87,11 @@
 
 ### Method 1: Windows One-Click Start (Recommended)
 
-Download the `windows-amd64.zip` package from [Releases](https://github.com/Mag1cFall/AIStudio2API/releases), extract it, and run `start.bat`. The package includes the management interface and is ready to run.
+Download the `windows-amd64.zip` package from [Releases](https://github.com/Mag1cFall/AIStudio2API/releases), extract it, and double-click `aistudio2api.exe`:
+
+- The management UI opens in a desktop window; on first launch the window shows a startup screen until Camoufox finishes downloading
+- Closing the window keeps the app running in the system tray; the tray menu shows the window, opens the management UI in the browser, or quits
+- Double-clicking `aistudio2api.exe` again brings back the running window
 
 To start from source:
 
@@ -70,24 +99,49 @@ To start from source:
 git clone https://github.com/Mag1cFall/AIStudio2API.git
 cd AIStudio2API
 copy .env.example .env
+cd web
+npm ci
+npm run build
+cd ..
+go build -o aistudio2api.exe ./cmd/aistudio2api
+.\aistudio2api.exe
 ```
 
-Then double-click `start.bat`. You can also run it from PowerShell:
+The first launch downloads Camoufox for the current platform to `runtime/camoufox/`:
 
-```powershell
-.\start.bat
+- The download goes through the first proxy in `PROXY`, or the system proxy when it is unset
+- An interrupted download resumes from the downloaded part on the next launch
+- `CAMOUFOX_PATH` selects an existing executable of the same version; a different version stops startup with an error naming the required version
+
+### Method 2: macOS and Linux Desktop App
+
+On macOS, download `darwin-universal.dmg` from Releases, open it, and drag `AIStudio2API.app` into Applications. The app is ad-hoc signed; when the system blocks the first launch, click "Open Anyway" in System Settings → Privacy & Security, or run:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/AIStudio2API.app
 ```
 
-The script runs an existing `aistudio2api.exe` immediately. In a source checkout without the executable, it installs frontend dependencies and builds the frontend and Go program.
+On Linux, make `linux-amd64.AppImage` executable and run it, or install `linux-amd64.deb` and start AIStudio2API from the application menu:
 
-The first launch downloads Camoufox for the current platform to `runtime/camoufox/`. Set `CAMOUFOX_PATH` to use an existing executable instead.
+```bash
+chmod +x aistudio2api-<version>-linux-amd64.AppImage
+./aistudio2api-<version>-linux-amd64.AppImage
+sudo apt install ./aistudio2api-<version>-linux-amd64.deb
+```
 
-### Method 2: Linux and macOS Source Build
+The desktop app keeps `.env`, `auth/`, and `runtime/` in:
+
+- macOS: `~/Library/Application Support/AIStudio2API/`
+- Linux: `~/.config/AIStudio2API/`
+
+Run `setup` and other commands with the desktop executable in a terminal, such as `/Applications/AIStudio2API.app/Contents/MacOS/aistudio2api setup --login`; the deb installs the executable as `aistudio2api`.
+
+### Method 3: Linux and macOS Source Build
 
 #### 1. Install Dependencies
 
 - Go 1.26.0 or later
-- Node.js 22.13+ or 24+, with its bundled npm
+- Node.js 22.18+, 24.11+, or 26+, with its bundled npm
 
 #### 2. Clone the Project
 
@@ -111,7 +165,7 @@ chmod +x ./aistudio2api
 
 The first Linux or macOS launch also prepares the matching Camoufox build automatically.
 
-### Method 3: Docker
+### Method 4: Docker
 
 ```bash
 mkdir aistudio2api && cd aistudio2api
@@ -128,7 +182,7 @@ docker compose up -d
 The image supports linux/amd64 and linux/arm64, and the service listens on `0.0.0.0:2048` inside the container. `data/` holds `.env`, `auth/`, and `runtime/`; with the Camoufox backend, the first start downloads Camoufox to `data/runtime/camoufox/`. To migrate an existing installation, copy these three items into `data/`. The container runs as root, so files the service writes in `data/` are owned by root; edit them with `sudo` on Linux hosts.
 
 - Set `PROXY_API_KEY` when the port is reachable from other machines. Opening the console from outside the container requires `ADMIN_AUTH_ENABLED=true` and a console password; the default username is `admin`.
-- Add accounts: copy `auth/<Google email>/` from a computer that can sign in to Google into `data/auth/`, or click "Add remotely" on the console Accounts page to get a pairing token, open an SSH tunnel with `ssh -L 2048:127.0.0.1:2048 <server>`, and run `setup --remote http://127.0.0.1:2048` on that computer.
+- Add accounts: choose "Sign in with browser" in "Add account" on the console and sign in to Google in the sign-in window that opens in the console; you can also paste cookies, or copy `auth/<Google email>/` from a computer that can sign in to Google into `data/auth/`.
 - `PROXY` and account proxies are reached from inside the container; when the proxy runs on the host, use the host's LAN address and allow LAN connections on the proxy.
 - Run `docker compose restart` after editing `data/.env`, `docker compose pull && docker compose up -d` to update the image, and `docker compose up -d --build` in the source directory to build from source.
 
@@ -141,7 +195,7 @@ The image supports linux/amd64 and linux/arm64, and the service listens on `0.0.
    Windows can import a local Chrome account:
 
    ```powershell
-   start.bat setup
+   cmd /c start /wait aistudio2api.exe setup
    ```
 
    Linux and macOS use an isolated Camoufox login:
@@ -153,15 +207,19 @@ The image supports linux/amd64 and linux/arm64, and the service listens on `0.0.
    The Google email is read from AI Studio after login, and Google Drive is authorized for the account. The account is saved under the path configured by `AISTUDIO_AUTH_STATES` in `.env`. Locale and timezone default to the current computer and can be set with `--locale` and `--timezone`.
 
 2. **Start the management UI**:
-   - Double-click `start.bat` on Windows
-   - Run `./aistudio2api` on Linux or macOS
-   - The browser opens `http://127.0.0.1:2048`
+   - Double-click `aistudio2api.exe` on Windows
+   - Start the macOS or Linux desktop app from the application menu, or run `./aistudio2api` for the command-line build
+   - The desktop app opens the management UI in its window; the command-line build opens `http://127.0.0.1:2048` in the browser
    - The initial state is `STOPPED`, with Logs open by default
 
 3. **Add another account**:
-   - Open Accounts
-   - "Import Chrome accounts" supports selecting multiple local Chrome accounts
-   - "Browser login" opens an isolated Camoufox window, detects the email after login, authorizes Google Drive, and saves the account; when Google asks to verify your identity, confirm it in that window or on your phone
+   - Open Accounts and click "Add account" to pick a method
+   - "Import from Chrome" supports selecting multiple local Chrome accounts
+   - "Paste cookies" takes the JSON exported on aistudio.google.com by a cookie extension (such as Cookie-Editor), a Cookie request header line, or a Netscape cookies.txt file, and the service detects the account email
+   - "Import from an antidetect browser" lists the windows signed in to AI Studio in local antidetect browsers and Chromium with their language and time zone; select them and import, and each account keeps the language and time zone of its browser. The browser needs remote debugging enabled
+   - "Sign in with browser" opens an isolated Camoufox window, detects the email after login, authorizes Google Drive, and saves the account; when Google asks to verify your identity, confirm it in that window or on your phone
+   - When the server has no graphical display, or the console is opened from another computer or through a reverse proxy, Camoufox for "Sign in with browser" and "Sign in again" runs headless on the server and its screen appears in a full-screen sign-in window in the console, where you click, type and paste; Cancel ends the sign-in
+   - Account proxy, locale and time zone are under "More settings" in the dialog
 
 4. **Start the API**:
    - Click "Start service" to start the data plane
@@ -181,24 +239,31 @@ Account actions depend on state:
 
 ### Daily Use (With Existing Authentication)
 
-1. Double-click `start.bat` on Windows; run `./aistudio2api` on Linux or macOS
+1. Double-click `aistudio2api.exe` or start the desktop app from the application menu; run `./aistudio2api` for the command-line build
 2. Click "Start service" to enable the APIs; with `AUTO_START=true`, the service starts together with the manager
 3. "Stop service" cancels an in-progress launch or active requests and closes WAA workers while the management UI and Logs remain available
 4. Click "Start service" again to resume the APIs
 
 Starting again loads the latest data-plane settings from `.env`; the account selection strategy and worker capacity apply as soon as they are saved. Changes to `LISTEN_ADDR` or `PROXY_API_KEY` require restarting the management process.
 
-Press `Ctrl+C` in the launch window or close that window to exit the manager. Closing the browser tab does not stop the manager.
+Closing the desktop window keeps the app running in the system tray; choose Quit in the tray menu to exit the manager. For the command-line build, press `Ctrl+C` in the launch window or close that window to exit the manager. Closing the browser tab does not stop the manager.
 
 ### Quick Start
 
-`start.bat`: Starts the manager and opens the web UI.
+On Windows, run these commands for the desktop app as `cmd /c start /wait aistudio2api.exe <arguments>`; the command line returns after the program exits.
 
-`start.bat -open-ui=false`: Starts the manager without opening the web UI.
+`aistudio2api`: Starts the manager and opens the management UI, in a window for the desktop app or in the browser for the command-line build.
 
-`start.bat setup`: Scans local Chrome accounts. Use `--email` or `--profile` to select a Chrome account. Run `start.bat setup --login` for an isolated login, or `start.bat setup --storage-state <file>` to import a file.
+`aistudio2api -open-ui=false`: Starts the manager without opening a window or the web UI; the desktop app shows only its tray icon.
 
-`start.bat setup --remote https://<remote-instance>`: Adds accounts to a remote instance. Click "Add remotely" on the remote instance's Accounts page to get a pairing token, then run the command on a computer that can sign in to Google and paste the token. It combines with options such as `--login`.
+`aistudio2api setup`: Imports accounts.
+
+- Without options it scans local Chrome accounts; `--email` or `--profile` selects a Chrome account
+- Isolated login: `aistudio2api setup --login`, which needs a graphical display; without one, start the service and sign in with "Sign in with browser" in the console
+- File import: `aistudio2api setup --storage-state <file>`
+- Cookie import: `aistudio2api setup --cookie-file <file>`, `aistudio2api setup --cookie "<Cookie request header>"`, or `aistudio2api setup --cdp <debugging address>`; the account email is detected from the cookies, and an account imported with `--cdp` keeps the language and time zone of that browser
+
+`aistudio2api setup --remote https://<remote-instance>`: Adds accounts to a remote instance. Click "Add remotely" on the remote instance's Accounts page to get a pairing token, then run the command on a computer that can sign in to Google and paste the token. It combines with options such as `--login`.
 
 ## API Usage
 
@@ -445,9 +510,10 @@ AIStudio2API/
 ├── internal/chromeauth/     # Windows Chrome and DBSC import
 ├── internal/camoufoxnative/ # Camoufox BiDi, login, and WAA workers
 ├── internal/webui/          # Embedded frontend build
+├── internal/desktop/        # Desktop window and system tray
 ├── web/                     # Vue 3 and TypeScript management UI
 ├── docs/                    # Development guide and protocol specification
-└── start.bat                # Windows one-click launcher
+└── build/                   # App icon and per-platform packaging configuration
 ```
 
 ## Configuration
@@ -474,7 +540,7 @@ cp .env.example .env
 | `ADMIN_PASSWORD` | empty | Administrator password, required when login is enabled |
 | `PROXY` | empty | HTTP, HTTPS, or SOCKS5 proxy used by Chrome import, login, and accounts without an override; separate several proxies with commas to form a proxy pool; the system proxy is used when empty |
 | `INIT_TIMEOUT` | `2m` | Per-account WAA initialization timeout |
-| `REQUEST_TIMEOUT` | `5m` | Maximum request execution time, multiplied by the number of rounds for auto-continued requests |
+| `REQUEST_TIMEOUT` | `30m` | Maximum request execution time, multiplied by the number of rounds for auto-continued requests |
 | `WARM_WORKER_LIMIT` | `5` | Number of resident prewarmed accounts |
 | `MAX_ACTIVE_WORKERS` | `10` | Maximum workers active during peak load |
 | `WARM_STARTUP_CONCURRENCY` | `5` | Camoufox workers cold-started concurrently, shared by prewarming and on-demand scaling; unlimited with `WAA_BACKEND=go` |
@@ -482,15 +548,24 @@ cp .env.example .env
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` rotates accounts; `fill-first` reuses the first available account |
 | `UPSTREAM_CHANNELS` | `playground,build` | Upstream channels for generation requests; either one can be used alone |
 | `MODEL_MAPPING` | empty | Client model names mapped to catalog models, each item `alias:model ID`, comma separated |
+| `MODEL_CHANNELS` | empty | Limit a model to one channel, each item `model ID:playground` or `model ID:build`; also selectable in model details on the Model catalog page, applied on save |
 | `BUILD_NATIVE_NONSTREAM` | `true` | Prefer native Build unary calls for non-streaming requests; log any fallback to stream collection |
 | `WAA_BACKEND` | `camoufox` | `camoufox` runs WAA in a Camoufox page; `go` runs WAA inside the service process and neither downloads nor starts Camoufox |
 | `TEMPORARY_CHAT` | `false` | Use Temporary Chat for the WAA prewarm page |
+| `MEDIA_OUTPUT` | `inline` | How Chat Completions and Messages include generated images and audio: `inline` embeds a data URI; `url` saves the file under `runtime/media/`, named by its content, and links to it at `/media/<file>` on this service, a path that does not check the API key |
+| `MEDIA_BASE_URL` | empty | Service address used in media URLs, such as `https://ai.example.com`; empty uses the address of each request and follows `X-Forwarded-Proto` behind a reverse proxy |
 
 The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` controls how many Camoufox workers cold-start at once, and `PER_ACCOUNT_CONCURRENCY` controls request slots per account. Saving these four in the console applies them to scheduling right away: lowering the peak limit closes the extra idle workers, and raising the resident count prewarms more.
 
 ### Port Configuration
 
-The console allows passwordless loopback access by default. For remote management, set `ADMIN_AUTH_ENABLED=true`, configure the administrator username and password, and restart the process. The separate `/login` page creates a 12-hour session with sign-out support. Administrators share the instance's account pool, configuration, and logs. Public APIs use the separate `PROXY_API_KEY`.
+The console allows passwordless loopback access by default. For remote management:
+
+- Set `ADMIN_AUTH_ENABLED=true`, configure the administrator username and password, restart the process, and sign in on the separate `/login` page
+- A session lasts 12 hours; with "Stay signed in for 30 days" checked it lasts 30 days and survives restarts
+- Sign-out is supported; administrators share the instance's account pool, configuration, and logs
+
+Public APIs use the separate `PROXY_API_KEY`.
 
 Use an HTTPS reverse proxy that preserves `Host` and sets `X-Forwarded-Proto: https`. Console login settings can also be saved from the settings page and take effect after restarting the process.
 
@@ -524,7 +599,13 @@ Authentication files are stored in `auth/` by default:
 
 The lowercase Google email is the account directory, management UI identity, and log source. `.leases` coordinates account-directory access, while the runtime lease in the user cache allows one WAA Worker per email on the current computer.
 
-The Accounts page supports Chrome batch import and isolated Camoufox login. `ready` accounts can be edited, disabled, refreshed, and deleted; `auth_required` accounts can log in again. Refresh all reads the benefit tier and model catalog of every enabled account immediately; the service also reads them every 10 minutes. An account whose catalog has never been read shows an unknown tier and the reason for the last failed read.
+"Add account" on the Accounts page supports Chrome import, pasted cookies, antidetect browser import, isolated Camoufox login, and remote adding:
+
+- Isolated Camoufox login opens a visible local window; when the server has no graphical display or the console is opened from another computer, the sign-in screen appears in a sign-in window in the console, and a reverse proxy must forward the WebSocket at `/api/login-view/`
+- `ready` accounts can be edited, disabled, refreshed, and deleted; `auth_required` accounts can log in again
+- Refresh all reads the benefit tier and model catalog of every enabled account immediately; the service also reads them every 10 minutes
+- An account whose catalog has never been read shows an unknown tier and the reason for the last failed read
+- When a read reports that AI Studio does not support the current egress region or account, accounts with an existing catalog show that reason as well
 
 ## Documentation
 
@@ -550,7 +631,7 @@ With `WAA_BACKEND=go`, WAA runs inside the service process, emulates the Firefox
 - **Client-Managed History**: Clients submit complete conversation context for Chat, Anthropic, and Gemini requests
 - **AI Studio History**: API requests are not saved to website history; `TEMPORARY_CHAT=true` also disables autosave for the WAA prewarm page
 - **Responses Sessions**: `previous_response_id` is stored only in the current process and is cleared on restart
-- **Authentication Expiry**: Chrome imports retain DBSC renewal material and renew on Windows; when a Chrome import on Linux, macOS, or Docker expires, copy it from Windows again. When another account expires and the local Chrome is signed in to the same email, the service renews it with that email's material from Chrome and renews it as a Chrome import from then on; otherwise log in again on the Accounts page
+- **Authentication Expiry**: Chrome imports retain OAuth renewal material and renew on Windows; when a Chrome import on Linux, macOS, or Docker expires, copy it from Windows again. When another account expires and the local Chrome is signed in to the same email, the service renews it with that email's material from Chrome and renews it as a Chrome import from then on; otherwise log in again on the Accounts page
 
 ## Troubleshooting
 
@@ -585,9 +666,11 @@ Common runtime states:
 | --- | --- |
 | The page does not open automatically | Open the address configured by `LISTEN_ADDR` in `.env` |
 | `service_stopped` | Click "Start service" in the management UI |
+| `service_starting` | The generation service is starting; retry shortly |
 | No account is available | Add, enable, or log in to an account from Accounts |
 | Camoufox preparation fails | Check access to GitHub Releases or set `CAMOUFOX_PATH` |
 | Linux account warmup `exit status 255` | Install the Camoufox runtime libraries, see the apt command in “System Requirements” |
+| Account shows “AI Studio 不支持当前出口地区或账户” (region or account not supported) | Use a proxy that exits in an [AI Studio supported region](https://aistudio.google.com/docs/available-regions) for that account or globally |
 
 ## Contributing
 
@@ -600,6 +683,8 @@ Issues and Pull Requests are welcome!
 - ✅ **Documentation**: Update and optimize documentation in `docs/` directory
 - ✅ **Go Refactoring**: Migrate core proxy service to Go for improved concurrency and reduced resource usage
 - ✅ **Multi-Worker Load Balancing**: Support multi-Google account rotation pool for higher concurrency limits
+- ✅ **Desktop App**: Windows, macOS, and Linux desktop apps with a window, system tray, and online update
+- ✅ **API Playground**: chat, image, video, speech, music, and live pages with the same entry points and routes as AI Studio
 
 ### Pure Go WAA Runtime
 

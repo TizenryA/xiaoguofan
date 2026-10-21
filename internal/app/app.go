@@ -9,16 +9,16 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
+	"github.com/Mag1cFall/AIStudio2API/internal/promptdb"
 	"github.com/Mag1cFall/AIStudio2API/internal/requestdb"
 	"github.com/Mag1cFall/AIStudio2API/internal/setup"
 	"github.com/Mag1cFall/AIStudio2API/internal/webui"
@@ -32,9 +32,14 @@ type commandOptions struct {
 
 // Run 执行单二进制命令入口
 func Run(args []string) int {
+	if err := prepareShell(args); err != nil {
+		fmt.Fprintln(os.Stderr, "AIStudio2API 启动失败:", err)
+		return 1
+	}
 	logs := &logOutput{dir: filepath.Join("runtime", "logs")}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(logs, nil)))
-	err := runCommand(args, logs)
+	executable, executableErr := os.Executable()
+	restart, err := runCommand(args, logs, executable)
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
@@ -42,43 +47,107 @@ func Run(args []string) int {
 		slog.Error("AIStudio2API 启动失败", "error", err)
 		return 1
 	}
+	if restart {
+		if err := errors.Join(executableErr, relaunch(executable, args)); err != nil {
+			slog.Error("AIStudio2API 重新启动失败", "error", err)
+			return 1
+		}
+	}
 	return 0
 }
 
-// runCommand 分派首次配置与默认服务
-func runCommand(args []string, logs *logOutput) error {
+// runCommand 分派首次配置与默认服务，返回值 restart 表示在线更新后需要重新启动
+func runCommand(args []string, logs *logOutput, executable string) (restart bool, err error) {
 	cfg, err := config.Load(".env")
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := logs.set(cfg.LogFile, cfg.LogMaxTotalMB); err != nil {
-		return err
+		return false, err
 	}
 	defer logs.set(false, 0)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signals, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(signals)
+	defer cancel()
 
 	if len(args) != 0 && args[0] == "setup" {
-		return setup.Run(ctx, cfg, args[1:])
+		return false, setup.Run(ctx, cfg, args[1:])
 	}
 	options, err := parseFlags(args, &cfg)
 	if err != nil {
-		return err
+		return false, err
 	}
+	shell := newShell(options.openUI)
+	ready := make(chan serviceReady, 1)
+	shellCtx, stopShell := context.WithCancel(ctx)
+	defer stopShell()
+	var restarting atomic.Bool
+	result := make(chan error, 1)
+	go func() {
+		started, err := runService(ctx, cancel, cfg, options, logs, executable, &restarting, ready)
+		result <- err
+		if started {
+			stopShell()
+		}
+	}()
+	shellErr := shell.run(shellCtx, func() (serviceReady, error) {
+		select {
+		case service := <-ready:
+			return service, service.err
+		case <-shellCtx.Done():
+			return serviceReady{}, shellCtx.Err()
+		}
+	})
+	cancel()
+	serviceErr := <-result
+	if errors.Is(serviceErr, context.Canceled) {
+		serviceErr = nil
+	}
+	return restarting.Load(), errors.Join(serviceErr, shellErr)
+}
+
+// serviceReady 为管理服务的启动结果：管理页面地址与服务日志，或启动失败的原因
+type serviceReady struct {
+	url string
+	log func(level, message string)
+	err error
+}
+
+// runService 装配运行时、打开请求账本并运行管理监听；就绪或启动失败时向 ready 发送一次结果，started 表示服务曾经就绪
+func runService(ctx context.Context, cancel func(), cfg config.Config, options commandOptions, logs *logOutput, executable string, restarting *atomic.Bool, ready chan<- serviceReady) (started bool, err error) {
+	defer func() {
+		if !started && err != nil {
+			ready <- serviceReady{err: err}
+		}
+	}()
 	manager, err := newRuntimeManager(ctx, ".env", cfg, options.overrides)
 	if err != nil {
-		return err
+		return false, err
 	}
-	ledger, err := requestdb.Open(filepath.Join("runtime", "requests.db"), func(level, message string) {
+	logService := func(level, message string) {
 		manager.requests.log("service", level, message)
-	})
+	}
+	ledger, err := requestdb.Open(filepath.Join("runtime", "requests.db"), logService)
 	if err != nil {
-		return errors.Join(fmt.Errorf("打开请求账本: %w", err), manager.Close())
+		return false, errors.Join(fmt.Errorf("打开请求账本: %w", err), manager.Close())
 	}
 	ledger.SetBodyCapture(cfg.RequestBodyLog)
 	manager.ledger = ledger
+	prompts, err := promptdb.Open(filepath.Join("runtime", "prompts.db"))
+	if err != nil {
+		return false, errors.Join(fmt.Errorf("打开对话库: %w", err), manager.Close(), ledger.Close())
+	}
+	manager.prompts = prompts
 	manager.logs = logs
-	return errors.Join(runServer(ctx, cfg, options, manager), manager.Close(), ledger.Close())
+	updater := newSelfUpdater(buildVersion(), executable, manager.egressProxy, logService, updateRestart(cancel, restarting, logService))
+	started, err = runServer(ctx, cfg, manager, updater, func(address string) {
+		ready <- serviceReady{url: address, log: logService}
+	})
+	if started {
+		cancel()
+	}
+	return started, errors.Join(err, manager.Close(), ledger.Close(), prompts.Close())
 }
 
 // parseFlags 使用命令行参数覆盖本次启动配置
@@ -120,16 +189,18 @@ func parseFlags(args []string, cfg *config.Config) (commandOptions, error) {
 	return options, nil
 }
 
-// runServer 管理 HTTP 监听与优雅退出
-func runServer(ctx context.Context, cfg config.Config, options commandOptions, manager *runtimeManager) error {
+// runServer 管理 HTTP 监听，就绪后以管理页面地址调用 onReady，运行到 ctx 结束或监听出错；started 表示监听曾经就绪
+func runServer(ctx context.Context, cfg config.Config, manager *runtimeManager, updater api.UpdateService, onReady func(address string)) (started bool, err error) {
 	manager.requests.log("service", "INFO", fmt.Sprintf("管理监听启动 | 地址=%s", cfg.ListenAddr))
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
-		return fmt.Errorf("监听 %s: %w", cfg.ListenAddr, err)
+		return false, fmt.Errorf("监听 %s: %w", cfg.ListenAddr, err)
 	}
 	apiHandler := api.NewHandler(manager, api.Config{
-		APIKey: cfg.ProxyAPIKey, Admin: manager, Ledger: manager.ledger,
+		APIKey: cfg.ProxyAPIKey, Admin: manager, Ledger: manager.ledger, Prompts: manager.prompts, Updates: updater,
 		AdminAuthEnabled: cfg.AdminAuthEnabled, AdminUsername: cfg.AdminUsername, AdminPassword: cfg.AdminPassword,
+		AdminSessionPath: filepath.Join("runtime", "admin-sessions.json"),
+		MediaDir:         filepath.Join("runtime", "media"), MediaLinks: manager.mediaLinks,
 	})
 	server := &http.Server{
 		Handler:           rootHandler(apiHandler),
@@ -141,16 +212,9 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 		serveError <- server.Serve(listener)
 	}()
 
-	address := browserAddress(listener.Addr().String())
-	manager.requests.log("service", "INFO", "管理服务就绪 | 地址=http://"+address)
-	if options.openUI {
-		if err := openBrowser("http://" + address); err != nil {
-			manager.requests.log("service", "WARN", "管理页面打开失败 | "+err.Error())
-		} else {
-			manager.requests.log("service", "INFO", "管理页面已打开 | 地址=http://"+address)
-		}
-	}
-
+	address := "http://" + browserAddress(listener.Addr().String())
+	manager.requests.log("service", "INFO", "管理服务就绪 | 地址="+address)
+	onReady(address)
 	if cfg.AutoStart {
 		go autoStartService(ctx, manager)
 	}
@@ -158,19 +222,20 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 	select {
 	case err := <-serveError:
 		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+			return true, nil
 		}
-		return err
+		return true, err
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("关闭 HTTP 服务: %w", err)
+			server.Close()
+			slog.Warn("管理监听关闭超时，断开剩余连接", "error", err)
 		}
 		if err := <-serveError; err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
+			return true, err
 		}
-		return nil
+		return true, nil
 	}
 }
 
@@ -190,6 +255,7 @@ func rootHandler(apiHandler http.Handler) http.Handler {
 	root.Handle("/v1/", apiHandler)
 	root.Handle("/v1beta/", apiHandler)
 	root.Handle("/upload/", apiHandler)
+	root.Handle("/media/", apiHandler)
 	root.Handle("/", webui.Handler())
 	return securityHeaders(root)
 }
@@ -216,24 +282,4 @@ func browserAddress(address string) string {
 		host = "127.0.0.1"
 	}
 	return net.JoinHostPort(host, port)
-}
-
-// openBrowser 使用当前平台的系统命令打开管理界面
-func openBrowser(url string) error {
-	var command *exec.Cmd
-	switch runtime.GOOS {
-	case "windows":
-		command = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	case "darwin":
-		command = exec.Command("open", url)
-	default:
-		command = exec.Command("xdg-open", url)
-	}
-	if err := command.Start(); err != nil {
-		return fmt.Errorf("打开管理界面: %w", err)
-	}
-	if err := command.Process.Release(); err != nil {
-		return fmt.Errorf("释放管理界面启动进程: %w", err)
-	}
-	return nil
 }

@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
+	"github.com/Mag1cFall/AIStudio2API/internal/chromeauth"
 )
 
 // AdminService 定义管理端需要的权威状态能力
@@ -14,13 +17,14 @@ type AdminService interface {
 	Status(context.Context) (AdminStatus, error)
 	CatalogModels(context.Context) ([]aistudio.Model, error)
 	Accounts(context.Context) ([]AdminAccount, error)
-	CreateAccount(context.Context, AccountCreateInput) (AdminAccount, error)
+	CreateAccount(context.Context, AccountCreateInput, *camoufoxnative.LiveView) (AdminAccount, error)
 	ChromeImportProfiles(context.Context) ([]ChromeImportProfile, error)
+	CookieBrowsers(context.Context) ([]CookieBrowser, error)
 	ImportChromeAccounts(context.Context, ChromeImportInput) ([]AdminAccount, error)
 	ImportAccountState(context.Context, AccountStateInput) (AdminAccount, error)
 	UpdateAccount(context.Context, string, AccountInput) (AdminAccount, error)
 	DeleteAccount(context.Context, string) error
-	LoginAccount(context.Context, string) (AdminAccount, error)
+	LoginAccount(context.Context, string, *camoufoxnative.LiveView) (AdminAccount, error)
 	RefreshAccount(context.Context, string) (AdminAccountRefresh, error)
 	StartService(context.Context) (AdminStatus, error)
 	StopService(context.Context) (AdminStatus, error)
@@ -28,6 +32,7 @@ type AdminService interface {
 	RuntimeConfig(context.Context) (RuntimeConfig, error)
 	UpdateRuntimeConfig(context.Context, RuntimeConfig) (RuntimeConfig, error)
 	Cooldowns(context.Context) ([]AdminCooldown, error)
+	ClearCooldown(ctx context.Context, accountID string, scope string) error
 	Requests(context.Context) ([]AdminRequest, error)
 	CancelRequest(context.Context, string) error
 	Events(context.Context) (<-chan AdminEvent, error)
@@ -183,6 +188,16 @@ type AccountCreateInput struct {
 	Timezone string `json:"timezone"`
 }
 
+// CookieImportInput 表示 Cookie 导入的账户邮箱、Cookie 文本或浏览器调试地址与账户环境
+type CookieImportInput struct {
+	Label    string `json:"label"`
+	Cookies  string `json:"cookies"`
+	CDP      string `json:"cdp"`
+	Proxy    string `json:"proxy"`
+	Locale   string `json:"locale"`
+	Timezone string `json:"timezone"`
+}
+
 // ChromeImportProfile 表示可从本机 Chrome 导入的账号
 type ChromeImportProfile struct {
 	ID          string `json:"id"`
@@ -190,6 +205,18 @@ type ChromeImportProfile struct {
 	DisplayName string `json:"display_name"`
 	Email       string `json:"email"`
 	Locale      string `json:"locale"`
+}
+
+// CookieBrowser 表示本机开启远程调试的浏览器与其中登录 AI Studio 的账户
+type CookieBrowser struct {
+	Address   string `json:"address"`
+	Browser   string `json:"browser"`
+	Email     string `json:"email"`
+	Locale    string `json:"locale"`
+	Timezone  string `json:"timezone"`
+	Imported  bool   `json:"imported"`
+	SignedOut bool   `json:"signed_out"`
+	Error     string `json:"error"`
 }
 
 // ChromeImportInput 表示批量导入的 Chrome 账号与账户环境
@@ -231,8 +258,11 @@ type RuntimeConfig struct {
 	RoutingStrategy           string       `json:"routing_strategy"`
 	UpstreamChannels          []string     `json:"upstream_channels"`
 	ModelMapping              string       `json:"model_mapping"`
+	ModelChannels             string       `json:"model_channels"`
 	TemporaryChat             bool         `json:"temporary_chat"`
 	WAABackend                string       `json:"waa_backend"`
+	MediaOutput               string       `json:"media_output"`
+	MediaBaseURL              string       `json:"media_base_url"`
 }
 
 // AdminCooldown 表示账户模型冷却
@@ -241,6 +271,7 @@ type AdminCooldown struct {
 	AccountLabel string    `json:"account_label"`
 	Channel      string    `json:"channel"`
 	ModelID      string    `json:"model_id"`
+	Scope        string    `json:"scope"`
 	Until        time.Time `json:"until"`
 	Reason       string    `json:"reason,omitempty"`
 }
@@ -267,10 +298,13 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts", s.handleCreateAccount)
 	mux.HandleFunc("GET /api/accounts/import/chrome", s.handleChromeImportProfiles)
 	mux.HandleFunc("POST /api/accounts/import/chrome", s.handleImportChromeAccounts)
+	mux.HandleFunc("GET /api/accounts/import/browsers", s.handleCookieBrowsers)
+	mux.HandleFunc("POST /api/accounts/import/cookies", s.handleImportCookieAccount)
 	mux.HandleFunc("POST /api/pairing", s.handleCreatePairing)
 	mux.HandleFunc("PUT /api/accounts/{id}", s.handleUpdateAccount)
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.handleDeleteAccount)
 	mux.HandleFunc("POST /api/accounts/{id}/login", s.handleLoginAccount)
+	mux.HandleFunc("GET /api/login-view/{view}", s.handleLoginView)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", s.handleRefreshAccount)
 	mux.HandleFunc("POST /api/control/start", s.handleStartService)
 	mux.HandleFunc("POST /api/control/stop", s.handleStopService)
@@ -278,6 +312,7 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/config", s.handleRuntimeConfig)
 	mux.HandleFunc("PUT /api/config", s.handleUpdateRuntimeConfig)
 	mux.HandleFunc("GET /api/cooldowns", s.handleCooldowns)
+	mux.HandleFunc("DELETE /api/accounts/{id}/cooldowns/{scope}", s.handleClearCooldown)
 	mux.HandleFunc("GET /api/requests", s.handleRequests)
 	mux.HandleFunc("POST /api/requests/{id}/cancel", s.handleCancelRequest)
 	mux.HandleFunc("GET /api/events", s.handleAdminEvents)
@@ -323,12 +358,17 @@ func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
-	var input AccountCreateInput
+	var input struct {
+		AccountCreateInput
+		View string `json:"view"`
+	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	account, err := s.config.Admin.CreateAccount(r.Context(), input)
+	view, release := s.loginView(r, input.View)
+	defer release()
+	account, err := s.config.Admin.CreateAccount(r.Context(), input.AccountCreateInput, view)
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return
@@ -359,6 +399,50 @@ func (s *server) handleImportChromeAccounts(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusCreated, map[string][]AdminAccount{"accounts": accounts})
 }
 
+func (s *server) handleCookieBrowsers(w http.ResponseWriter, r *http.Request) {
+	browsers, err := s.config.Admin.CookieBrowsers(r.Context())
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string][]CookieBrowser{"browsers": browsers})
+}
+
+func (s *server) handleImportCookieAccount(w http.ResponseWriter, r *http.Request) {
+	var input CookieImportInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if address := strings.TrimSpace(input.CDP); address != "" {
+		browser, err := chromeauth.ReadCDPBrowser(r.Context(), address)
+		if err != nil {
+			writeAdminError(w, http.StatusBadGateway, "cdp_unavailable", err.Error())
+			return
+		}
+		input.Cookies = browser.Cookies
+		if strings.TrimSpace(input.Locale) == "" {
+			input.Locale = browser.Locale
+		}
+		if strings.TrimSpace(input.Timezone) == "" {
+			input.Timezone = browser.Timezone
+		}
+	}
+	state, err := aistudio.ParseCookieText(input.Cookies)
+	if err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_cookies", err.Error())
+		return
+	}
+	account, err := s.config.Admin.ImportAccountState(r.Context(), AccountStateInput{
+		Label: input.Label, Proxy: input.Proxy, Locale: input.Locale, Timezone: input.Timezone, StorageState: state,
+	})
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]AdminAccount{"account": account})
+}
+
 func (s *server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	var input AccountInput
 	if err := decodeJSON(r, &input); err != nil {
@@ -382,7 +466,18 @@ func (s *server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleLoginAccount(w http.ResponseWriter, r *http.Request) {
-	account, err := s.config.Admin.LoginAccount(r.Context(), r.PathValue("id"))
+	var input struct {
+		View string `json:"view"`
+	}
+	if r.ContentLength != 0 {
+		if err := decodeJSON(r, &input); err != nil {
+			writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+	}
+	view, release := s.loginView(r, input.View)
+	defer release()
+	account, err := s.config.Admin.LoginAccount(r.Context(), r.PathValue("id"), view)
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return
@@ -455,6 +550,14 @@ func (s *server) handleCooldowns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string][]AdminCooldown{"cooldowns": cooldowns})
+}
+
+func (s *server) handleClearCooldown(w http.ResponseWriter, r *http.Request) {
+	if err := s.config.Admin.ClearCooldown(r.Context(), r.PathValue("id"), r.PathValue("scope")); err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *server) handleRequests(w http.ResponseWriter, r *http.Request) {

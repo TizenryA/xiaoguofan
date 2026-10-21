@@ -104,16 +104,21 @@ func NewWorkerProtectedTransport(options WorkerProtectedTransportOptions) (*Work
 	}, nil
 }
 
-// DoProtected 写入 fresh proof 后通过 Camoufox 发送 GenerateContent 或 Build 代理请求
+// DoProtected 写入 fresh proof 后通过 Camoufox 发送 GenerateContent、Build 代理或写代码助手请求
 func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request GenerateRequest, rpc RPCRequest) (*RPCResponse, error) {
 	var prompt, page string
 	var err error
 	proofField := 5
-	if rpc.Method == buildProxyStreamedMethod || rpc.Method == buildProxyUnaryMethod {
+	switch rpc.Method {
+	case buildProxyStreamedMethod, buildProxyUnaryMethod:
 		prompt, err = buildBindingPrompt(rpc.Body)
 		page = contentsText(request.Contents)
 		proofField = buildProofField
-	} else {
+	case assistantOfflineMethod:
+		prompt, err = bindingPrompt(request)
+		page = contentsText(request.Contents)
+		proofField = assistantProofField
+	default:
 		prompt, err = bindingPrompt(request)
 		page = prompt
 	}
@@ -532,6 +537,9 @@ func (s *PooledService) markRetryableFailure(lease *AccountLease, modelAccessSco
 
 func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease) ([]Model, error) {
 	account := lease.Account()
+	if err := s.client.EnsureTermsAccepted(ContextWithAccountLease(ctx, lease), account.ID); err != nil {
+		return nil, s.catalogFailure(lease, err)
+	}
 	tier, err := s.client.BenefitTierForAccount(ContextWithAccountLease(ctx, lease), account.ID)
 	if err != nil {
 		return nil, s.catalogFailure(lease, err)
@@ -844,6 +852,12 @@ func mergeModels(base []Model, additions []Model) []Model {
 		}
 		for name, values := range model.CapabilityOptions {
 			current.CapabilityOptions[name] = unionStrings(current.CapabilityOptions[name], values)
+		}
+		if len(current.VoiceDetails) == 0 {
+			current.VoiceDetails = model.VoiceDetails
+		}
+		if len(current.Languages) == 0 {
+			current.Languages = model.Languages
 		}
 		current.AccessModes = unionInt64(current.AccessModes, model.AccessModes)
 		current.Paid = current.Paid || model.Paid

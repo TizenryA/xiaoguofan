@@ -10,7 +10,9 @@ import (
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
+	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
+	"github.com/Mag1cFall/AIStudio2API/internal/promptdb"
 	"github.com/Mag1cFall/AIStudio2API/internal/requestdb"
 )
 
@@ -73,6 +75,7 @@ type runtimeManager struct {
 	current          *runtimeGeneration
 	startCancel      context.CancelFunc
 	ledger           *requestdb.Store
+	prompts          *promptdb.Store
 	logs             *logOutput
 }
 
@@ -196,6 +199,13 @@ func (manager *runtimeManager) Close() error {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	return manager.current.Close()
+}
+
+// mediaLinks 返回当前生成服务的媒体输出是否使用 URL 与设置的服务地址
+func (manager *runtimeManager) mediaLinks() (bool, string) {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.current.config.MediaOutput == config.MediaOutputURL, manager.current.config.MediaBaseURL
 }
 
 // Models 返回当前生成服务模型
@@ -347,6 +357,17 @@ func (manager *runtimeManager) Transcribe(ctx context.Context, request aistudio.
 	return service.Transcribe(ctx, request)
 }
 
+// egressProxy 返回管理进程访问外网的代理：PROXY 的第一个代理，未设置时为系统代理
+func (manager *runtimeManager) egressProxy() string {
+	manager.mu.RLock()
+	proxies := config.ProxyList(manager.current.config.Proxy)
+	manager.mu.RUnlock()
+	if len(proxies) > 0 {
+		return proxies[0]
+	}
+	return systemProxy()
+}
+
 // Status 返回当前生成服务状态
 func (manager *runtimeManager) Status(ctx context.Context) (api.AdminStatus, error) {
 	manager.mu.RLock()
@@ -362,10 +383,10 @@ func (manager *runtimeManager) Accounts(ctx context.Context) ([]api.AdminAccount
 }
 
 // CreateAccount 在当前生成服务创建账户
-func (manager *runtimeManager) CreateAccount(ctx context.Context, input api.AccountCreateInput) (api.AdminAccount, error) {
+func (manager *runtimeManager) CreateAccount(ctx context.Context, input api.AccountCreateInput, view *camoufoxnative.LiveView) (api.AdminAccount, error) {
 	manager.mu.RLock()
 	defer manager.mu.RUnlock()
-	return manager.current.admin.CreateAccount(ctx, input)
+	return manager.current.admin.CreateAccount(ctx, input, view)
 }
 
 // ChromeImportProfiles 返回当前生成服务可导入的 Chrome 账号
@@ -375,6 +396,13 @@ func (manager *runtimeManager) ChromeImportProfiles(ctx context.Context) ([]api.
 	return manager.current.admin.ChromeImportProfiles(ctx)
 }
 
+// CookieBrowsers 返回当前生成服务发现的本机调试浏览器
+func (manager *runtimeManager) CookieBrowsers(ctx context.Context) ([]api.CookieBrowser, error) {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.current.admin.CookieBrowsers(ctx)
+}
+
 // ImportChromeAccounts 在当前生成服务批量导入 Chrome 账号
 func (manager *runtimeManager) ImportChromeAccounts(ctx context.Context, input api.ChromeImportInput) ([]api.AdminAccount, error) {
 	manager.mu.RLock()
@@ -382,7 +410,7 @@ func (manager *runtimeManager) ImportChromeAccounts(ctx context.Context, input a
 	return manager.current.admin.ImportChromeAccounts(ctx, input)
 }
 
-// ImportAccountState 在当前生成服务导入远程配对账户
+// ImportAccountState 在当前生成服务导入远程配对或 Cookie 导入的账户
 func (manager *runtimeManager) ImportAccountState(ctx context.Context, input api.AccountStateInput) (api.AdminAccount, error) {
 	manager.mu.RLock()
 	defer manager.mu.RUnlock()
@@ -404,10 +432,10 @@ func (manager *runtimeManager) DeleteAccount(ctx context.Context, id string) err
 }
 
 // LoginAccount 在当前生成服务登录账户
-func (manager *runtimeManager) LoginAccount(ctx context.Context, id string) (api.AdminAccount, error) {
+func (manager *runtimeManager) LoginAccount(ctx context.Context, id string, view *camoufoxnative.LiveView) (api.AdminAccount, error) {
 	manager.mu.RLock()
 	defer manager.mu.RUnlock()
-	return manager.current.admin.LoginAccount(ctx, id)
+	return manager.current.admin.LoginAccount(ctx, id, view)
 }
 
 // RefreshAccount 在当前生成服务立即刷新账户状态
@@ -455,6 +483,13 @@ func (manager *runtimeManager) Cooldowns(ctx context.Context) ([]api.AdminCooldo
 	manager.mu.RLock()
 	defer manager.mu.RUnlock()
 	return manager.current.admin.Cooldowns(ctx)
+}
+
+// ClearCooldown 手动清除账户在一个作用域上的冷却
+func (manager *runtimeManager) ClearCooldown(ctx context.Context, accountID string, scope string) error {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.current.admin.ClearCooldown(ctx, accountID, scope)
 }
 
 // Requests 返回进程级活动请求
@@ -520,6 +555,8 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		ModelMapping:         value.ModelMapping,
 		WAABackend:           value.WAABackend,
 		BuildNativeNonstream: value.BuildNativeNonstream,
+		MediaOutput:          value.MediaOutput,
+		MediaBaseURL:         value.MediaBaseURL,
 	}
 	overrides.Apply(&saved)
 	return saved.AuthStates == active.AuthStates && saved.Proxy == active.Proxy &&
@@ -527,7 +564,8 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.TemporaryChat == active.TemporaryChat &&
 		slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) && saved.ModelMapping == active.ModelMapping &&
 		saved.WAABackend == active.WAABackend &&
-		saved.BuildNativeNonstream == active.BuildNativeNonstream
+		saved.BuildNativeNonstream == active.BuildNativeNonstream &&
+		saved.MediaOutput == active.MediaOutput && saved.MediaBaseURL == active.MediaBaseURL
 }
 
 var _ aistudio.Service = (*runtimeManager)(nil)

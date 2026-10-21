@@ -46,3 +46,48 @@ def test_worker_channel_switch_recreates_single_tenant_worker_with_only_selected
         assert len(m.items)==1 and m.items['admin']['channel']=='build'
         with pytest.raises(ValueError):await m.ensure('admin',[],2,channel='evil')
     asyncio.run(run())
+
+
+def test_upstream_assistant_suffix_cannot_shadow_existing_build_api_alias():
+    original={'data':[
+        {'id':'gemini-example','name':'Gemini','channels':['playground','build']},
+        {'id':'gemini-example-build','name':'Gemini (Build)','channels':['assistant'],'capabilities':{'assistant_route':True}},
+    ]}
+    snapshot=copy.deepcopy(original)
+    out=split_catalogue(original)
+    assert [r['id'] for r in out['data']]==['gemini-example-pg','gemini-example-build','gemini-example-assistant']
+    assert out['data'][1]['channels']==['build']
+    assert out['data'][2]['channels']==['assistant']
+    assert split_model('gemini-example-build')==('gemini-example','build')
+    assert split_model('gemini-example-assistant')==('gemini-example-build','')
+    assert split_catalogue(out)==out and original==snapshot
+
+
+def test_assistant_alias_rewrites_chat_and_gemini_at_proxy_boundary(tmp_path,monkeypatch):
+    import json
+
+    from fastapi.testclient import TestClient
+
+    from portal.main import create_app
+
+    captured=[]
+    class Broker:
+        async def ensure(self,uid,accounts,limit,channel=''):
+            assert channel==''
+            return {'url':'http://worker.invalid','key':'fixture'}
+    real=httpx.AsyncClient
+    def handler(request):
+        captured.append((request.url.path,json.loads(request.content) if request.content else {}))
+        return httpx.Response(200,json={'ok':True})
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kw:real(transport=httpx.MockTransport(handler),**kw))
+    app=create_app(tmp_path,'fixture-long-password','https://portal.example',Broker());s=app.state.store
+    user=s.discord_user('111','fixture');s.save_settings({'public_login':True});s.mark_verified(user['id'])
+    s.add_account(user['id'],'own',{})
+    headers={'Authorization':'Bearer '+s.create_key(user['id'],'fixture')['key']}
+    with TestClient(app,base_url='https://portal.example') as client:
+        response=client.post('/v1/chat/completions',headers=headers,json={'model':'gemini-example-assistant','messages':[]})
+        assert response.status_code==200,response.text
+        assert captured[-1][1]['model']=='gemini-example-build'
+        response=client.post('/v1beta/models/gemini-example-assistant:generateContent',headers=headers,json={'contents':[]})
+        assert response.status_code==200,response.text
+        assert captured[-1][0]=='/v1beta/models/gemini-example-build:generateContent'

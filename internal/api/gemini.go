@@ -151,8 +151,10 @@ type geminiGenerationConfig struct {
 	ResponseMIMEType    string                     `json:"responseMimeType"`
 	ResponseSchema      json.RawMessage            `json:"responseSchema"`
 	ResponseJSONSchema  json.RawMessage            `json:"responseJsonSchema"`
+	ResponseFormat      geminiResponseFormats      `json:"responseFormat"`
 	ResponseModalities  []string                   `json:"responseModalities"`
 	ImageConfig         *geminiImageConfig         `json:"imageConfig"`
+	VideoConfig         *geminiVideoConfig         `json:"videoConfig"`
 	SpeechConfig        *geminiSpeechConfig        `json:"speechConfig"`
 	TranscriptionConfig *geminiTranscriptionConfig `json:"transcriptionConfig"`
 	Seed                *int64                     `json:"seed"`
@@ -175,6 +177,73 @@ type geminiTranscriptionConfig struct {
 type geminiImageConfig struct {
 	AspectRatio string `json:"aspectRatio"`
 	ImageSize   string `json:"imageSize"`
+}
+
+// geminiVideoConfig 为 generationConfig.videoConfig 扩展字段，task 取 Interactions API video_config.task 的取值
+type geminiVideoConfig struct {
+	Task string `json:"task"`
+}
+
+// geminiResponseFormat 为 generationConfig.responseFormat 的一项输出格式
+type geminiResponseFormat struct {
+	Text *struct {
+		MIMEType string          `json:"mimeType"`
+		Schema   json.RawMessage `json:"schema"`
+	} `json:"text"`
+	Image *geminiImageConfig `json:"image"`
+	Video *struct {
+		AspectRatio string `json:"aspectRatio"`
+		Duration    string `json:"duration"`
+		Resolution  string `json:"resolution"`
+	} `json:"video"`
+}
+
+// geminiResponseFormats 为 generationConfig.responseFormat，REST 写法为单个对象，SDK 写法为数组
+type geminiResponseFormats []geminiResponseFormat
+
+// UnmarshalJSON 按单个对象或数组读取 responseFormat
+func (formats *geminiResponseFormats) UnmarshalJSON(data []byte) error {
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && trimmed[0] == '{' {
+		var format geminiResponseFormat
+		if err := json.Unmarshal(trimmed, &format); err != nil {
+			return err
+		}
+		*formats = geminiResponseFormats{format}
+		return nil
+	}
+	return json.Unmarshal(data, (*[]geminiResponseFormat)(formats))
+}
+
+// geminiResponseFormatValues 为 responseFormat 枚举名对应的上游取值
+var geminiResponseFormatValues = map[string]string{
+	"APPLICATION_JSON":                "application/json",
+	"TEXT_PLAIN":                      "text/plain",
+	"ASPECT_RATIO_ONE_BY_ONE":         "1:1",
+	"ASPECT_RATIO_TWO_BY_THREE":       "2:3",
+	"ASPECT_RATIO_THREE_BY_TWO":       "3:2",
+	"ASPECT_RATIO_THREE_BY_FOUR":      "3:4",
+	"ASPECT_RATIO_FOUR_BY_THREE":      "4:3",
+	"ASPECT_RATIO_FOUR_BY_FIVE":       "4:5",
+	"ASPECT_RATIO_FIVE_BY_FOUR":       "5:4",
+	"ASPECT_RATIO_NINE_BY_SIXTEEN":    "9:16",
+	"ASPECT_RATIO_SIXTEEN_BY_NINE":    "16:9",
+	"ASPECT_RATIO_TWENTY_ONE_BY_NINE": "21:9",
+	"ASPECT_RATIO_ONE_BY_EIGHT":       "1:8",
+	"ASPECT_RATIO_EIGHT_BY_ONE":       "8:1",
+	"ASPECT_RATIO_ONE_BY_FOUR":        "1:4",
+	"ASPECT_RATIO_FOUR_BY_ONE":        "4:1",
+	"IMAGE_SIZE_FIVE_TWELVE":          "512",
+	"IMAGE_SIZE_ONE_K":                "1K",
+	"IMAGE_SIZE_TWO_K":                "2K",
+	"IMAGE_SIZE_FOUR_K":               "4K",
+}
+
+// geminiResponseFormatValue 把 responseFormat 枚举名换成上游取值，其他值原样返回
+func geminiResponseFormatValue(value string) string {
+	if mapped, ok := geminiResponseFormatValues[value]; ok {
+		return mapped
+	}
+	return value
 }
 
 type geminiVoiceConfig struct {
@@ -257,6 +326,21 @@ func geminiModelObject(model aistudio.Model) map[string]any {
 		"supportedGenerationMethods": model.Methods,
 		"inputTokenLimit":            model.InputTokenLimit,
 		"outputTokenLimit":           model.OutputTokenLimit,
+	}
+	if model.Temperature != nil {
+		item["temperature"] = *model.Temperature
+	}
+	if model.MaxTemperature != nil {
+		item["maxTemperature"] = *model.MaxTemperature
+	}
+	if model.TopP != nil {
+		item["topP"] = *model.TopP
+	}
+	if model.TopK != nil {
+		item["topK"] = *model.TopK
+	}
+	if model.Capabilities["thinking"] {
+		item["thinking"] = true
 	}
 	if len(model.Capabilities) > 0 {
 		item["capabilities"] = model.Capabilities
@@ -345,7 +429,7 @@ func geminiFilesAPIURI(raw string) bool {
 // geminiOpaqueFields 为取值是自由 JSON 的字段，其中的键名属于用户数据
 var geminiOpaqueFields = map[string]bool{
 	"args": true, "response": true, "parameters": true, "parametersJsonSchema": true,
-	"responseSchema": true, "responseJsonSchema": true, "partMetadata": true,
+	"responseSchema": true, "responseJsonSchema": true, "partMetadata": true, "schema": true,
 }
 
 // geminiCamelKeys 按 proto3 JSON 规则把各层消息字段名转为 lowerCamelCase，同层两种写法并存时保留驼峰字段，自由 JSON 字段的取值原样保留
@@ -499,9 +583,38 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 	if len(request.GenerationConfig.ResponseJSONSchema) > 0 {
 		config.ResponseSchema = request.GenerationConfig.ResponseJSONSchema
 	}
+	for _, format := range request.GenerationConfig.ResponseFormat {
+		if text := format.Text; text != nil {
+			if text.MIMEType != "" {
+				config.ResponseMIMEType = geminiResponseFormatValue(text.MIMEType)
+			}
+			if len(text.Schema) > 0 {
+				config.ResponseSchema = text.Schema
+			}
+		}
+		if image := format.Image; image != nil {
+			config.ImageConfig = &aistudio.ImageConfig{AspectRatio: geminiResponseFormatValue(image.AspectRatio), ImageSize: geminiResponseFormatValue(image.ImageSize)}
+		}
+		if video := format.Video; video != nil {
+			seconds, err := videoDurationSeconds(video.Duration)
+			if err != nil {
+				return aistudio.GenerateRequest{}, fmt.Errorf("generationConfig.responseFormat.video: %w", err)
+			}
+			config.VideoConfig = &aistudio.VideoConfig{AspectRatio: geminiResponseFormatValue(video.AspectRatio), DurationSeconds: seconds, Resolution: video.Resolution}
+		}
+	}
+	if video := request.GenerationConfig.VideoConfig; video != nil && video.Task != "" {
+		if config.VideoConfig == nil {
+			config.VideoConfig = &aistudio.VideoConfig{}
+		}
+		config.VideoConfig.Task = video.Task
+	}
 	config.HideThinking = true
 	if request.GenerationConfig.ThinkingConfig != nil {
-		config.ThinkingBudget = request.GenerationConfig.ThinkingConfig.ThinkingBudget
+		// thinkingBudget -1 为动态思考，使用模型默认思考设置
+		if budget := request.GenerationConfig.ThinkingConfig.ThinkingBudget; budget == nil || *budget != -1 {
+			config.ThinkingBudget = budget
+		}
 		config.ReasoningEffort = request.GenerationConfig.ThinkingConfig.ThinkingLevel
 		config.HideThinking = !request.GenerationConfig.ThinkingConfig.IncludeThoughts
 	}
@@ -1248,7 +1361,16 @@ func geminiFinishReason(reason string) string {
 func setGeminiCandidateEnd(candidate map[string]any, result generationResult) {
 	setGeminiFinish(candidate, result.finishReason, result.finishMessage)
 	if result.grounding != nil {
-		candidate["groundingMetadata"] = geminiGroundingMetadata(*result.grounding)
+		if grounding := geminiGroundingMetadata(*result.grounding); len(grounding) > 0 {
+			candidate["groundingMetadata"] = grounding
+		}
+		if len(result.grounding.URLContext) > 0 {
+			urls := make([]map[string]any, 0, len(result.grounding.URLContext))
+			for _, item := range result.grounding.URLContext {
+				urls = append(urls, map[string]any{"retrievedUrl": item.RetrievedURL, "urlRetrievalStatus": item.Status})
+			}
+			candidate["urlContextMetadata"] = map[string]any{"urlMetadata": urls}
+		}
 	}
 	citations := make([]aistudio.Citation, 0)
 	for _, event := range result.events {

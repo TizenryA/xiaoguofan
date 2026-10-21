@@ -44,7 +44,7 @@ func NewNativeLoginDriver(camoufoxPath string, timeout time.Duration) (*NativeLo
 	return &NativeLoginDriver{camoufox: absolute, timeout: timeout}, nil
 }
 
-// Login 启动可见隔离 Camoufox 并导出认证状态
+// Login 启动隔离 Camoufox 供用户登录并导出认证状态
 func (driver *NativeLoginDriver) Login(ctx context.Context, request IsolatedLoginRequest) (IsolatedLoginResult, error) {
 	if driver == nil {
 		return IsolatedLoginResult{}, errors.New("纯 Go Camoufox 登录驱动未初始化")
@@ -66,7 +66,8 @@ func (driver *NativeLoginDriver) Login(ctx context.Context, request IsolatedLogi
 		return IsolatedLoginResult{}, err
 	}
 	return IsolatedLoginResult{
-		StorageState: state, Email: result.Email, VerifiedAt: result.VerifiedAt, DriveError: result.DriveError,
+		StorageState: state, Email: result.Email, VerifiedAt: result.VerifiedAt,
+		DriveError: result.DriveError, CloseError: result.CloseError,
 	}, nil
 }
 
@@ -78,5 +79,6 @@ func (driver *NativeLoginDriver) options(request IsolatedLoginRequest) camoufoxn
 		Timezone:       request.Timezone,
 		Proxy:          request.Proxy,
 		Timeout:        driver.timeout,
+		View:           request.View,
 	}
 }

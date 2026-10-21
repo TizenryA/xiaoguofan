@@ -31,7 +31,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.9.8'
+VERSION = '0.9.9'
 
 
 class Strict(BaseModel):
@@ -653,7 +653,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         base_model, channel = split_model(model.removeprefix(PREFIX) if anti else model)
         if anti and (not enabled or request.method != 'POST' or path != '/v1/chat/completions' or not eligible(base_model)):
             raise HTTPException(400, '请先开启防截断，仅支持带前缀的 OpenAI 聊天模型')
-        if channel and path_model:
+        if path_model and base_model != path_model:
             path = path.replace('/models/'+path_model, '/models/'+base_model, 1)
         if not anti and PREFIX in path:
             raise HTTPException(400, '防截断模型仅支持 OpenAI /v1/chat/completions')
@@ -673,7 +673,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                     logging.getLogger(__name__).error('worker lease release failed')
         client = httpx.AsyncClient(timeout=httpx.Timeout(330, connect=15), follow_redirects=False)
         try:
-            if channel and isinstance(parsed, dict):
+            if isinstance(parsed, dict) and base_model != model:
                 parsed = dict(parsed, model=base_model)
                 body = json.dumps(parsed, ensure_ascii=True).encode()
             if anti:

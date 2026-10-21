@@ -19,7 +19,7 @@ const (
 	defaultAuthStates         = "auth"
 	defaultListenAddr         = "127.0.0.1:2048"
 	defaultInitTimeout        = 2 * time.Minute
-	defaultRequestTimeout     = 5 * time.Minute
+	defaultRequestTimeout     = 30 * time.Minute
 	defaultWarmWorkerLimit    = 5
 	defaultMaxActiveWorkers   = 10
 	defaultWarmConcurrency    = 5
@@ -40,8 +40,11 @@ var configKeys = [...]string{
 	"ROUTING_STRATEGY",
 	"UPSTREAM_CHANNELS",
 	"MODEL_MAPPING",
+	"MODEL_CHANNELS",
 	"TEMPORARY_CHAT",
 	"WAA_BACKEND",
+	"MEDIA_OUTPUT",
+	"MEDIA_BASE_URL",
 	"AUTO_START",
 	"REQUEST_BODY_LOG",
 	"LOG_FILE",
@@ -63,6 +66,12 @@ const WAABackendCamoufox = "camoufox"
 
 // WAABackendGo 表示由纯 Go VM 承担 WAA 生命周期
 const WAABackendGo = "go"
+
+// MediaOutputInline 表示 Chat 与 Messages 正文以 data URI 内联生成的媒体
+const MediaOutputInline = "inline"
+
+// MediaOutputURL 表示生成的媒体保存到本地，Chat 与 Messages 正文以 URL 引用
+const MediaOutputURL = "url"
 
 // Config 保存服务的全局配置
 type Config struct {
@@ -87,8 +96,11 @@ type Config struct {
 	RoutingStrategy        string        `json:"routing_strategy"`
 	UpstreamChannels       []string      `json:"upstream_channels"`
 	ModelMapping           string        `json:"model_mapping"`
+	ModelChannels          string        `json:"model_channels"`
 	TemporaryChat          bool          `json:"temporary_chat"`
 	WAABackend             string        `json:"waa_backend"`
+	MediaOutput            string        `json:"media_output"`
+	MediaBaseURL           string        `json:"media_base_url"`
 }
 
 // Default 返回可直接启动的默认配置
@@ -109,6 +121,7 @@ func Default() Config {
 		RoutingStrategy:        "round-robin",
 		UpstreamChannels:       append([]string(nil), upstreamChannels...),
 		WAABackend:             WAABackendCamoufox,
+		MediaOutput:            MediaOutputInline,
 	}
 }
 
@@ -224,6 +237,9 @@ func Load(path string) (Config, error) {
 	if value, ok := values["MODEL_MAPPING"]; ok {
 		cfg.ModelMapping = strings.TrimSpace(value)
 	}
+	if value, ok := values["MODEL_CHANNELS"]; ok {
+		cfg.ModelChannels = strings.TrimSpace(value)
+	}
 	if value, ok := values["TEMPORARY_CHAT"]; ok {
 		cfg.TemporaryChat, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
@@ -232,6 +248,12 @@ func Load(path string) (Config, error) {
 	}
 	if value, ok := values["WAA_BACKEND"]; ok {
 		cfg.WAABackend = strings.ToLower(strings.TrimSpace(value))
+	}
+	if value, ok := values["MEDIA_OUTPUT"]; ok {
+		cfg.MediaOutput = strings.ToLower(strings.TrimSpace(value))
+	}
+	if value, ok := values["MEDIA_BASE_URL"]; ok {
+		cfg.MediaBaseURL = strings.TrimSpace(value)
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -266,8 +288,11 @@ func (c Config) Save(path string) error {
 		"ROUTING_STRATEGY":         c.RoutingStrategy,
 		"UPSTREAM_CHANNELS":        strings.Join(c.UpstreamChannels, ","),
 		"MODEL_MAPPING":            c.ModelMapping,
+		"MODEL_CHANNELS":           c.ModelChannels,
 		"TEMPORARY_CHAT":           strconv.FormatBool(c.TemporaryChat),
 		"WAA_BACKEND":              c.WAABackend,
+		"MEDIA_OUTPUT":             c.MediaOutput,
+		"MEDIA_BASE_URL":           c.MediaBaseURL,
 	}
 
 	var output strings.Builder
@@ -323,8 +348,20 @@ func (c Config) Validate() error {
 	if _, err := ParseModelMapping(c.ModelMapping); err != nil {
 		return err
 	}
+	if _, err := ParseModelChannels(c.ModelChannels); err != nil {
+		return err
+	}
 	if c.WAABackend != WAABackendCamoufox && c.WAABackend != WAABackendGo {
 		return fmt.Errorf("WAA_BACKEND 必须是 camoufox 或 go")
+	}
+	if c.MediaOutput != MediaOutputInline && c.MediaOutput != MediaOutputURL {
+		return fmt.Errorf("MEDIA_OUTPUT 必须是 inline 或 url")
+	}
+	if c.MediaBaseURL != "" {
+		base, err := url.Parse(c.MediaBaseURL)
+		if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
+			return fmt.Errorf("MEDIA_BASE_URL 必须是 http 或 https 地址")
+		}
 	}
 	if c.LogMaxTotalMB < 2*LogFileMB {
 		return fmt.Errorf("LOG_MAX_TOTAL_MB 不能小于 %d", 2*LogFileMB)
@@ -354,6 +391,28 @@ func ParseModelMapping(value string) ([]ModelAlias, error) {
 		mapping = append(mapping, ModelAlias{Alias: alias, Model: strings.TrimPrefix(model, "models/")})
 	}
 	return mapping, nil
+}
+
+// ParseModelChannels 解析逗号分隔的 模型 ID:通道，返回每个模型限定使用的通道
+func ParseModelChannels(value string) (map[string]string, error) {
+	channels := make(map[string]string)
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		index := strings.LastIndexByte(item, ':')
+		model := strings.TrimPrefix(strings.TrimSpace(item[:max(index, 0)]), "models/")
+		channel := strings.ToLower(strings.TrimSpace(item[index+1:]))
+		if index < 0 || model == "" || !slices.Contains(upstreamChannels, channel) {
+			return nil, fmt.Errorf("MODEL_CHANNELS 的每一项写成 模型 ID:playground 或 模型 ID:build，%q 不符合", item)
+		}
+		if _, exists := channels[model]; exists {
+			return nil, fmt.Errorf("MODEL_CHANNELS 中模型 %s 重复", model)
+		}
+		channels[model] = channel
+	}
+	return channels, nil
 }
 
 // ParseUpstreamChannels 把逗号分隔的通道列表拆成去空白的小写名称
@@ -412,8 +471,11 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		RoutingStrategy        string   `json:"routing_strategy"`
 		UpstreamChannels       []string `json:"upstream_channels"`
 		ModelMapping           string   `json:"model_mapping"`
+		ModelChannels          string   `json:"model_channels"`
 		TemporaryChat          bool     `json:"temporary_chat"`
 		WAABackend             string   `json:"waa_backend"`
+		MediaOutput            string   `json:"media_output"`
+		MediaBaseURL           string   `json:"media_base_url"`
 	}
 	return json.Marshal(payload{
 		AutoStart:              c.AutoStart,
@@ -436,8 +498,11 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		RoutingStrategy:        c.RoutingStrategy,
 		UpstreamChannels:       c.UpstreamChannels,
 		ModelMapping:           c.ModelMapping,
+		ModelChannels:          c.ModelChannels,
 		TemporaryChat:          c.TemporaryChat,
 		WAABackend:             c.WAABackend,
+		MediaOutput:            c.MediaOutput,
+		MediaBaseURL:           c.MediaBaseURL,
 	})
 }
 
@@ -465,8 +530,11 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		RoutingStrategy        string   `json:"routing_strategy"`
 		UpstreamChannels       []string `json:"upstream_channels"`
 		ModelMapping           string   `json:"model_mapping"`
+		ModelChannels          string   `json:"model_channels"`
 		TemporaryChat          bool     `json:"temporary_chat"`
 		WAABackend             string   `json:"waa_backend"`
+		MediaOutput            string   `json:"media_output"`
+		MediaBaseURL           string   `json:"media_base_url"`
 	}
 	var value payload
 	if err := json.Unmarshal(data, &value); err != nil {
@@ -502,8 +570,11 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
 		ModelMapping:           strings.TrimSpace(value.ModelMapping),
+		ModelChannels:          strings.TrimSpace(value.ModelChannels),
 		TemporaryChat:          value.TemporaryChat,
 		WAABackend:             strings.ToLower(strings.TrimSpace(value.WAABackend)),
+		MediaOutput:            strings.ToLower(strings.TrimSpace(value.MediaOutput)),
+		MediaBaseURL:           strings.TrimSpace(value.MediaBaseURL),
 	}
 	if err := parsed.Validate(); err != nil {
 		return err

@@ -5,6 +5,8 @@ CHANNELS={'playground':'-pg','build':'-build'}
 
 
 def split_model(model):
+    if model.endswith("-assistant") and len(model)>len("-assistant"):
+        return model[:-len("-assistant")]+"-build",''
     for channel,suffix in CHANNELS.items():
         if model.endswith(suffix) and len(model)>len(suffix):
             return model[:-len(suffix)],channel
@@ -14,6 +16,16 @@ def split_model(model):
 def split_catalogue(body):
     out=copy.deepcopy(body)
     if not isinstance(out,dict) or not isinstance(out.get('data'),list):return out
+    # Upstream -build now means the code assistant, not our historical Build API alias.
+    # Rename only entries with explicit upstream assistant-route evidence.
+    for row in out['data']:
+        if (isinstance(row,dict) and isinstance(row.get('id'),str)
+                and row['id'].endswith('-build')
+                and isinstance(row.get('capabilities'),dict)
+                and row['capabilities'].get('assistant_route') is True
+                and row.get('xiaoguofan_channel')!='assistant'):
+            row['id']=row['id'][:-len('-build')]+'-assistant'
+            row['xiaoguofan_channel']='assistant'
     rows=[]
     seen=set()
     upstream_ids={r.get('id') for r in out['data'] if isinstance(r,dict) and isinstance(r.get('id'),str)}
@@ -21,7 +33,7 @@ def split_catalogue(body):
         if not isinstance(row,dict) or not isinstance(row.get('id'),str):
             rows.append(row)
             continue
-        if row.get('xiaoguofan_channel') in CHANNELS:
+        if row.get('xiaoguofan_channel') in (*CHANNELS,'assistant'):
             variants=[row]
         else:
             variants=[]
