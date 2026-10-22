@@ -17,7 +17,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, VerifyMismatchError
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from starlette.routing import Mount, compile_path
@@ -31,7 +31,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.9.10'
+VERSION = '0.9.11'
 
 
 class Strict(BaseModel):
@@ -665,14 +665,43 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         aid, generation, synthetic_name, buffered = None, False, '', None
         worker = None
 
-        async def release_worker():
-            if worker and worker.get('lease'):
-                try:
-                    await asyncio.shield(workers.release(u['id'], worker['lease']))
-                except Exception:
-                    logging.getLogger(__name__).error('worker lease release failed')
-        client = httpx.AsyncClient(timeout=httpx.Timeout(330, connect=15), follow_redirects=False)
+        from portal.proxy_response import ManagedStreamingResponse
+        response = None
+        client = None
+        cleaned = False
+        meter = UsageMeter(started=start)
+        final_status = 499
+        async def cleanup():
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+            # Local admission must never depend on cancellable remote cleanup.
+            userlocks[u['id']].release()
+            active.discard(u['id'])
+            async def close_resources():
+                calls = []
+                if worker and worker.get('lease'):
+                    calls.append(workers.release(u['id'], worker['lease']))
+                if response is not None:
+                    calls.append(response.aclose())
+                if client is not None:
+                    calls.append(client.aclose())
+                results = await asyncio.gather(*calls, return_exceptions=True)
+                if any(isinstance(item, BaseException) for item in results):
+                    logging.getLogger(__name__).error('proxy resource cleanup failed')
+            task = asyncio.create_task(close_resources())
+            # Background work is bounded even if the calling request is cancelled again.
+            timer = asyncio.get_running_loop().call_later(5, task.cancel)
+            task.add_done_callback(lambda _: timer.cancel())
+            try:
+                await asyncio.shield(task)
+            except (Exception, asyncio.CancelledError):
+                logging.getLogger(__name__).warning('proxy cleanup interrupted or timed out')
+            finally:
+                store.record(u['id'], u['key_id'], model, final_status, time.monotonic()-start, meter.finish(), account_id=aid, generation=generation, first_token_seconds=meter.first_token_seconds if generation and final_status < 400 else None)
         try:
+            client = httpx.AsyncClient(timeout=httpx.Timeout(330, connect=15), follow_redirects=False)
             if isinstance(parsed, dict) and base_model != model:
                 parsed = dict(parsed, model=base_model)
                 body = json.dumps(parsed, ensure_ascii=True).encode()
@@ -718,12 +747,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                     result = await normalize(payload, synthetic_name, model)
                 buffered = json.dumps(result, ensure_ascii=False).encode()
         except BaseException as exc:
-            await release_worker()
-            await client.aclose()
-            userlocks[u['id']].release()
-            active.discard(u['id'])
-            status = 499 if isinstance(exc, asyncio.CancelledError) else 422 if isinstance(exc, HTTPException) and exc.status_code == 422 else 503
-            store.record(u['id'], u['key_id'], model, status, time.monotonic()-start, account_id=aid, generation=generation)
+            final_status = 499 if isinstance(exc, asyncio.CancelledError) else 422 if isinstance(exc, HTTPException) and exc.status_code == 422 else 503
+            await cleanup()
             if isinstance(exc, asyncio.CancelledError):
                 raise
             if isinstance(exc, HTTPException) and (exc.status_code == 422 or exc.detail in {'项目内存预算已满，请稍后重试','项目资源保护未就绪，请稍后重试','自己的账号池正在处理请求，请稍后重试'}):
@@ -731,8 +756,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             raise HTTPException(503, '自己的账号池未就绪，账号可能失效；未使用其他用户账号') from None
 
         async def stream():
-            meter = UsageMeter(started=start)
-            status = response.status_code
+            nonlocal final_status
+            final_status = response.status_code
             try:
                 async def output():
                     if buffered is not None:
@@ -747,16 +772,9 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                     meter.feed(chunk)
                     yield chunk
             except BaseException:
-                status = 499
+                final_status = 499
                 raise
-            finally:
-                await release_worker()
-                await response.aclose()
-                await client.aclose()
-                userlocks[u['id']].release()
-                active.discard(u['id'])
-                store.record(u['id'], u['key_id'], model, status, time.monotonic()-start, meter.finish(), account_id=aid, generation=generation, first_token_seconds=meter.first_token_seconds if generation and status < 400 else None)
-        return StreamingResponse(stream(), status_code=response.status_code,
+        return ManagedStreamingResponse(stream(), cleanup=cleanup, status_code=response.status_code,
             headers={'Content-Type':response.headers.get('content-type','application/json'), 'X-Accel-Buffering':'no'})
 
     @app.api_route('/v1/{rest:path}', methods=['GET','POST','DELETE'])
