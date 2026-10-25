@@ -15,7 +15,7 @@ def test_installer_refuses_insecure_or_overlapping_paths():
 
 
 def test_broker_only_docker_socket_and_shared_slice():
-    c={'root':'/opt/app','data':'/var/data','socket_dir':'/run/xiaoguofan-release','portal_image':'xiaoguofan-portal:0.9.11','docker_gid':999}
+    c={'root':'/opt/app','data':'/var/data','socket_dir':'/run/xiaoguofan-release','portal_image':'xiaoguofan-portal:0.9.12','docker_gid':999}
     d=installer.compose(c,123,124)['services']
     for v in d.values():assert v['cgroup_parent']=='xiaoguofan.slice' and v['network_mode']=='host'
     assert not any('docker.sock' in v for v in d['portal']['volumes'])

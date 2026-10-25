@@ -41,7 +41,8 @@ def reference_quota(store,uid):
         trend.append({'day':datetime.fromtimestamp(lo,CST).strftime('%m-%d'),'success':sum(200<=r['status']<300 for r in daily),'failed':sum(r['status']>=400 for r in daily),
                       '4a':sum(200<=r['status']<300 and model_group(r['model'])=='4a' for r in daily),
                       '3.8f':sum(200<=r['status']<300 and model_group(r['model'])=='3.8f' for r in daily)})
-    unknown=[r for r in generation if not r['account_id']]
+    known={a['id'] for a in accounts}
+    unknown=[r for r in generation if r['account_id'] not in known]
     return {'reference_only':True,'timezone':'Asia/Shanghai','reset_at':start+86400,'period_days':30,
             'account_usage':result,'trend':trend,'unattributed':{'attempts':len(unknown),'success':sum(200<=r['status']<300 for r in unknown)},
             'quota_note':'站内参考额度，每日北京时间 00:00 重置；仅成功生成计数，不是 Google 实际余额，不拦截调用。Free / PRO 由本人标注；站外调用不计入。'}

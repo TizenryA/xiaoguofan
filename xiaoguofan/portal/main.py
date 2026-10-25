@@ -31,7 +31,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.9.11'
+VERSION = '0.9.12'
 
 
 class Strict(BaseModel):
@@ -207,7 +207,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             if not s['public_login']:
                 raise HTTPException(403, '公共访问尚未开放')
             if s['block_enabled'] and (user['policy'] != s['policy'] or time.time()-user['verified'] > s['verification_hours']*3600):
-                raise HTTPException(403, '请重新通过 Discord 登录验证')
+                raise HTTPException(403, '本站 Discord 权限验证已到期或规则已更新，请重新登录；Google 账号和用量记录不受影响')
         return user
 
     def auth(request, admin=False, csrf=False):
@@ -430,7 +430,10 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         validate_selected_identity(p)
         async with account_operation(u['id']):
             await workers.stop(u['id'])
-            aid = store.add_account(u['id'], payload.label, p)
+            try:
+                aid = store.add_account(u['id'], payload.label, p)
+            except ValueError as exc:
+                raise HTTPException(422,str(exc)) from None
         return {'id':aid, 'label':payload.label, 'status':'待首次调用验证'}
 
     @app.post('/api/accounts/native/verify')
@@ -438,8 +441,6 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         u=auth(request,csrf=True)
         rate('native:'+u['id'],3)
         if not payload.consent:raise HTTPException(422,'请先确认本人授权')
-        if len(store.accounts(u['id']))>=store.settings()['max_accounts']:
-            raise HTTPException(422,'账号数量达到限制')
         from portal.native_cookie import verify_native
         if native_slots.locked():raise HTTPException(429,'身份查询繁忙，请稍后重试')
         async with native_slots:
@@ -476,7 +477,6 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             validate_account(p)
             from portal.accounts import validate_selected_identity
             validate_selected_identity(p)
-            if len(store.accounts(u['id']))>=store.settings()['max_accounts']:raise HTTPException(422,'账号数量达到限制')
             await workers.stop(u['id'])
             auth(request,csrf=True)
             if row['expires']<=time.time():raise HTTPException(422,'确认已过期，请重新核对 Cookie')
@@ -484,7 +484,10 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             with store.lock:
                 if not store.one('SELECT token FROM native_pending WHERE token=? AND owner=? AND session=? AND expires>?',(digest(payload.ticket),u['id'],digest(u['csrf']),time.time())):
                     raise HTTPException(422,'确认已取消或过期，请重新核对 Cookie')
-                aid=store.add_account(u['id'],payload.label,p)
+                try:
+                    aid=store.add_account(u['id'],payload.label,p)
+                except ValueError as exc:
+                    raise HTTPException(422,str(exc)) from None
                 store.run('DELETE FROM native_pending WHERE token=?',(digest(payload.ticket),))
             return {'id':aid,'label':payload.label,'status':'身份已核对，模型权限待检查'}
 
@@ -528,7 +531,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             except TimeoutError:
                 result = {'status':'error','models':0,'message':'账号检查超时，请稍后再试；不要连续点击检查'}
             except HTTPException as exc:
-                message = exc.detail if exc.status_code in (409,422,503) else '独立账号池未就绪，请稍后重试或重新导入账号'
+                message = exc.detail if exc.status_code in (409,422,502,503) else '独立账号池未就绪，请稍后检查重建；无需删除或重导账号'
                 result = {'status':'error', 'models':0, 'message':message}
             except Exception:
                 result = {'status':'error', 'models':0, 'message':'检查未通过：登录失效、网络故障或服务器繁忙，请稍后重试'}
@@ -732,6 +735,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             params = [(k,v) for k,v in request.query_params.multi_items() if k not in ['key','api_key']]
             req = client.build_request(request.method, worker['url']+path, params=params, headers=headers, content=body)
             response = await client.send(req, stream=True)
+            if response.status_code in (401,403):
+                raise HTTPException(502, 'Google／账号池认证失败，不是 Discord 登录失效；请检查 Google 会话或联系站长')
             catalogue = request.method == 'GET' and path == '/v1/models'
             if response.is_success and (catalogue or (anti and 'text/event-stream' not in response.headers.get('content-type',''))):
                 raw_response = bytearray()
@@ -747,13 +752,13 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                     result = await normalize(payload, synthetic_name, model)
                 buffered = json.dumps(result, ensure_ascii=False).encode()
         except BaseException as exc:
-            final_status = 499 if isinstance(exc, asyncio.CancelledError) else 422 if isinstance(exc, HTTPException) and exc.status_code == 422 else 503
+            final_status = 499 if isinstance(exc, asyncio.CancelledError) else 422 if isinstance(exc, HTTPException) and exc.status_code == 422 else 502 if isinstance(exc, HTTPException) and exc.status_code == 502 else 503
             await cleanup()
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            if isinstance(exc, HTTPException) and (exc.status_code == 422 or exc.detail in {'项目内存预算已满，请稍后重试','项目资源保护未就绪，请稍后重试','自己的账号池正在处理请求，请稍后重试'}):
+            if isinstance(exc, HTTPException) and (exc.status_code in (422,502) or exc.detail in {'独立账号池认证失败，不是 Discord 登录失效；请检查 Google 会话或联系站长', '独立账号池启动失败，请稍后检查重建；无需删除或重导账号'} or exc.detail in {'项目内存预算已满，请稍后重试','项目资源保护未就绪，请稍后重试','自己的账号池正在处理请求，请稍后重试'}):
                 raise
-            raise HTTPException(503, '自己的账号池未就绪，账号可能失效；未使用其他用户账号') from None
+            raise HTTPException(503, '自己的账号池未就绪，请到账号管理点击检查重建；无需删除或重导账号') from None
 
         async def stream():
             nonlocal final_status

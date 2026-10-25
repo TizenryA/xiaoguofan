@@ -25,11 +25,11 @@ class BrokerClient:
         async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=self.socket), base_url='http://broker', timeout=240) as c:
             r = await c.post(path, json=payload)
             if r.status_code >= 400:
-                detail = '独立账号池未就绪，请稍后重试或重新导入账号'
+                detail = '独立账号池未就绪，请到账号管理点击检查重建；无需删除账号'
                 if r.status_code in (409,429,503):
                     try:
                         candidate = r.json().get('detail')
-                        allowed = {'账号池正在处理请求，请结束后重试','自己的账号池正在处理请求，请稍后重试','项目内存预算已满，请稍后重试','项目资源保护未就绪，请稍后重试','账号池正在启动或维护，请稍后重试','账号池启动超时，已结束本轮启动；请稍后重试'}
+                        allowed = {'独立账号池认证失败，不是 Discord 登录失效；请检查 Google 会话或联系站长', '独立账号池启动失败，请稍后检查重建；无需删除或重导账号', '账号池正在处理请求，请结束后重试','自己的账号池正在处理请求，请稍后重试','项目内存预算已满，请稍后重试','项目资源保护未就绪，请稍后重试','账号池正在启动或维护，请稍后重试','账号池启动超时，已结束本轮启动；请稍后重试'}
                         if candidate in allowed:
                             detail = candidate
                     except (ValueError,AttributeError,TypeError):
@@ -67,9 +67,12 @@ class BrokerClient:
     async def check(self, uid, account, limit):
         worker = None
         try:
+            await self.stop(uid)
             worker = await self.acquire(uid, [account], limit)
             async with httpx.AsyncClient(timeout=180) as c:
                 r = await c.get(worker['url']+'/v1/models', headers={'Authorization':'Bearer '+worker['key']})
+                if r.status_code in (401,403):
+                    raise HTTPException(502, 'Google／账号池认证失败，不是 Discord 登录失效；请检查 Google 会话或联系站长')
                 r.raise_for_status()
                 models = r.json().get('data', [])
                 if not isinstance(models, list) or not models:
@@ -259,9 +262,11 @@ class WorkerManager:
                             raise HTTPException(422, identity_error) from None
                     except (ValueError,AttributeError):
                         pass
+                if response is not None and response.status_code in (401,403):
+                    raise HTTPException(503, '独立账号池认证失败，不是 Discord 登录失效；请检查 Google 会话或联系站长') from None
                 if isinstance(exc,TimeoutError):
                     raise HTTPException(503, '账号池启动超时，已结束本轮启动；请稍后重试') from None
-                raise HTTPException(503, '独立账号池启动失败') from None
+                raise HTTPException(503, '独立账号池启动失败，请稍后检查重建；无需删除或重导账号') from None
             finally:
                 self.starting -= 1
 

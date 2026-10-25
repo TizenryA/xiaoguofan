@@ -9,6 +9,7 @@ from portal.workers import BrokerClient, WorkerManager
 def test_check_releases_worker_when_catalog_request_fails(monkeypatch):
     calls=[]
     class Broker(BrokerClient):
+        async def stop(self,uid):pass
         async def ensure(self,*args,**kwargs):return {'url':'http://worker','key':'k','lease':'lease1'}
         async def release(self,uid,lease):calls.append((uid,lease))
     async def fail(*args,**kwargs):raise httpx.ConnectError('network')

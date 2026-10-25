@@ -50,6 +50,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, user_id TEXT, key_id TEXT, model TEXT, status INTEGER, duration REAL,
           input_tokens INTEGER, output_tokens INTEGER, created REAL);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, actor TEXT, action TEXT, created REAL);
+        CREATE TABLE IF NOT EXISTS account_links(user_id TEXT, identity TEXT, account_id TEXT, gaia TEXT, PRIMARY KEY(user_id,identity));
         CREATE TABLE IF NOT EXISTS native_pending(token TEXT PRIMARY KEY, owner TEXT, session TEXT, expires REAL, encrypted TEXT);
         ''')
         columns = {r[1] for r in self.db.execute('PRAGMA table_info(accounts)')}
@@ -167,15 +168,50 @@ class Store:
 
     def add_account(self, uid, label, payload):
         with self.lock:
-            if len(self.accounts(uid)) >= self.settings()['max_accounts']:
-                raise ValueError('账号数量达到限制')
-            aid = uuid.uuid4().hex
-            self.run('INSERT INTO accounts(id,user_id,label,payload,created) VALUES (?,?,?,?,?)', (aid, uid, label, self.encrypt(payload), time.time()))
-            self.audit(uid, 'account_imported')
+            email = account_email(payload)
+            identity = digest(email) if email else None
+            state = payload.get('storage_state', {})
+            selected = state.get('xiaoguofan_identity', {}) if isinstance(state, dict) else {}
+            gaia = digest(selected['gaia_id']) if isinstance(selected, dict) and selected.get('gaia_id') else ''
+            matches = [a for a in self.accounts(uid) if email and a['email'] == email]
+            if len(matches) > 1:
+                raise ValueError('同一身份存在多个账号，请先保留一个；不会自动合并用量')
+            link = self.one('SELECT * FROM account_links WHERE user_id=? AND identity=?', (uid, identity)) if identity else None
+            if matches:
+                old = self.account(uid, matches[0]['id'])
+                old_state = old['payload'].get('storage_state', {})
+                old_identity = old_state.get('xiaoguofan_identity', {}) if isinstance(old_state, dict) else {}
+                old_gaia = digest(old_identity['gaia_id']) if isinstance(old_identity, dict) and old_identity.get('gaia_id') else ''
+                if gaia and (old_gaia or (link or {}).get('gaia')) and gaia != (old_gaia or link['gaia']):
+                    raise ValueError('Google 身份冲突，未覆盖原账号')
+                aid = old['id']
+                self.run("UPDATE accounts SET label=?,payload=?,status='unverified',checked=NULL,note='凭据已更新，用量记录保留；请重新检查' WHERE user_id=? AND id=?", (label, self.encrypt(payload), uid, aid))
+                gaia = gaia or old_gaia or (link or {}).get('gaia', '')
+            else:
+                if link and link['gaia'] and gaia and gaia != link['gaia']:
+                    raise ValueError('Google 身份冲突，未覆盖历史账号')
+                if len(self.accounts(uid)) >= self.settings()['max_accounts']:
+                    raise ValueError('账号数量达到限制')
+                aid = link['account_id'] if link else uuid.uuid4().hex
+                gaia = gaia or (link or {}).get('gaia', '')
+                self.run('INSERT INTO accounts(id,user_id,label,payload,created) VALUES (?,?,?,?,?)', (aid, uid, label, self.encrypt(payload), time.time()))
+            if identity:
+                self.run('INSERT INTO account_links VALUES (?,?,?,?) ON CONFLICT(user_id,identity) DO UPDATE SET account_id=excluded.account_id,gaia=excluded.gaia', (uid, identity, aid, gaia))
+            self.audit(uid, 'account_credentials_updated' if matches else 'account_imported')
             return aid
 
     def delete_account(self, uid, aid):
-        return bool(self.run('DELETE FROM accounts WHERE user_id=? AND id=?', (uid, aid)))
+        with self.lock:
+            old = self.account(uid, aid)
+            if not old:
+                return False
+            email = account_email(old['payload'])
+            state = old['payload'].get('storage_state', {})
+            selected = state.get('xiaoguofan_identity', {}) if isinstance(state, dict) else {}
+            gaia = digest(selected['gaia_id']) if isinstance(selected, dict) and selected.get('gaia_id') else ''
+            if email:
+                self.run('INSERT OR IGNORE INTO account_links VALUES (?,?,?,?)', (uid, digest(email), aid, gaia))
+            return bool(self.run('DELETE FROM accounts WHERE user_id=? AND id=?', (uid, aid)))
 
     def update_account(self, uid, aid, values):
         allowed = {k:v for k,v in values.items() if k in ['label','enabled','status','checked','note','plan']}
