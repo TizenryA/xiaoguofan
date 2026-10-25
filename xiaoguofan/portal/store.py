@@ -144,10 +144,10 @@ class Store:
     def user(self, uid):
         return self.one('SELECT * FROM users WHERE id=?', (uid,))
 
-    def login(self, uid):
+    def login(self, uid, lifetime=86400):
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
         self.run('DELETE FROM sessions WHERE expires<?', (time.time(),))
-        self.run('INSERT INTO sessions VALUES (?,?,?,?)', (digest(token), uid, csrf, time.time()+86400))
+        self.run('INSERT INTO sessions VALUES (?,?,?,?)', (digest(token), uid, csrf, time.time()+lifetime))
         return token, csrf
 
     def session(self, token):

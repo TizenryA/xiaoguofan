@@ -31,7 +31,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.9.12'
+VERSION = '0.9.13'
 
 
 class Strict(BaseModel):
@@ -96,7 +96,7 @@ class Settings(Strict):
     blocked_guilds: list[str] = Field(default_factory=list, max_length=100)
     discord_allowlist: list[str] = Field(default_factory=list, max_length=100)
     block_enabled: bool = False
-    verification_hours: int = Field(default=24, ge=1, le=168)
+    verification_hours: int = Field(default=24, ge=1, le=720)
     requests_per_minute: int = Field(default=20, ge=1, le=120)
     max_accounts: int = Field(default=5, ge=1, le=20)
     max_keys: int = Field(default=10, ge=1, le=30)
@@ -362,9 +362,9 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             raise HTTPException(403, '访问规则已更新，请重新登录')
         if str(profile['id']) in s['discord_allowlist']:
             store.audit(u['id'], 'discord_allowlist_login')
-        token, _ = store.login(u['id'])
+        token, _ = store.login(u['id'], lifetime=2592000)
         r = RedirectResponse(prefix or '/', 302)
-        r.set_cookie('portal_session', token, max_age=86400, httponly=True, secure=secure, samesite='lax', path=cookie_path)
+        r.set_cookie('portal_session', token, max_age=2592000, httponly=True, secure=secure, samesite='lax', path=cookie_path)
         r.delete_cookie('oauth_browser', path=cookie_path)
         return r
 
