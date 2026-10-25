@@ -6,6 +6,8 @@ import time
 class UsageMeter:
     def __init__(self, started=None):
         self.pending = bytearray()
+        self.json_mode = None
+        self.overflow = False
         self.usage = {}
         self.started = started if started is not None else time.monotonic()
         self.first_token_seconds = None
@@ -48,7 +50,16 @@ class UsageMeter:
 
     def feed(self, chunk):
         self.last_received = time.monotonic()
+        if self.overflow:
+            return
         self.pending.extend(chunk)
+        if self.json_mode is None and self.pending.strip():
+            self.json_mode = self.pending.lstrip()[:1] in (b'{', b'[')
+        if self.json_mode:
+            if len(self.pending) > 1024*1024:
+                self.pending.clear()
+                self.overflow = True
+            return
         while b'\n' in self.pending:
             line, _, remaining = self.pending.partition(b'\n')
             self.pending = bytearray(remaining)
