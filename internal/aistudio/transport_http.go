@@ -198,9 +198,11 @@ func (t *MakerSuiteHTTPTransport) UploadAssistantFile(ctx context.Context, accou
 		header.Set("Sec-Fetch-Dest", "empty")
 		header.Set("Sec-Fetch-Mode", "cors")
 		header.Set("Sec-Fetch-Site", "same-origin")
-		if account.Config.AuthUser > 0 {
-			header.Set("X-Goog-Authuser", strconv.Itoa(account.Config.AuthUser))
+		authUser, err := ResolveSelectedAuthUser(ctx, client, state, account.Config.AuthUser)
+		if err != nil {
+			return nil, nil, err
 		}
+		header.Set("X-Goog-Authuser", authUser)
 		if language := account.AcceptLanguage(); language != "" {
 			header.Set("Accept-Language", language)
 		}
@@ -288,7 +290,7 @@ func (t *MakerSuiteHTTPTransport) Do(ctx context.Context, rpc RPCRequest) (*RPCR
 	if err != nil {
 		return nil, releaseOnError(err)
 	}
-	authUser, err := ResolveSelectedAuthUser(ctx, client, state)
+	authUser, err := ResolveSelectedAuthUser(ctx, client, state, account.Config.AuthUser)
 	if err != nil {
 		return nil, releaseOnError(err)
 	}

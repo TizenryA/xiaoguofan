@@ -424,7 +424,7 @@ func (t *WorkerProtectedTransport) OpenBidiProtected(
 	if err != nil {
 		return nil, err
 	}
-	authUser, err := ResolveSelectedAuthUser(ctx, client, state)
+	authUser, err := ResolveSelectedAuthUser(ctx, client, state, lease.Account().Config.AuthUser)
 	if err != nil {
 		return nil, err
 	}

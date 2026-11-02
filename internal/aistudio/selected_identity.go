@@ -145,12 +145,20 @@ func matchSelectedIdentity(rows []selectedAccount, id SelectedIdentity) (string,
 
 // ResolveSelectedAuthUser verifies email+Gaia against Google's current cookie session.
 // Never trust the saved numeric position: account order can change.
-func ResolveSelectedAuthUser(ctx context.Context, client *http.Client, state StorageState) (string, error) {
+func ResolveSelectedAuthUser(ctx context.Context, client *http.Client, state StorageState, fallback ...int) (string, error) {
 	id, err := state.SelectedIdentity()
 	if err != nil {
 		return "", err
 	}
 	if id == nil {
+		// Upstream Cookie imports may select a session without fork metadata.
+		// An explicit identity is always verified and never uses this fallback.
+		if len(fallback) > 0 {
+			if fallback[0] < 0 || fallback[0] > 99 {
+				return "", errors.New("Google 账号会话位置无效")
+			}
+			return strconv.Itoa(fallback[0]), nil
+		}
 		return "0", nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)

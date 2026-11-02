@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1229,7 +1228,11 @@ func (t *MakerSuiteHTTPTransport) loadDriveDiscovery(ctx context.Context, lease 
 		return err
 	}
 	request.Header = gapi.Clone()
-	request.Header.Set("X-Goog-AuthUser", strconv.Itoa(account.Config.AuthUser))
+	authUser, err := ResolveSelectedAuthUser(ctx, client, state, account.Config.AuthUser)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("X-Goog-AuthUser", authUser)
 	request.Header.Set("Authorization", authorization)
 	request.Header.Set("Cookie", cookie)
 	request.Header.Set("Sec-Fetch-Site", "same-site")

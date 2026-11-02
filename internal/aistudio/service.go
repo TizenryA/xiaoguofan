@@ -163,7 +163,7 @@ func (t *WorkerProtectedTransport) doPrepared(
 	if err != nil {
 		return nil, err
 	}
-	authUser, err := ResolveSelectedAuthUser(ctx, client, selectedState)
+	authUser, err := ResolveSelectedAuthUser(ctx, client, selectedState, lease.Account().Config.AuthUser)
 	if err != nil {
 		return nil, err
 	}

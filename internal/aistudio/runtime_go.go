@@ -195,7 +195,7 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 		return nil, err
 	}
 	client := runtime.client
-	authUser, err := ResolveSelectedAuthUser(ctx, client, runtime.cookies())
+	authUser, err := ResolveSelectedAuthUser(ctx, client, runtime.cookies(), options.AuthUser)
 	if err != nil {
 		return nil, err
 	}
@@ -448,6 +448,14 @@ func CheckSession(ctx context.Context, options camoufoxnative.Options) error {
 	if err != nil {
 		return err
 	}
+	authUser, err := ResolveSelectedAuthUser(ctx, runtime.client, runtime.cookies(), options.AuthUser)
+	if err != nil {
+		return err
+	}
+	runtime.pageURL = aiStudioOrigin + "/prompts/new_chat"
+	if authUser != "0" {
+		runtime.pageURL = aiStudioOrigin + "/u/" + authUser + "/prompts/new_chat"
+	}
 	_, err = runtime.loadPage(ctx)
 	return err
 }
@@ -526,7 +534,7 @@ func (runtime *goWAARuntime) rpcHeaders(apiKey string) (http.Header, error) {
 	headers.Set("Referer", aiStudioOrigin+"/")
 	headers.Set("Content-Type", "application/json+protobuf")
 	headers.Set("X-Goog-Api-Key", apiKey)
-	authUser, err := ResolveSelectedAuthUser(context.Background(), runtime.client, runtime.cookies())
+	authUser, err := ResolveSelectedAuthUser(context.Background(), runtime.client, runtime.cookies(), runtime.options.AuthUser)
 	if err != nil {
 		return nil, err
 	}
@@ -833,7 +841,7 @@ func (runtime *goWAARuntime) Proof(ctx context.Context, digest string, prompt st
 
 // ProtocolHeaders 返回官网 GenerateContent 的六个公共头
 func (runtime *goWAARuntime) ProtocolHeaders(ctx context.Context) (http.Header, error) {
-	authUser, err := ResolveSelectedAuthUser(ctx, runtime.client, runtime.cookies())
+	authUser, err := ResolveSelectedAuthUser(ctx, runtime.client, runtime.cookies(), runtime.options.AuthUser)
 	if err != nil {
 		return nil, err
 	}
@@ -847,7 +855,7 @@ func (runtime *goWAARuntime) ProtocolHeaders(ctx context.Context) (http.Header, 
 
 // SendProtected 以官网页面 XHR 的 Firefox 请求形状流式发送受保护请求
 func (runtime *goWAARuntime) SendProtected(ctx context.Context, rawURL string, headers http.Header, body []byte) (*camoufoxnative.ProtectedResponse, error) {
-	authUser, identityErr := ResolveSelectedAuthUser(ctx, runtime.client, runtime.cookies())
+	authUser, identityErr := ResolveSelectedAuthUser(ctx, runtime.client, runtime.cookies(), runtime.options.AuthUser)
 	if identityErr != nil {
 		return nil, identityErr
 	}
