@@ -15,10 +15,11 @@ import (
 	"strings"
 	"unicode"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
-func defaultChromeRoot() (string, error) {
+// DefaultChromeRoot 返回稳定版 Chrome User Data 目录
+func DefaultChromeRoot() (string, error) {
 	localAppData := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
 	if localAppData == "" {
 		return "", fmt.Errorf("环境变量 LOCALAPPDATA 为空")
@@ -30,7 +31,8 @@ func ensurePlatformImport() error {
 	return nil
 }
 
-func discoverPlatform(chromeRoot string) ([]Account, error) {
+// Discover 只读列出本机 Chrome Google 账号
+func Discover(chromeRoot string) ([]Account, error) {
 	data, err := os.ReadFile(filepath.Join(chromeRoot, "Local State"))
 	if err != nil {
 		return nil, fmt.Errorf("读取 Chrome Local State: %w", err)
@@ -114,25 +116,8 @@ func profileIdentities(chromeRoot string, profile string) ([]profileIdentity, er
 }
 
 func profileLocale(chromeRoot string, profile string) string {
-	data, err := os.ReadFile(filepath.Join(chromeRoot, profile, "Preferences"))
-	if err != nil {
-		return ""
-	}
-	var preferences struct {
-		Intl struct {
-			AcceptLanguages   string `json:"accept_languages"`
-			SelectedLanguages string `json:"selected_languages"`
-		} `json:"intl"`
-	}
-	if json.Unmarshal(data, &preferences) != nil {
-		return ""
-	}
-	for _, value := range []string{preferences.Intl.AcceptLanguages, preferences.Intl.SelectedLanguages} {
-		if locale := strings.TrimSpace(strings.Split(value, ",")[0]); locale != "" {
-			return locale
-		}
-	}
-	return ""
+	locale, _, _ := strings.Cut(profileLanguages(chromeRoot, profile), ",")
+	return strings.TrimSpace(locale)
 }
 
 // copyFile 把 src 复制为 dst
@@ -151,7 +136,7 @@ func copyFile(src string, dst string) error {
 	return err
 }
 
-// openWebData 把 Profile 的 Web Data 与其 WAL 日志复制到临时目录后只读打开，绕过运行中 Chrome 的排他锁并包含尚未检查点的写入
+// openWebData 把 Profile 的 Web Data 与其 WAL 日志复制到临时目录后只读打开
 func openWebData(chromeRoot string, profile string) (database *sql.DB, closeDatabase func(), err error) {
 	tempDir, err := os.MkdirTemp("", "aistudio2api-webdata-*")
 	if err != nil {
@@ -171,7 +156,7 @@ func openWebData(chromeRoot string, profile string) (database *sql.DB, closeData
 		return nil, nil, fmt.Errorf("复制 %s Web Data-wal: %w", profile, err)
 	}
 	uri := url.URL{Scheme: "file", Path: "/" + filepath.ToSlash(copyPath), RawQuery: "mode=ro"}
-	if database, err = sql.Open("sqlite", uri.String()); err != nil {
+	if database, err = sql.Open("sqlite3", uri.String()); err != nil {
 		return nil, nil, fmt.Errorf("打开 %s Web Data: %w", profile, err)
 	}
 	database.SetMaxOpenConns(1)

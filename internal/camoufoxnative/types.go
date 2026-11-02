@@ -11,7 +11,7 @@ import (
 var ErrAuthenticationRequired = errors.New("隔离登录态失效")
 
 // ErrRegionNotSupported 表示 AI Studio 不支持当前出口地区或账户
-var ErrRegionNotSupported = errors.New("AI Studio 不支持当前出口地区或账户")
+var ErrRegionNotSupported = errors.New("AI Studio 不支持当前出口地区或账户，为该账户或全局代理换用支持地区的出口")
 
 // AvailableRegionsURL 是官网在地区或账户不受支持时跳转的页面
 const AvailableRegionsURL = "https://aistudio.google.com/docs/available-regions"
@@ -34,6 +34,9 @@ const (
 	StartupBootstrappingWAA StartupStage = "bootstrapping_waa"
 )
 
+// DefaultBootstrapPrompt 是 Options 未指定 BootstrapPrompt 时 WAA bootstrap 写入官网输入框并提交的提示词
+const DefaultBootstrapPrompt = "Hello"
+
 // Options 定义单个 AI Studio 账户的原生 Camoufox runtime
 type Options struct {
 	ExecutablePath   string
@@ -46,6 +49,7 @@ type Options struct {
 	ProxyBypass      string
 	Headless         bool
 	TemporaryChat    bool
+	AuthUser         int
 	CacheDirectory   string
 	ReadyTimeout     time.Duration
 	Log              io.Writer
@@ -65,8 +69,6 @@ type State struct {
 	PID         int
 	PageURL     string
 	UserAgent   string
-	Platform    string
-	Timezone    string
 	SnapshotKey string
 	Headers     http.Header
 }

@@ -12,7 +12,7 @@ declare module 'vue-router' {
 const studio = { studio: true }
 
 // routes 为管理端主页面与 API 试用页
-export const routes: RouteRecordRaw[] = [
+const routes: RouteRecordRaw[] = [
   { path: '/', name: 'console', component: App },
   { path: '/login', name: 'login', component: App },
   {
@@ -49,6 +49,12 @@ export const routes: RouteRecordRaw[] = [
     path: '/live',
     name: 'live',
     component: () => import('@/playground/media/LivePage.vue'),
+    meta: studio,
+  },
+  {
+    path: '/library',
+    name: 'library',
+    component: () => import('@/playground/LibraryPage.vue'),
     meta: studio,
   },
   {

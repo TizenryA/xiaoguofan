@@ -1,5 +1,11 @@
-import { apiKey, errorMessage, StreamError } from '../request'
+import { jsonBody } from '@/api'
+import { useI18n } from '@/i18n'
+import { base64Bytes, bytesToBase64, pcmToWav } from '../bytes'
+import { apiKey, errorMessage } from '../request'
 import type { Part } from '../types'
+import { pcmFormat } from './pcm-player'
+
+const { t } = useI18n()
 
 // InlineImage 是请求中的内联图片
 export interface InlineImage {
@@ -8,13 +14,13 @@ export interface InlineImage {
 }
 
 // GenerateResponse 是 generateContent 的响应
-export interface GenerateResponse {
+interface GenerateResponse {
   candidates?: { content?: { parts?: Part[] }; finishReason?: string }[]
   promptFeedback?: { blockReason?: string }
 }
 
 // VideoOperation 是 Gemini 视频长任务的状态
-export interface VideoOperation {
+interface VideoOperation {
   name: string
   done?: boolean
   error?: { message?: string }
@@ -37,10 +43,10 @@ async function post<T>(path: string, body: unknown, signal: AbortSignal): Promis
   const response = await fetch(path, {
     method: 'POST',
     headers: headers(),
-    body: JSON.stringify(body),
+    body: jsonBody(body),
     signal,
   })
-  if (!response.ok) throw new StreamError(await errorMessage(response), response.status)
+  if (!response.ok) throw new Error(await errorMessage(response))
   return (await response.json()) as T
 }
 
@@ -54,7 +60,7 @@ export function generateContent(
 }
 
 // PredictImagesInput 是 Imagen predict 请求的提示词与参数
-export interface PredictImagesInput {
+interface PredictImagesInput {
   prompt: string
   sampleCount: number
   aspectRatio: string
@@ -82,13 +88,13 @@ export async function predictImages(
     .map((item) => `data:${item.mimeType ?? 'image/png'};base64,${item.bytesBase64Encoded}`)
   if (images.length === 0)
     throw new Error(
-      predictions.find((item) => item.raiFilteredReason)?.raiFilteredReason ?? 'No images',
+      predictions.find((item) => item.raiFilteredReason)?.raiFilteredReason ?? t('pg.noImages'),
     )
   return images
 }
 
 // OpenAIVideo 是 OpenAI Videos 视频对象
-export interface OpenAIVideo {
+interface OpenAIVideo {
   id: string
   status: string
   error?: { message?: string } | null
@@ -102,34 +108,39 @@ export async function createOpenAIVideo(form: FormData, signal: AbortSignal): Pr
     body: form,
     signal,
   })
-  if (!response.ok) throw new StreamError(await errorMessage(response), response.status)
+  if (!response.ok) throw new Error(await errorMessage(response))
   return (await response.json()) as OpenAIVideo
+}
+
+// pollDelay 等待一个视频轮询间隔，signal 取消时以 AbortError 结束，到时与取消后都移除取消监听
+function pollDelay(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      window.clearTimeout(timer)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', abort)
+      resolve()
+    }, 5000)
+    signal.addEventListener('abort', abort, { once: true })
+  })
 }
 
 // waitOpenAIVideo 每 5 秒轮询 OpenAI 视频对象直到完成，返回结果视频地址
 export async function waitOpenAIVideo(video: OpenAIVideo, signal: AbortSignal): Promise<string> {
   let current = video
   while (current.status !== 'completed' && current.status !== 'failed') {
-    await new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(resolve, 5000)
-      signal.addEventListener(
-        'abort',
-        () => {
-          window.clearTimeout(timer)
-          reject(new DOMException('Aborted', 'AbortError'))
-        },
-        { once: true },
-      )
-    })
+    await pollDelay(signal)
     const response = await fetch(`/v1/videos/${encodeURIComponent(video.id)}`, {
       headers: headers(false),
       signal,
     })
-    if (!response.ok) throw new StreamError(await errorMessage(response), response.status)
+    if (!response.ok) throw new Error(await errorMessage(response))
     current = (await response.json()) as OpenAIVideo
   }
   if (current.status === 'failed')
-    throw new StreamError(current.error?.message ?? 'Video generation failed', 500)
+    throw new Error(current.error?.message ?? t('pg.videoGenerationFailed'))
   return `/v1/videos/${encodeURIComponent(video.id)}/content`
 }
 
@@ -146,46 +157,29 @@ export function createVideo(
 export async function waitVideo(operation: VideoOperation, signal: AbortSignal): Promise<string[]> {
   let current = operation
   while (current.done !== true) {
-    await new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(resolve, 5000)
-      signal.addEventListener(
-        'abort',
-        () => {
-          window.clearTimeout(timer)
-          reject(new DOMException('Aborted', 'AbortError'))
-        },
-        { once: true },
-      )
-    })
+    await pollDelay(signal)
     const response = await fetch(`/v1beta/${current.name}`, { headers: headers(false), signal })
-    if (!response.ok) throw new StreamError(await errorMessage(response), response.status)
+    if (!response.ok) throw new Error(await errorMessage(response))
     current = (await response.json()) as VideoOperation
   }
-  if (current.error) throw new StreamError(current.error.message ?? 'Video generation failed', 500)
+  if (current.error) throw new Error(current.error.message ?? t('pg.videoGenerationFailed'))
   const samples = current.response?.generateVideoResponse?.generatedSamples ?? []
   return samples.map((sample) => sample.video?.uri ?? '').filter((uri) => uri !== '')
 }
 
 // downloadMedia 下载本服务返回的媒体地址
-export async function downloadMedia(url: string, signal?: AbortSignal): Promise<Blob> {
-  const response = await fetch(url, { headers: headers(false), signal: signal ?? null })
-  if (!response.ok) throw new StreamError(await errorMessage(response), response.status)
+export async function downloadMedia(url: string): Promise<Blob> {
+  const response = await fetch(url, { headers: headers(false) })
+  if (!response.ok) throw new Error(await errorMessage(response))
   return response.blob()
 }
 
 // readImage 把图片文件读为内联图片
 export async function readImage(file: Blob): Promise<InlineImage> {
-  const buffer = new Uint8Array(await file.arrayBuffer())
-  let binary = ''
-  for (let index = 0; index < buffer.length; index += 0x8000) {
-    binary += String.fromCharCode(...buffer.subarray(index, index + 0x8000))
+  return {
+    mimeType: file.type || 'image/png',
+    data: bytesToBase64(new Uint8Array(await file.arrayBuffer())),
   }
-  return { mimeType: file.type || 'image/png', data: btoa(binary) }
-}
-
-// base64Bytes 把 base64 文本解码为字节
-export function base64Bytes(data: string): Uint8Array<ArrayBuffer> {
-  return Uint8Array.from(atob(data), (char) => char.charCodeAt(0))
 }
 
 // audioBlob 把响应中的音频片段合成一个可播放文件：audio/L16 PCM 封装为 16 位 WAV，其余格式按原样拼接
@@ -195,33 +189,8 @@ export function audioBlob(parts: readonly Part[]): Blob | undefined {
   const mime = audio[0]!.inlineData!.mimeType
   const chunks = audio.map((part) => base64Bytes(part.inlineData!.data))
   if (!mime.toLowerCase().startsWith('audio/l16')) return new Blob(chunks, { type: mime })
-  const parameters = new Map(
-    mime
-      .split(';')
-      .slice(1)
-      .map((item) => item.trim().split('=') as [string, string]),
-  )
-  const rate = Number(parameters.get('rate') ?? 24000)
-  const channels = Number(parameters.get('channels') ?? 1)
-  const length = chunks.reduce((total, chunk) => total + chunk.length, 0)
-  const header = new DataView(new ArrayBuffer(44))
-  const text = (offset: number, value: string): void => {
-    for (let index = 0; index < value.length; index++)
-      header.setUint8(offset + index, value.charCodeAt(index))
-  }
-  text(0, 'RIFF')
-  header.setUint32(4, 36 + length, true)
-  text(8, 'WAVEfmt ')
-  header.setUint32(16, 16, true)
-  header.setUint16(20, 1, true)
-  header.setUint16(22, channels, true)
-  header.setUint32(24, rate, true)
-  header.setUint32(28, rate * channels * 2, true)
-  header.setUint16(32, channels * 2, true)
-  header.setUint16(34, 16, true)
-  text(36, 'data')
-  header.setUint32(40, length, true)
-  return new Blob([header, ...chunks], { type: 'audio/wav' })
+  const { rate, channels } = pcmFormat(mime)
+  return pcmToWav(chunks, rate, channels)
 }
 
 // responseText 返回响应正文中的文本

@@ -1,14 +1,17 @@
 import { computed, reactive } from 'vue'
 import { useConsole } from '@/console'
+import { keepPage } from '@/desktop'
 import type { Model } from '@/types'
 import type { CodeOption } from '../code'
 import { newTurnID } from '../session'
 import { predictImages } from './api'
 import { pyTriple, tsTemplate } from './code'
+import { modelMatches } from '../catalog'
 import { pageKindOf } from './kinds'
+import { requestTitle } from '../title'
 
 // ImagenTurn 是 Imagen 页的一轮：用户轮次记录提示词，模型轮次记录生成的图片
-export interface ImagenTurn {
+interface ImagenTurn {
   id: string
   role: 'user' | 'model'
   prompt?: string
@@ -24,12 +27,17 @@ export type ImagenLanguage = 'python' | 'typescript' | 'rest'
 // imagenCodeOptions 是 Imagen 页获取代码的语言选项
 export const imagenCodeOptions: CodeOption<ImagenLanguage>[] = [
   { value: 'python', label: 'Python', highlight: 'python', file: 'main.py' },
-  { value: 'typescript', label: 'TypeScript', highlight: 'typescript', file: 'main.ts' },
+  {
+    value: 'typescript',
+    label: 'TypeScript',
+    highlight: 'typescript',
+    file: 'main.ts',
+  },
   { value: 'rest', label: 'REST', highlight: 'bash', file: 'request.sh' },
 ]
 
-// imagenAspectRatios 是模型没有给出宽高比列表时官网 Imagen 页的选项
-const imagenAspectRatios = ['1:1', '3:4', '4:3', '9:16', '16:9']
+// imagenAspectRatios 是官网 Imagen 页的宽高比选项
+const imagenAspectRatios = ['1:1', '9:16', '16:9', '4:3', '3:4']
 
 const state = reactive({
   model: '',
@@ -43,9 +51,21 @@ const state = reactive({
 })
 let controller: AbortController | undefined
 
+// 关闭桌面窗口时，生成中与只存在于页面的图片保留页面
+keepPage(() => state.running || state.turns.length > 0)
+
 // imagenModels 返回目录中归属 Imagen 页的模型
-export function imagenModels(): Model[] {
+function imagenModels(): Model[] {
   return useConsole().models.value.filter((model) => pageKindOf(model) === 'image')
+}
+
+// generateTitle 与官网一样在会话未命名时于提交时以提示词生成标题，失败时保持未命名
+async function generateTitle(model: string, prompt: string): Promise<void> {
+  const title = await requestTitle(model, prompt, '', () => ({
+    owner: state.turns,
+    title: state.title,
+  }))
+  if (title !== '') state.title = title
 }
 
 // run 以当前提示词与设置调用本服务的 predict 接口，结果写入新的模型轮次；与官网一样失败时撤下本轮并抛出上游说明，取消时只撤下本轮
@@ -53,10 +73,7 @@ async function run(): Promise<void> {
   const prompt = state.draft.trim()
   if (prompt === '' || state.running || state.model === '') return
   const model = imagenModels().find((item) => item.id === state.model)
-  if (state.title === '') {
-    const line = prompt.split('\n')[0] ?? ''
-    state.title = line.length > 60 ? `${line.slice(0, 60)}…` : line
-  }
+  if (state.title === '') void generateTitle(state.model, prompt)
   state.turns.push({ id: newTurnID(), role: 'user', prompt })
   const turn = reactive<ImagenTurn>({
     id: newTurnID(),
@@ -145,29 +162,23 @@ result.generatedImages?.forEach((generated, index) => {
 // useImagen 返回 Imagen 页的状态与操作
 export function useImagen() {
   const currentModel = computed(() => imagenModels().find((model) => model.id === state.model))
-  const aspectRatios = computed(() => {
-    const options = currentModel.value?.capability_options?.['image_aspect_ratios']
-    return Array.isArray(options) && options.length > 0 ? options.map(String) : imagenAspectRatios
-  })
   return {
     state,
     currentModel,
-    aspectRatios,
+    aspectRatios: imagenAspectRatios,
     // ensureModel 在目录变化后选定模型：地址中的模型优先，其次保留当前模型，否则用第一个 Imagen 模型
     ensureModel(requested?: string): void {
       const list = imagenModels()
       const wanted =
-        list.find((model) => model.id === requested) ??
+        list.find((model) => modelMatches(model, requested)) ??
         list.find((model) => model.id === state.model) ??
         list[0]
       if (wanted) state.model = wanted.id
-      if (!aspectRatios.value.includes(state.aspectRatio))
-        state.aspectRatio = aspectRatios.value[0] ?? '1:1'
     },
     // reset 恢复默认运行设置
     reset(): void {
       state.count = 1
-      state.aspectRatio = aspectRatios.value[0] ?? '1:1'
+      state.aspectRatio = '1:1'
     },
     // newSession 清空当前会话
     newSession(): void {

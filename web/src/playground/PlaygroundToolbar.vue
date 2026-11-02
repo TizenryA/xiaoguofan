@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
 import { computed, ref } from 'vue'
 import {
   DropdownMenuContent,
@@ -9,16 +8,19 @@ import {
   DropdownMenuTrigger,
 } from 'reka-ui'
 import { useRouter } from 'vue-router'
+import { useConsole } from '@/console'
 import { useI18n } from '@/i18n'
 import UiDialog from '@/playground/ui/UiDialog.vue'
 import UiIcon from '@/playground/ui/UiIcon.vue'
+import SavePromptDialog from './SavePromptDialog.vue'
 import { isOmniModel } from './catalog'
 import { useMediaQuery } from './media-query'
 import { useCompare, usePlayground } from './session'
 
 defineProps<{ settingsOpen: boolean; narrow: boolean }>()
 const emit = defineEmits<{ newChat: []; toggleSettings: [] }>()
-const { t, locale } = useI18n()
+const { t, tokenLabel, errorText } = useI18n()
+const { showNotice } = useConsole()
 const router = useRouter()
 const playground = usePlayground()
 const { session } = playground
@@ -27,11 +29,15 @@ const { comparing, enterCompare, toggleRaw } = useCompare()
 const handset = useMediaQuery('(max-width: 768px)')
 
 const editing = ref(false)
-const titleDraft = ref('')
 const confirmDelete = ref(false)
 
 // hasPrompt 表示对话已有内容，标题可编辑
-const hasPrompt = computed(() => session.turns.length > 0 || session.id !== null)
+const hasPrompt = computed(
+  () =>
+    session.turns.length > 0 ||
+    session.id !== null ||
+    session.settings.systemInstruction.trim() !== '',
+)
 // temporaryLabel 与官网一样在临时对话不可用时显示原因
 const temporaryLabel = computed(() =>
   isOmniModel(playground.currentModel.value)
@@ -46,37 +52,28 @@ const title = computed(() =>
 )
 // tokens 是当前对话的 token 数
 const tokens = computed(() =>
-  session.promptTokens === null
-    ? ''
-    : t('pg.tokens').replace(
-        '{count}',
-        new Intl.NumberFormat(locale.value).format(session.promptTokens),
-      ),
+  session.promptTokens === null ? '' : tokenLabel(session.promptTokens),
 )
-
-// openRename 打开标题编辑对话框
-function openRename(): void {
-  titleDraft.value = session.title
-  editing.value = true
-}
-
-// saveTitle 保存编辑后的标题
-function saveTitle(): void {
-  playground.rename(titleDraft.value)
-  editing.value = false
-}
 
 // makeCopy 复制当前对话并打开副本
 async function makeCopy(): Promise<void> {
-  const id = await playground.copyPrompt()
-  void router.push(`/prompts/${id}`)
+  try {
+    const id = await playground.copyPrompt()
+    void router.push(`/prompts/${id}`)
+  } catch (error) {
+    showNotice(errorText(error), 'error')
+  }
 }
 
 // removePrompt 删除当前对话并回到新对话
 async function removePrompt(): Promise<void> {
   confirmDelete.value = false
-  await playground.deletePrompt()
-  void router.push('/prompts/new_chat')
+  try {
+    await playground.deletePrompt()
+    void router.push('/prompts/new_chat')
+  } catch (error) {
+    showNotice(errorText(error), 'error')
+  }
 }
 </script>
 
@@ -92,7 +89,7 @@ async function removePrompt(): Promise<void> {
           ms-button
           class="ms-button-borderless ms-button-icon ms-button-small"
           :aria-label="t('pg.editTitle')"
-          @click="openRename"
+          @click="editing = true"
         >
           <UiIcon name="edit" :size="18" />
         </button>
@@ -156,24 +153,31 @@ async function removePrompt(): Promise<void> {
         <DropdownMenuPortal>
           <DropdownMenuContent align="end" :side-offset="4" class="ms-menu-panel">
             <DropdownMenuItem
+              v-if="handset"
+              v-tooltip.left="session.id === null ? t('pg.shareNeedsRun') : ''"
+              class="ms-menu-item"
+              disabled
+            >
+              <UiIcon name="share" :size="18" />
+              <span class="ms-menu-item-text">{{ t('pg.share') }}</span>
+            </DropdownMenuItem>
+            <DropdownMenuItem
               class="ms-menu-item"
               :disabled="session.id !== null || isOmniModel(playground.currentModel.value)"
               @select="session.temporary = !session.temporary"
             >
               <UiIcon name="incognito" :size="18" />
               <span class="ms-menu-item-text">{{ temporaryLabel }}</span>
-              <span class="ms-menu-radio" :class="{ selected: session.temporary }"></span>
+              <UiIcon v-if="session.temporary" name="check" :size="18" />
             </DropdownMenuItem>
             <DropdownMenuItem
               class="ms-menu-item"
-              :disabled="
-                session.temporary || session.turns.length === 0 || session.saveState === 'saved'
-              "
+              :disabled="session.temporary || !hasPrompt || session.saveState === 'saved'"
               @select="playground.save()"
             >
               <UiIcon name="save" :size="18" />
               <span class="ms-menu-item-text">{{
-                session.saveState === 'saved' ? t('pg.noChanges') : t('pg.savePrompt')
+                !hasPrompt || session.saveState === 'saved' ? t('pg.noChanges') : t('pg.savePrompt')
               }}</span>
             </DropdownMenuItem>
             <DropdownMenuItem
@@ -195,7 +199,7 @@ async function removePrompt(): Promise<void> {
             <DropdownMenuItem class="ms-menu-item" @select="toggleRaw">
               <UiIcon name="rawMode" :size="18" />
               <span class="ms-menu-item-text">{{ t('pg.rawMode') }}</span>
-              <span class="ms-menu-radio" :class="{ selected: session.rawMode }"></span>
+              <UiIcon v-if="session.rawMode" name="check" :size="18" />
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenuPortal>
@@ -214,26 +218,18 @@ async function removePrompt(): Promise<void> {
         </button>
       </Transition>
     </div>
-    <UiDialog v-model:open="editing" :title="t('pg.editTitle')" width="480px">
-      <label class="field-label" for="prompt-title">{{ t('pg.title') }}</label>
-      <input
-        id="prompt-title"
-        v-model="titleDraft"
-        ms-input
-        class="title-input"
-        maxlength="120"
-        @keydown.enter.prevent="saveTitle"
-      />
-      <template #actions>
-        <button type="button" ms-button class="ms-button-borderless" @click="editing = false">
-          {{ t('common.cancel') }}
-        </button>
-        <button type="button" ms-button class="ms-button-primary" @click="saveTitle">
-          {{ t('common.save') }}
-        </button>
-      </template>
-    </UiDialog>
-    <UiDialog v-model:open="confirmDelete" :title="t('pg.deleteTitle')" width="420px">
+    <SavePromptDialog
+      v-model:open="editing"
+      :title="session.title"
+      :description="session.description"
+      @save="playground.rename"
+    />
+    <UiDialog
+      v-model:open="confirmDelete"
+      :title="t('pg.deleteTitle')"
+      width="500px"
+      :closable="false"
+    >
       <p class="confirm-text">{{ t('pg.deleteBody') }}</p>
       <template #actions>
         <button type="button" ms-button class="ms-button-borderless" @click="confirmDelete = false">
@@ -248,37 +244,6 @@ async function removePrompt(): Promise<void> {
 </template>
 
 <style scoped>
-.ms-header {
-  position: relative;
-  z-index: 2;
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: center;
-  gap: 4px;
-  width: 100%;
-  padding: 16px 20px 8px var(--ms-header-padding-left, 20px);
-  backdrop-filter: blur(5px);
-  background-color: var(--color-v3-overlay-background);
-}
-
-.ms-header::after {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: 32px;
-  background: linear-gradient(to bottom, var(--color-v3-surface) 0, transparent 100%);
-  content: '';
-  pointer-events: none;
-  transform: translateY(100%);
-}
-
-@media screen and (max-width: 480px) {
-  .ms-header {
-    padding: 16px 8px 8px var(--ms-header-padding-left, 8px);
-  }
-}
-
 .toolbar-left,
 .toolbar-right {
   display: flex;
@@ -341,19 +306,9 @@ async function removePrompt(): Promise<void> {
   line-height: 18px;
 }
 
-.field-label {
-  display: block;
-  margin-bottom: 8px;
-  font-weight: 500;
-}
-
-.title-input {
-  width: 100%;
-}
-
 .confirm-text {
   margin: 0;
-  color: var(--color-v3-text-var);
+  line-height: 21px;
 }
 
 .runsettings-toggle-enter-active {

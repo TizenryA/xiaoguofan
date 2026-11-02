@@ -13,6 +13,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,12 +29,12 @@ const (
 	waaRequestKey          = "lmnUSbltwc5ULv48iKLX"
 	waaAPIKey              = "AIzaSyBGb5fGAyC-pRcRU6MUHb__b_vKha71HRE"
 	waaLifetime            = 12 * time.Hour
-	waaSettleQuiet         = 3 * time.Second
-	loggingContextURL      = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GetLoggingContext"
+	makerSuiteRPCURL       = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/"
+	loggingContextURL      = makerSuiteRPCURL + "GetLoggingContext"
 	firefoxInnerHeightDiff = 57
 )
 
-// workerRuntime 是 Camoufox 页面与纯 Go VM 两种 WAA 后端共同提供的 Worker 能力
+// workerRuntime 是 Camoufox 页面与 SpiderMonkey VM 两种 WAA 后端共同提供的 Worker 能力
 type workerRuntime interface {
 	Proof(context.Context, string, string) (string, error)
 	ProtocolHeaders(context.Context) (http.Header, error)
@@ -44,7 +47,7 @@ type workerRuntime interface {
 // waaInterpreterHashes 记录本进程已执行过的解释器版本
 var waaInterpreterHashes sync.Map
 
-// goWAARuntime 以纯 Go BotGuard VM 与账户固定出口 HTTP 承担官网页面的 WAA 职责
+// goWAARuntime 以 SpiderMonkey BotGuard VM 与账户固定出口 HTTP 承担官网页面的 WAA 职责
 type goWAARuntime struct {
 	options        camoufoxnative.Options
 	client         *http.Client
@@ -52,6 +55,8 @@ type goWAARuntime struct {
 	userAgent      string
 	acceptLanguage string
 	pageURL        string
+	pageLoaded     time.Time
+	pageFlags      pageFlags
 	headers        http.Header
 	cacheDirectory string
 
@@ -67,6 +72,82 @@ type goWAARuntime struct {
 	refreshTimer    *time.Timer
 }
 
+// pageRPC 是官网页面自身发出的 MakerSuite 请求方法与正文
+type pageRPC struct {
+	method string
+	body   string
+}
+
+// pageStartupRPCs 是官网页面启动时与 GetLoggingContext、Waa/Create 并发发出的请求
+var pageStartupRPCs = []pageRPC{
+	{"GetUserPreferences", "[]"},
+	{"GetAiStudioBenefitTier", "[]"},
+	{"ListModels", "[]"},
+	{"GenerateAccessToken", `["users/me"]`},
+	{"ListIncidentsHistory", "[]"},
+	{"ListPromos", "[]"},
+	{"GenerateAccessToken", `["users/me"]`},
+}
+
+// pageFollowupRPCs 是官网页面在启动请求完成后接着发出的请求
+var pageFollowupRPCs = []pageRPC{
+	{"ListRecentApplets", "[]"},
+	{"ListPrompts", "[100]"},
+}
+
+// gdpProfileRPC 是官网导航栏在账户有订阅权益时读取 Google Developer Program 权益的请求
+var gdpProfileRPC = pageRPC{"GetGdpProfileAndBenefits", "[]"}
+
+// pageFlags 是官网页面内联数据中决定页面自身请求的构建开关
+type pageFlags struct {
+	// gdpProfile 为开关 45806340：导航栏读取 Google Developer Program 权益
+	gdpProfile bool
+	// plusBenefit 为开关 45777963：Plus 权益计为订阅权益
+	plusBenefit bool
+}
+
+// parsePageFlags 读取官网页面内联数据中的构建开关
+func parsePageFlags(body []byte) pageFlags {
+	enabled := func(id string) bool { return bytes.Contains(body, []byte("["+id+",null,true,")) }
+	return pageFlags{gdpProfile: enabled("45806340"), plusBenefit: enabled("45777963")}
+}
+
+// requestsGDPProfile 按官网导航栏的条件判断页面是否读取 Google Developer Program 权益：开关开启且 GetAiStudioBenefitTier 返回订阅权益
+func (flags pageFlags) requestsGDPProfile(benefitTier []byte) bool {
+	if !flags.gdpProfile {
+		return false
+	}
+	tier, err := decodeBenefitTier(benefitTier)
+	if err != nil || tier == BenefitTierPlus && !flags.plusBenefit {
+		return false
+	}
+	return tier != BenefitTierFree
+}
+
+// pageTogglesPattern 匹配官网页面内联脚本写入的构建开关数组
+var pageTogglesPattern = regexp.MustCompile(`window\["_F_toggles_default_MakerSuite"\] = \[([^\]]*)\]`)
+
+// pageStringGlobalPattern 匹配官网页面内联脚本以 var 声明的构建字符串
+var pageStringGlobalPattern = regexp.MustCompile(`var (_F_cssRowKey|_F_combinedSignature) = '([^']*)'`)
+
+// pageGlobals 返回官网页面内联脚本声明的当前构建全局值
+func pageGlobals(body []byte) map[string]any {
+	globals := map[string]any{}
+	if match := pageTogglesPattern.FindSubmatch(body); match != nil {
+		toggles := []any{}
+		for _, item := range strings.Split(string(match[1]), ",") {
+			if value, err := strconv.ParseInt(strings.TrimSpace(item), 0, 64); err == nil {
+				toggles = append(toggles, float64(value))
+			}
+		}
+		globals["_F_toggles_default_MakerSuite"] = toggles
+	}
+	for _, match := range pageStringGlobalPattern.FindAllSubmatch(body, -1) {
+		globals[string(match[1])] = string(match[2])
+	}
+	return globals
+}
+
 // newGoWAAHTTPClient 创建由 runtime 手动处理重定向的固定出口客户端
 func newGoWAAHTTPClient(proxyURL string) (*http.Client, error) {
 	client, err := NewProxyHTTPClient(proxyURL)
@@ -79,8 +160,8 @@ func newGoWAAHTTPClient(proxyURL string) (*http.Client, error) {
 	return client, nil
 }
 
-// NewGoWorker 启动单个账户的纯 Go WAA runtime，不启动浏览器
-func NewGoWorker(ctx context.Context, accountID string, options camoufoxnative.Options) (*NativeWorker, error) {
+// NewSpiderMonkeyWorker 启动单个账户的 SpiderMonkey WAA runtime
+func NewSpiderMonkeyWorker(ctx context.Context, accountID string, options camoufoxnative.Options) (*NativeWorker, error) {
 	if accountID == "" {
 		return nil, fmt.Errorf("缺少账户 ID")
 	}
@@ -95,7 +176,7 @@ func NewGoWorker(ctx context.Context, accountID string, options camoufoxnative.O
 			AccountID: accountID,
 			Phase:     WorkerReady,
 			PID:       os.Getpid(),
-			RuntimeID: "go-waa",
+			RuntimeID: "spidermonkey-waa",
 			PageURL:   runtime.pageURL,
 		},
 	}, nil
@@ -106,28 +187,24 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 		return nil, errors.New("WAA bootstrap 缺少实时目录聊天模型")
 	}
 	if options.BootstrapPrompt == "" {
-		options.BootstrapPrompt = fmt.Sprintf("AIStudio2API bootstrap %d", time.Now().UnixNano())
+		options.BootstrapPrompt = camoufoxnative.DefaultBootstrapPrompt
 	}
 	reportGoStartup(options, camoufoxnative.StartupPreparingBrowser)
-	storage, err := LoadStorageState(options.StorageStatePath)
+	runtime, fingerprint, err := newGoPageRuntime(options)
 	if err != nil {
 		return nil, err
 	}
-	fingerprint, err := camoufoxnative.AccountFingerprint(options)
+	client := runtime.client
+	authUser, err := ResolveSelectedAuthUser(ctx, client, runtime.cookies())
 	if err != nil {
 		return nil, err
 	}
-	client, err := newGoWAAHTTPClient(options.Proxy)
-	if err != nil {
-		return nil, err
+	if authUser != "0" {
+		runtime.pageURL = aiStudioOrigin + "/u/" + authUser + "/prompts/new_chat"
+	} else {
+		runtime.pageURL = aiStudioOrigin + "/prompts/new_chat"
 	}
-	runtime := &goWAARuntime{options: options, client: client, storage: storage}
-	runtime.profile, runtime.userAgent, runtime.acceptLanguage = profileFromFingerprint(fingerprint)
-	authUser, err := ResolveSelectedAuthUser(ctx, client, storage)
-	if err != nil {
-		return nil, err
-	}
-	runtime.pageURL = aiStudioOrigin + "/prompts/new_chat?authuser=" + authUser + "&model=" + url.QueryEscape(options.Model)
+	runtime.pageURL += "?model=" + url.QueryEscape(options.Model)
 	if options.TemporaryChat {
 		runtime.pageURL += "&temporary=true"
 	}
@@ -135,7 +212,7 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 	runtime.profile.HasFocus = true
 	runtime.profile.Locale, _ = fingerprint["navigator.language"].(string)
 	runtime.profile.TimeZone, _ = fingerprint["timezone"].(string)
-	for _, origin := range storage.Origins {
+	for _, origin := range runtime.storage.Origins {
 		if origin.Origin != aiStudioOrigin {
 			continue
 		}
@@ -150,14 +227,34 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 	if err != nil {
 		return nil, err
 	}
-	extension, err := runtime.loggingContextHeader(ctx, apiKey)
-	if err != nil {
-		return nil, err
-	}
 	visitID, err := newVisitID()
 	if err != nil {
 		return nil, err
 	}
+	reportGoStartup(options, camoufoxnative.StartupLocatingWAA)
+	type loggingContext struct {
+		extension string
+		err       error
+	}
+	loggingDone := make(chan loggingContext, 1)
+	go func() {
+		extension, err := runtime.loggingContextHeader(ctx, apiKey, visitID)
+		loggingDone <- loggingContext{extension, err}
+	}()
+	pageDone := make(chan [][]byte, 1)
+	go func() {
+		pageDone <- runtime.sendPageRPCs(ctx, apiKey, visitID, pageStartupRPCs)
+	}()
+	challenge, err := runtime.createChallenge(ctx, nil)
+	logging := <-loggingDone
+	startup := <-pageDone
+	if err != nil {
+		return nil, err
+	}
+	if logging.err != nil {
+		return nil, logging.err
+	}
+	extension := logging.extension
 	runtime.headers = http.Header{}
 	runtime.headers.Set("user-agent", runtime.userAgent)
 	runtime.headers.Set("x-goog-api-key", apiKey)
@@ -167,13 +264,14 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 	if extension != "" {
 		runtime.headers.Set("x-goog-ext-519733851-bin", extension)
 	}
-	reportGoStartup(options, camoufoxnative.StartupLocatingWAA)
-	challenge, err := runtime.createChallenge(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
 	reportGoStartup(options, camoufoxnative.StartupBootstrappingWAA)
+	followupDone := make(chan struct{})
+	go func() {
+		runtime.sendFollowupRPCs(ctx, apiKey, visitID, startup)
+		close(followupDone)
+	}()
 	vm, err := runtime.startVM(ctx, challenge)
+	<-followupDone
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +279,7 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
 		vm.Close()
 		return nil, fmt.Errorf("填写 bootstrap 提示词失败: %w", err)
 	}
-	if err := vm.Settle(ctx, waaSettleQuiet); err != nil {
+	if err := vm.Settle(ctx); err != nil {
 		vm.Close()
 		return nil, err
 	}
@@ -202,7 +300,7 @@ func (runtime *goWAARuntime) scheduleRefresh() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		if _, err := runtime.currentVM(ctx, true); err != nil {
-			slog.Warn("WAA 纯 Go VM 刷新失败", "error", err)
+			slog.Warn("WAA SpiderMonkey VM 刷新失败", "error", err)
 		}
 	})
 }
@@ -228,6 +326,11 @@ func profileFromFingerprint(config map[string]any) (waa.Profile, string, string)
 			profile.Screen[name] = value
 		case "window":
 			profile.Window[name] = value
+		}
+	}
+	for _, name := range []string{"availLeft", "availTop"} {
+		if _, ok := profile.Screen[name]; !ok {
+			profile.Screen[name] = 0
 		}
 	}
 	profile.Navigator["doNotTrack"] = "unspecified"
@@ -280,7 +383,7 @@ func (runtime *goWAARuntime) mergeResponseCookies(response *http.Response, reque
 	runtime.storageMu.Lock()
 	defer runtime.storageMu.Unlock()
 	if err := runtime.storage.MergeSetCookieHeaders(headers, requestURL, time.Now()); err != nil {
-		slog.Warn("WAA 纯 Go Cookie 写回失败", "url", requestURL, "error", err)
+		slog.Warn("WAA SpiderMonkey Cookie 写回失败", "url", requestURL, "error", err)
 	}
 }
 
@@ -315,6 +418,40 @@ func (runtime *goWAARuntime) do(ctx context.Context, method string, target strin
 	return response, nil
 }
 
+// newGoPageRuntime 以账户的指纹、固定出口与保存的 Cookie 准备打开官网新对话页面
+func newGoPageRuntime(options camoufoxnative.Options) (*goWAARuntime, map[string]any, error) {
+	storage, err := LoadStorageState(options.StorageStatePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	fingerprint, err := camoufoxnative.AccountFingerprint(options)
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err := newGoWAAHTTPClient(options.Proxy)
+	if err != nil {
+		return nil, nil, err
+	}
+	runtime := &goWAARuntime{options: options, client: client, storage: storage}
+	runtime.profile, runtime.userAgent, runtime.acceptLanguage = profileFromFingerprint(fingerprint)
+	pagePath := "/prompts/new_chat"
+	if options.AuthUser > 0 {
+		pagePath = fmt.Sprintf("/u/%d/prompts/new_chat", options.AuthUser)
+	}
+	runtime.pageURL = aiStudioOrigin + pagePath
+	return runtime, fingerprint, nil
+}
+
+// CheckSession 像官网页面一样打开账户的 AI Studio 新对话页，被转到 Google 登录页时返回 camoufoxnative.ErrAuthenticationRequired
+func CheckSession(ctx context.Context, options camoufoxnative.Options) error {
+	runtime, _, err := newGoPageRuntime(options)
+	if err != nil {
+		return err
+	}
+	_, err = runtime.loadPage(ctx)
+	return err
+}
+
 // loadPage 以浏览器导航形状请求官网页面并返回页面公开 API Key
 func (runtime *goWAARuntime) loadPage(ctx context.Context) (string, error) {
 	headers := http.Header{}
@@ -326,6 +463,7 @@ func (runtime *goWAARuntime) loadPage(ctx context.Context) (string, error) {
 	headers.Set("Sec-Fetch-User", "?1")
 	headers.Set("Priority", "u=0, i")
 	target := runtime.pageURL
+	navigationStart := time.Now()
 	for redirect := 0; redirect < 5; redirect++ {
 		response, err := runtime.do(ctx, http.MethodGet, target, nil, headers)
 		if err != nil {
@@ -354,9 +492,27 @@ func (runtime *goWAARuntime) loadPage(ctx context.Context) (string, error) {
 		if len(match) != 2 || len(match[1]) == 0 {
 			return "", fmt.Errorf("AI Studio 页面缺少 WIu0Nc")
 		}
+		runtime.pageLoaded = time.Now()
+		runtime.profile.Globals = pageGlobals(body)
+		runtime.pageFlags = parsePageFlags(body)
+		runtime.profile.NavigationStart = navigationStart
+		runtime.profile.TrustedTypes = requiresTrustedScripts(response.Header.Values("Content-Security-Policy"))
 		return string(match[1]), nil
 	}
 	return "", errors.New("AI Studio 页面跳转次数过多")
+}
+
+// requiresTrustedScripts 判断页面 CSP 是否含 require-trusted-types-for 'script'
+func requiresTrustedScripts(policies []string) bool {
+	for _, policy := range policies {
+		for _, directive := range strings.FieldsFunc(policy, func(character rune) bool { return character == ';' || character == ',' }) {
+			fields := strings.Fields(directive)
+			if len(fields) > 1 && strings.EqualFold(fields[0], "require-trusted-types-for") && slices.Contains(fields[1:], "'script'") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // rpcHeaders 返回官网页面 grpc-web 请求的公共头
@@ -384,12 +540,13 @@ func (runtime *goWAARuntime) rpcHeaders(apiKey string) (http.Header, error) {
 	return headers, nil
 }
 
-// loggingContextHeader 调用 GetLoggingContext 并编码为官网的 X-Goog-Ext-519733851-Bin
-func (runtime *goWAARuntime) loggingContextHeader(ctx context.Context, apiKey string) (string, error) {
+// loggingContextHeader 以官网页面的 visit ID 调用 GetLoggingContext 并编码为官网的 X-Goog-Ext-519733851-Bin
+func (runtime *goWAARuntime) loggingContextHeader(ctx context.Context, apiKey string, visitID string) (string, error) {
 	headers, err := runtime.rpcHeaders(apiKey)
 	if err != nil {
 		return "", err
 	}
+	headers.Set("X-AIStudio-Visit-Id", visitID)
 	response, err := runtime.do(ctx, http.MethodPost, loggingContextURL, []byte("[]"), headers)
 	if err != nil {
 		return "", fmt.Errorf("读取官网日志上下文: %w", err)
@@ -407,6 +564,47 @@ func (runtime *goWAARuntime) loggingContextHeader(ctx context.Context, apiKey st
 		return "", fmt.Errorf("编码官网日志上下文: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(encoded), nil
+}
+
+// sendPageRPCs 以官网页面的请求头并发发出页面自身的 MakerSuite 请求，按 rpcs 顺序返回各 HTTP 200 响应的正文
+func (runtime *goWAARuntime) sendPageRPCs(ctx context.Context, apiKey string, visitID string, rpcs []pageRPC) [][]byte {
+	bodies := make([][]byte, len(rpcs))
+	var group sync.WaitGroup
+	for index, rpc := range rpcs {
+		group.Go(func() {
+			headers, err := runtime.rpcHeaders(apiKey)
+			if err != nil {
+				return
+			}
+			headers.Set("X-AIStudio-Visit-Id", visitID)
+			bodies[index] = runtime.drain(runtime.do(ctx, http.MethodPost, makerSuiteRPCURL+rpc.method, []byte(rpc.body), headers))
+		})
+	}
+	group.Wait()
+	return bodies
+}
+
+// sendFollowupRPCs 按启动请求的响应发出官网页面接着发出的请求，导航栏条件成立时同时读取 Google Developer Program 权益
+func (runtime *goWAARuntime) sendFollowupRPCs(ctx context.Context, apiKey string, visitID string, startup [][]byte) {
+	rpcs := pageFollowupRPCs
+	benefitTier := startup[slices.IndexFunc(pageStartupRPCs, func(rpc pageRPC) bool { return rpc.method == "GetAiStudioBenefitTier" })]
+	if runtime.pageFlags.requestsGDPProfile(benefitTier) {
+		rpcs = append(slices.Clone(rpcs), gdpProfileRPC)
+	}
+	runtime.sendPageRPCs(ctx, apiKey, visitID, rpcs)
+}
+
+// drain 读完并关闭页面自身请求的响应，返回 HTTP 200 响应的正文
+func (runtime *goWAARuntime) drain(response *http.Response, err error) []byte {
+	if err != nil {
+		return nil
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil || response.StatusCode != http.StatusOK {
+		return nil
+	}
+	return body
 }
 
 // encodeJSPBFields 按字段顺序把 JSPB 数组中的数字与字符串编码为 protobuf 二进制
@@ -539,7 +737,11 @@ func (runtime *goWAARuntime) startVM(ctx context.Context, challenge waa.Challeng
 	runtime.interpreterHash, runtime.interpreter = challenge.InterpreterHash, interpreter
 	cookie, _ := documentCookie(runtime.cookies())
 	profile := runtime.profile
-	profile.Document = map[string]any{"cookie": cookie}
+	location, err := time.LoadLocation(profile.TimeZone)
+	if err != nil {
+		location = time.Local
+	}
+	profile.Document = map[string]any{"cookie": cookie, "lastModified": runtime.pageLoaded.In(location).Format("01/02/2006 15:04:05")}
 	return waa.NewRuntime(ctx, waa.Options{Challenge: challenge, Interpreter: interpreter, Profile: profile, LoadImage: runtime.loadImage})
 }
 
@@ -565,6 +767,7 @@ func (runtime *goWAARuntime) loadImage(address string) bool {
 	headers.Set("Sec-Fetch-Dest", "image")
 	headers.Set("Sec-Fetch-Mode", "no-cors")
 	headers.Set("Sec-Fetch-Site", "same-origin")
+	headers.Set("Priority", "u=5, i")
 	response, err := runtime.do(ctx, http.MethodGet, address, nil, headers)
 	if err != nil {
 		return false
@@ -577,7 +780,7 @@ func (runtime *goWAARuntime) loadImage(address string) bool {
 // currentVM 返回未过期的 VM，到期时按官网刷新流程重建
 func (runtime *goWAARuntime) currentVM(ctx context.Context, force bool) (*waa.Runtime, error) {
 	if runtime.closed {
-		return nil, errors.New("纯 Go WAA runtime 已关闭")
+		return nil, errors.New("SpiderMonkey WAA runtime 已关闭")
 	}
 	if !force && runtime.vm != nil && time.Now().Before(runtime.vmExpires) {
 		return runtime.vm, nil
@@ -598,7 +801,7 @@ func (runtime *goWAARuntime) currentVM(ctx context.Context, force bool) (*waa.Ru
 	if err != nil {
 		return nil, err
 	}
-	if err := vm.Settle(ctx, waaSettleQuiet); err != nil {
+	if err := vm.Settle(ctx); err != nil {
 		vm.Close()
 		return nil, err
 	}
@@ -642,7 +845,7 @@ func (runtime *goWAARuntime) ProtocolHeaders(ctx context.Context) (http.Header, 
 	return headers, nil
 }
 
-// SendProtected 以官网页面 fetch 的 Firefox 请求形状流式发送受保护请求
+// SendProtected 以官网页面 XHR 的 Firefox 请求形状流式发送受保护请求
 func (runtime *goWAARuntime) SendProtected(ctx context.Context, rawURL string, headers http.Header, body []byte) (*camoufoxnative.ProtectedResponse, error) {
 	authUser, identityErr := ResolveSelectedAuthUser(ctx, runtime.client, runtime.cookies())
 	if identityErr != nil {
@@ -658,6 +861,11 @@ func (runtime *goWAARuntime) SendProtected(ctx context.Context, rawURL string, h
 	request.Set("Sec-Fetch-Mode", "cors")
 	request.Set("Sec-Fetch-Site", "same-site")
 	request.Del("Cookie")
+	if followUp, ok := camoufoxnative.FollowUpFrom(ctx); ok {
+		time.AfterFunc(followUp.Delay, func() {
+			runtime.drain(runtime.do(context.WithoutCancel(ctx), http.MethodPost, followUp.URL, followUp.Body, request))
+		})
+	}
 	response, err := runtime.do(ctx, http.MethodPost, rawURL, body, request)
 	if err != nil {
 		return nil, err
@@ -673,14 +881,12 @@ func (runtime *goWAARuntime) StorageCookies(ctx context.Context) ([]byte, error)
 	return json.Marshal(runtime.cookies().Cookies)
 }
 
-// State 返回纯 Go runtime 的页面与协议状态
+// State 返回 SpiderMonkey runtime 的页面与协议状态
 func (runtime *goWAARuntime) State() camoufoxnative.State {
 	return camoufoxnative.State{
 		PID:       os.Getpid(),
 		PageURL:   runtime.pageURL,
 		UserAgent: runtime.userAgent,
-		Platform:  fmt.Sprint(runtime.profile.Navigator["platform"]),
-		Timezone:  runtime.options.Timezone,
 		Headers:   runtime.headers.Clone(),
 	}
 }

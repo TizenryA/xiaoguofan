@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/base64"
@@ -37,6 +38,7 @@ type responsesRequest struct {
 	Conversation       json.RawMessage   `json:"conversation"`
 	Prompt             json.RawMessage   `json:"prompt"`
 	Include            []string          `json:"include"`
+	ServiceTier        string            `json:"service_tier"`
 	ContextManagement  []struct {
 		Type             string `json:"type"`
 		CompactThreshold *int64 `json:"compact_threshold"`
@@ -65,6 +67,35 @@ type responsesTool struct {
 	Format            json.RawMessage `json:"format,omitempty"`
 	Strict            *bool           `json:"strict,omitempty"`
 	Tools             []responsesTool `json:"tools,omitempty"`
+	// Size、Quality、OutputFormat 与 InputImageMask 是 image_generation 工具的图片尺寸、质量、输出格式与编辑遮罩
+	Size           string              `json:"size,omitempty"`
+	Quality        string              `json:"quality,omitempty"`
+	OutputFormat   string              `json:"output_format,omitempty"`
+	InputImageMask *responsesImageMask `json:"input_image_mask,omitempty"`
+	// DisplayWidth、DisplayHeight 与 Environment 是 computer_use_preview 工具的屏幕尺寸与运行环境，shell 工具的 environment 为对象
+	DisplayWidth  int64           `json:"display_width,omitempty"`
+	DisplayHeight int64           `json:"display_height,omitempty"`
+	Environment   json.RawMessage `json:"environment,omitempty"`
+	// SearchContentTypes 是 web_search 工具检索的内容类型 text 与 image
+	SearchContentTypes []string `json:"search_content_types,omitempty"`
+	// ServerLabel 至 ServerDescription 是 mcp 工具的远程 MCP 服务器设置
+	ServerLabel       string            `json:"server_label,omitempty"`
+	ServerURL         string            `json:"server_url,omitempty"`
+	ConnectorID       string            `json:"connector_id,omitempty"`
+	Authorization     string            `json:"authorization,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	AllowedTools      json.RawMessage   `json:"allowed_tools,omitempty"`
+	RequireApproval   json.RawMessage   `json:"require_approval,omitempty"`
+	ServerDescription string            `json:"server_description,omitempty"`
+}
+
+// imageGenerationTool 返回请求声明的 image_generation 工具
+func imageGenerationTool(tools []responsesTool) *responsesTool {
+	index := slices.IndexFunc(tools, func(tool responsesTool) bool { return tool.Type == "image_generation" })
+	if index < 0 {
+		return nil
+	}
+	return &tools[index]
 }
 
 type responsesInputItem struct {
@@ -78,6 +109,7 @@ type responsesInputItem struct {
 	Arguments        string          `json:"arguments"`
 	Input            string          `json:"input"`
 	Action           json.RawMessage `json:"action"`
+	Actions          json.RawMessage `json:"actions"`
 	Operation        json.RawMessage `json:"operation"`
 	Status           string          `json:"status"`
 	Output           json.RawMessage `json:"output"`
@@ -224,7 +256,7 @@ func (store *responseStateStore) Response(id string) (json.RawMessage, bool, boo
 		output = append(output, item.Raw)
 	}
 	shell["output"], _ = json.Marshal(output)
-	encoded, _ := json.Marshal(shell)
+	encoded, _ := json.Marshal(officialOrder("responses", shell))
 	return encoded, state.Record.Background, true
 }
 
@@ -257,10 +289,7 @@ func (store *responseStateStore) InputItems(id string) ([]storedItem, bool) {
 	}
 	items := append([]storedItem(nil), state.Record.Input...)
 	for parentID := state.ParentID; parentID != ""; {
-		parent, exists := store.states[parentID]
-		if !exists {
-			break
-		}
+		parent := store.states[parentID]
 		if parent.Record != nil {
 			items = append(append(append([]storedItem(nil), parent.Record.Input...), parent.Record.Output...), items...)
 		}
@@ -348,7 +377,7 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	responseID := newID("resp")
-	prepared, err := s.prepareResponses(r.Context(), &request, responseID)
+	prepared, err := s.prepareResponses(r.Context(), &request, responseID, true)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -367,6 +396,11 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		s.streamBackground(w, r, request, prepared, responseID)
 		return
 	}
+	if !request.Stream {
+		var stopKeepalive func()
+		w, stopKeepalive = s.nonstreamKeepalive(w, r)
+		defer stopKeepalive()
+	}
 	compaction, err := s.compactOverThreshold(r.Context(), &request, &prepared, responseID)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
@@ -375,7 +409,7 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	generateRequest := prepared.generate
-	generateRequest.Unary = !request.Stream
+	generateRequest.Unary = !request.Stream || s.responseModes().FakeStream
 	events, err := s.service.Generate(r.Context(), generateRequest)
 	if err == nil && request.Stream {
 		events, err = awaitStreamStart(r.Context(), events)
@@ -391,14 +425,14 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		s.streamResponses(w, r, request, prepared, responseID, created, events, compaction)
 		return
 	}
-	result, err := consumeEvents(r.Context(), events, nil)
+	result, err := consumeEvents(r.Context(), events)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIRequestError(w, err)
 		}
 		return
 	}
-	response, err := buildResponsesObject(responseID, created, request, result, compaction)
+	response, err := buildResponsesObject(responseID, created, request, result, outputPrefix(compaction, prepared))
 	if err != nil {
 		writeOpenAIRequestError(w, err)
 		return
@@ -406,7 +440,7 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if request.storesResponse() {
 		s.storeResponse(responseID, request, prepared, result, response)
 	}
-	writeJSON(w, http.StatusOK, response)
+	writeJSON(w, http.StatusOK, officialOrder("responses", response))
 }
 
 // responsesPreparation 是转换后的生成请求，以及保存续接节点所需的前序上下文与本次输入
@@ -416,11 +450,13 @@ type responsesPreparation struct {
 	contents           []aistudio.Content
 	inlineInstructions []string
 	input              []storedItem
+	// approved 是批准后由服务执行的 mcp_call 项，排在输出首位
+	approved []map[string]any
 	// stream 为后台流式响应的事件记录，随响应对象保存
 	stream *streamLog
 }
 
-// compactOverThreshold 在 context_management 的 compaction 阈值被超过时先压缩输入，以被压缩部分的 developer 与 system 消息、保留的条目与 compaction 项作为本次输入；返回生成前插入输出的 compaction 项
+// compactOverThreshold 在 context_management 的 compaction 阈值被超过时先压缩输入，返回生成前插入输出的 compaction 项
 func (s *server) compactOverThreshold(ctx context.Context, request *responsesRequest, prepared *responsesPreparation, id string) (map[string]any, error) {
 	threshold := request.compactThreshold()
 	if threshold <= 0 {
@@ -439,31 +475,64 @@ func (s *server) compactOverThreshold(ctx context.Context, request *responsesReq
 	encoded, _ := json.Marshal(item)
 	request.Input, _ = json.Marshal(slices.Concat(instructions, retained, []json.RawMessage{encoded}))
 	request.PreviousResponseID = ""
-	compacted, err := s.prepareResponses(ctx, request, id)
+	compacted, err := s.prepareResponses(ctx, request, id, false)
 	if err != nil {
 		return nil, err
 	}
+	compacted.approved = prepared.approved
 	*prepared = compacted
 	return item, nil
 }
 
-// prepareResponses 展开 item_reference、转换请求、下载外部媒体并接上 previous_response_id 的上下文
-func (s *server) prepareResponses(ctx context.Context, request *responsesRequest, id string) (responsesPreparation, error) {
+// prepareResponses 展开 item_reference、转换请求、下载外部媒体并接上 previous_response_id 的上下文；execute 为真时执行输入中批准的 MCP 调用
+func (s *server) prepareResponses(ctx context.Context, request *responsesRequest, id string, execute bool) (responsesPreparation, error) {
 	input, err := s.responseStates.ResolveItems(request.Input)
 	if err != nil {
 		return responsesPreparation{}, err
 	}
-	request.Input = input
-	generateRequest, inlineInstructions, err := request.toGenerateRequest(id)
+	additionalTools, _ := responsesInputConfig(input)
+	tools := slices.Concat(request.Tools, additionalTools)
+	rewritten, approved, err := s.applyMCPApprovals(ctx, request.PreviousResponseID, tools, input, execute)
 	if err != nil {
 		return responsesPreparation{}, err
 	}
+	request.Input = rewritten
+	generateRequest, inlineInstructions, err := request.toGenerateRequest(id)
+	if err == nil {
+		generateRequest, err = s.resolveMCPTools(ctx, generateRequest)
+	}
+	if err == nil {
+		generateRequest, err = s.mcpApprovalTools(ctx, tools, request.ToolChoice, generateRequest)
+	}
+	if err != nil {
+		return responsesPreparation{}, err
+	}
+	generateRequest = s.prepareSearch(generateRequest)
 	if err := inlineRemoteMedia(ctx, generateRequest.Contents); err != nil {
 		return responsesPreparation{}, err
 	}
+	if tool := imageGenerationTool(request.Tools); tool != nil && (tool.Size != "" || tool.Quality != "") {
+		models, err := s.service.Models(ctx)
+		if err != nil {
+			return responsesPreparation{}, err
+		}
+		if model, _ := LookupPublicModel(models, request.Model); model.Capabilities["image_route"] {
+			if generateRequest.Config.ImageConfig, err = openAIImageConfig(tool.Size, tool.Quality, model.CapabilityOptions); err != nil {
+				return responsesPreparation{}, fmt.Errorf("image_generation: %w", err)
+			}
+		}
+	}
 	prepared := responsesPreparation{
 		generate: generateRequest, contents: cloneResponseContents(generateRequest.Contents),
-		inlineInstructions: append([]string(nil), inlineInstructions...), input: responsesInputItems(request.Input, id),
+		inlineInstructions: append([]string(nil), inlineInstructions...), input: responsesInputItems(input, id), approved: approved,
+	}
+	if tool := imageGenerationTool(request.Tools); tool != nil && tool.InputImageMask != nil {
+		mask, err := s.imageGenerationMask(ctx, *tool.InputImageMask)
+		if err != nil {
+			return responsesPreparation{}, fmt.Errorf("image_generation.input_image_mask: %w", err)
+		}
+		generateRequest.Contents = withImageMask(generateRequest.Contents, mask)
+		prepared.generate.Contents = generateRequest.Contents
 	}
 	if request.PreviousResponseID == "" {
 		return prepared, nil
@@ -475,13 +544,23 @@ func (s *server) prepareResponses(ctx context.Context, request *responsesRequest
 	prepared.previous = previous
 	prepared.generate.Contents = append(cloneResponseContents(previous.Contents), generateRequest.Contents...)
 	inlineInstructions = append(append([]string(nil), previous.InlineInstructions...), inlineInstructions...)
-	instructions := make([]string, 0, 1+len(inlineInstructions))
+	prepared.generate.System = systemSegments(strings.Join(request.instructions(inlineInstructions), "\n"))
+	return prepared, nil
+}
+
+// instructions 按顺序返回 instructions、输入中的系统消息与 mcp 工具的 server_description
+func (request responsesRequest) instructions(inline []string) []string {
+	instructions := make([]string, 0, 1+len(inline))
 	if request.Instructions != "" {
 		instructions = append(instructions, request.Instructions)
 	}
-	instructions = append(instructions, inlineInstructions...)
-	prepared.generate.System = strings.Join(instructions, "\n")
-	return prepared, nil
+	instructions = append(instructions, inline...)
+	for _, tool := range request.Tools {
+		if tool.Type == "mcp" && tool.ServerDescription != "" {
+			instructions = append(instructions, "MCP server "+tool.ServerLabel+": "+tool.ServerDescription)
+		}
+	}
+	return instructions
 }
 
 // storesResponse 返回响应是否保存为可续接与查询的节点，后台请求同样保存以供轮询
@@ -498,7 +577,7 @@ func (s *server) storeResponse(id string, request responsesRequest, prepared res
 	for _, item := range response["output"].([]any) {
 		object, _ := item.(map[string]any)
 		if itemID, _ := object["id"].(string); itemID != "" {
-			raw, _ := json.Marshal(object)
+			raw, _ := json.Marshal(officialOrder("responses", object))
 			record.Output = append(record.Output, storedItem{ID: itemID, Raw: raw})
 		}
 	}
@@ -557,31 +636,11 @@ func responsesInputItems(raw json.RawMessage, responseID string) []storedItem {
 }
 
 func responseHistoryOutput(result generationResult) aistudio.Content {
-	output := aistudio.Content{Role: aistudio.RoleAssistant}
+	var output aistudio.Output
 	for _, event := range result.events {
-		switch event.Kind {
-		case aistudio.EventText:
-			if event.Text != "" {
-				output.Parts = append(output.Parts, aistudio.Part{Text: event.Text, ThoughtSignature: event.ThoughtSignature})
-			}
-		case aistudio.EventToolCall:
-			if event.ToolCall != nil {
-				call := *event.ToolCall
-				call.Arguments = append(json.RawMessage(nil), call.Arguments...)
-				output.Parts = append(output.Parts, aistudio.Part{FunctionCall: &call, ThoughtSignature: event.ThoughtSignature})
-			}
-		case aistudio.EventMedia:
-			if event.Media != nil && len(event.Media.Data) > 0 {
-				blob := &aistudio.Blob{MIME: event.Media.MIME, Data: append([]byte(nil), event.Media.Data...)}
-				output.Parts = append(output.Parts, aistudio.Part{InlineData: blob, ThoughtSignature: event.ThoughtSignature})
-			}
-		case aistudio.EventReasoning, aistudio.EventThoughtSignature:
-			if event.ThoughtSignature != "" {
-				output.Parts = append(output.Parts, aistudio.Part{ThoughtSignature: event.ThoughtSignature})
-			}
-		}
+		output.Add(event)
 	}
-	return output
+	return output.History()
 }
 
 func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateRequest, []string, error) {
@@ -594,11 +653,7 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 	if err != nil {
 		return aistudio.GenerateRequest{}, nil, err
 	}
-	instructions := make([]string, 0, 1+len(inlineInstructions))
-	if request.Instructions != "" {
-		instructions = append(instructions, request.Instructions)
-	}
-	instructions = append(instructions, inlineInstructions...)
+	instructions := request.instructions(inlineInstructions)
 	additionalTools, configuredEffort := responsesInputConfig(request.Input)
 	tools, err := mapResponsesTools(slices.Concat(request.Tools, additionalTools), request.ToolChoice)
 	if err != nil {
@@ -633,9 +688,9 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 		Temperature:     request.Temperature,
 		TopP:            request.TopP,
 		MaxOutputTokens: request.MaxOutputTokens,
+		HideThinking:    true,
 	}
-	config.HideThinking = true
-	if len(request.Reasoning) > 0 && string(request.Reasoning) != "null" {
+	if rawJSONConfigured(request.Reasoning) {
 		var reasoning struct {
 			Effort          string `json:"effort"`
 			Summary         string `json:"summary"`
@@ -651,11 +706,12 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 	if configuredEffort != "" {
 		config.ReasoningEffort = configuredEffort
 	}
-	if len(request.Text) > 0 && string(request.Text) != "null" {
+	if rawJSONConfigured(request.Text) {
 		var text struct {
 			Format struct {
-				Type   string          `json:"type"`
-				Schema json.RawMessage `json:"schema"`
+				Type        string          `json:"type"`
+				Description string          `json:"description"`
+				Schema      json.RawMessage `json:"schema"`
 			} `json:"format"`
 		}
 		if err := json.Unmarshal(request.Text, &text); err != nil {
@@ -666,25 +722,30 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 			config.ResponseMIMEType = "application/json"
 		case "json_schema":
 			config.ResponseMIMEType = "application/json"
-			config.ResponseSchema = text.Format.Schema
+			schema, err := describedSchema(text.Format.Schema, text.Format.Description)
+			if err != nil {
+				return aistudio.GenerateRequest{}, nil, fmt.Errorf("invalid text format json_schema: %w", err)
+			}
+			config.ResponseJSONSchema = schema
 		case "", "text":
 		default:
 			return aistudio.GenerateRequest{}, nil, fmt.Errorf("unsupported text format %q", text.Format.Type)
 		}
 	}
 	return aistudio.GenerateRequest{
-		ID:       id,
-		Model:    request.Model,
-		System:   strings.Join(instructions, "\n"),
-		Contents: contents,
-		Config:   config,
-		Tools:    tools,
-		Truncate: request.Truncation == "auto",
+		ID:          id,
+		Model:       request.Model,
+		System:      systemSegments(strings.Join(instructions, "\n")),
+		Contents:    contents,
+		Config:      config,
+		Tools:       tools,
+		Truncate:    request.Truncation == "auto",
+		ServiceTier: openAIServiceTier(request.ServiceTier),
 	}, inlineInstructions, nil
 }
 
 func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error) {
-	if value := strings.TrimSpace(string(raw)); value == "" || value == "null" {
+	if !rawJSONConfigured(raw) {
 		return nil, nil, nil
 	}
 	var text string
@@ -714,7 +775,7 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 			continue
 		case "additional_tools", "configuration_update":
 			continue
-		case "web_search_call", "code_interpreter_call", "image_generation_call", "file_search_call", "computer_call", "computer_call_output",
+		case "web_search_call", "code_interpreter_call", "image_generation_call", "file_search_call",
 			"mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response", "tool_search_call", "tool_search_output", "program", "program_output":
 			pendingSignature = ""
 			content, err := responsesHostedItem(kind, rawItem)
@@ -772,6 +833,21 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 			call.Name, call.Arguments = "shell", rawObjectArguments(item.Action)
 		case "apply_patch_call":
 			call.Name, call.Arguments = "apply_patch", rawObjectArguments(item.Operation)
+		case "computer_call":
+			call.Name, call.Arguments = "computer", rawObjectArguments(item.Action)
+			if rawJSONConfigured(item.Actions) {
+				call.Arguments, _ = json.Marshal(map[string]json.RawMessage{"actions": item.Actions})
+			}
+		case "computer_call_output":
+			pendingSignature = ""
+			screenshot, err := computerScreenshot(item.Output)
+			if err != nil {
+				return nil, nil, fmt.Errorf("computer_call_output: %w", err)
+			}
+			contents = append(contents, aistudio.Content{Role: aistudio.RoleTool, Parts: append([]aistudio.Part{{FunctionResult: &aistudio.FunctionResult{
+				ID: item.CallID, Name: "computer", Content: json.RawMessage(`{"type":"computer_screenshot"}`),
+			}}}, screenshot...)})
+			continue
 		case "function_call_output", "custom_tool_call_output", "local_shell_call_output", "shell_call_output", "apply_patch_call_output":
 			pendingSignature = ""
 			if item.CallID == "" {
@@ -836,12 +912,10 @@ func responsesItemType(raw json.RawMessage) string {
 	return head.Type
 }
 
-// responsesHostedItem 把托管工具与 computer、MCP 历史项转为文本摘要，截图与生成图片保留为图片
+// responsesHostedItem 把托管工具与 MCP 历史项转为文本摘要，生成图片保留为图片
 func responsesHostedItem(kind string, raw json.RawMessage) (aistudio.Content, error) {
 	var item map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &item); err != nil {
-		return aistudio.Content{}, err
-	}
+	_ = json.Unmarshal(raw, &item)
 	content := aistudio.Content{Role: aistudio.RoleAssistant}
 	var media []aistudio.Part
 	switch kind {
@@ -855,23 +929,6 @@ func responsesHostedItem(kind string, raw json.RawMessage) (aistudio.Content, er
 			media = append(media, aistudio.Part{InlineData: &aistudio.Blob{MIME: detectMediaType("", data), Data: data}})
 			delete(item, "result")
 		}
-	case "computer_call_output":
-		content.Role = aistudio.RoleUser
-		var output struct {
-			ImageURL string `json:"image_url"`
-			FileID   string `json:"file_id"`
-		}
-		if json.Unmarshal(item["output"], &output) == nil && (output.ImageURL != "" || output.FileID != "") {
-			part := aistudio.Part{File: &aistudio.FileRef{ID: output.FileID}}
-			if output.ImageURL != "" {
-				var err error
-				if part, err = fileOrInlinePart(output.ImageURL, ""); err != nil {
-					return aistudio.Content{}, fmt.Errorf("output: %w", err)
-				}
-			}
-			media = append(media, part)
-			delete(item, "output")
-		}
 	case "mcp_approval_response":
 		content.Role = aistudio.RoleUser
 	}
@@ -881,6 +938,60 @@ func responsesHostedItem(kind string, raw json.RawMessage) (aistudio.Content, er
 	summary, _ := json.Marshal(item)
 	content.Parts = append([]aistudio.Part{{Text: kind + " " + string(summary)}}, media...)
 	return content, nil
+}
+
+// mcpOutputText 把上游 MCP 工具结果中的文本内容拼成 mcp_call 的 output，无法解析时返回结果原文
+func mcpOutputText(raw json.RawMessage) string {
+	switch result := mcpToolResult(raw).(type) {
+	case string:
+		return result
+	case []map[string]any:
+		var text strings.Builder
+		for _, item := range result {
+			if value, ok := item["text"].(string); ok {
+				text.WriteString(value)
+			}
+		}
+		return text.String()
+	}
+	return string(raw)
+}
+
+// mcpCallError 在上游 MCP 结果的 isError 为 true 时返回 mcp_call 的 mcp_tool_execution_error，content 为结果的内容数组，否则返回 nil
+func mcpCallError(raw json.RawMessage) map[string]any {
+	var response struct {
+		Result string `json:"call_tool_result_json"`
+	}
+	var result struct {
+		Content json.RawMessage `json:"content"`
+		IsError bool            `json:"isError"`
+	}
+	if json.Unmarshal(raw, &response) != nil || json.Unmarshal([]byte(response.Result), &result) != nil || !result.IsError {
+		return nil
+	}
+	return map[string]any{"type": "mcp_tool_execution_error", "content": result.Content}
+}
+
+// computerScreenshot 返回 computer_call_output 中 computer_screenshot 的图片 Part
+func computerScreenshot(raw json.RawMessage) ([]aistudio.Part, error) {
+	var output struct {
+		ImageURL string `json:"image_url"`
+		FileID   string `json:"file_id"`
+	}
+	if err := json.Unmarshal(raw, &output); err != nil {
+		return nil, fmt.Errorf("output: %w", err)
+	}
+	switch {
+	case output.ImageURL != "":
+		part, err := fileOrInlinePart(output.ImageURL, "")
+		if err != nil {
+			return nil, fmt.Errorf("output: %w", err)
+		}
+		return []aistudio.Part{part}, nil
+	case output.FileID != "":
+		return []aistudio.Part{{File: &aistudio.FileRef{ID: output.FileID}}}, nil
+	}
+	return nil, nil
 }
 
 func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.Tools, error) {
@@ -916,7 +1027,11 @@ func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.
 				return aistudio.Tools{}, err
 			}
 		case "local_shell", "shell", "apply_patch":
-			if err := addDeclaration(clientToolDeclarations[tool.Type]); err != nil {
+			if err := addDeclaration(shellSkills(clientToolDeclarations[tool.Type], tool.Environment)); err != nil {
+				return aistudio.Tools{}, err
+			}
+		case "computer_use_preview", "computer":
+			if err := addDeclaration(computerToolDeclaration(tool)); err != nil {
 				return aistudio.Tools{}, err
 			}
 		case "namespace":
@@ -928,6 +1043,9 @@ func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.
 					return aistudio.Tools{}, fmt.Errorf("namespace %q tool type %q is not supported", tool.Name, inner.Type)
 				}
 				inner.Name = tool.Name + "." + inner.Name
+				if tool.Description != "" {
+					inner.Description = strings.TrimSpace(tool.Description + "\n\n" + inner.Description)
+				}
 				if err := addTool(inner); err != nil {
 					return aistudio.Tools{}, err
 				}
@@ -936,6 +1054,9 @@ func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.
 			search, err := mapSearchOptions(tool.SearchContextSize, tool.UserLocation, tool.Filters)
 			if err != nil {
 				return aistudio.Tools{}, err
+			}
+			if len(tool.SearchContentTypes) > 0 {
+				search.WebSearch, search.ImageSearch = slices.Contains(tool.SearchContentTypes, "text"), slices.Contains(tool.SearchContentTypes, "image")
 			}
 			mapped.GoogleSearch = search
 			mapped.Google = appendUnique(mapped.Google, "google_search")
@@ -947,7 +1068,19 @@ func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.
 			mapped.Google = appendUnique(mapped.Google, "google_maps")
 		case "image_search":
 			mapped.Google = appendUnique(mapped.Google, "image_search")
-		case "image_generation", "file_search", "mcp", "computer", "computer_use_preview", "tool_search", "programmatic_tool_calling":
+		case "mcp":
+			server, err := responsesMCPServer(tool)
+			if err != nil {
+				return aistudio.Tools{}, err
+			}
+			approval, err := parseMCPApproval(tool.RequireApproval)
+			if err != nil {
+				return aistudio.Tools{}, err
+			}
+			if approval.never {
+				mapped.MCPServers = append(mapped.MCPServers, server)
+			}
+		case "image_generation", "file_search", "tool_search", "programmatic_tool_calling":
 		default:
 			return aistudio.Tools{}, fmt.Errorf("unsupported tool type %q", tool.Type)
 		}
@@ -960,13 +1093,45 @@ func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.
 		mapped = restrictAllowedTools(mapped, allowed)
 	}
 	mapped.ToolConfig = config
+	mapped.ToolConfig.ServerSideInvocations = len(mapped.MCPServers) > 0
 	return mapped, nil
 }
 
-// buildResponsesObject 用与流式相同的输出累积构造非流式响应对象，compaction 不为空时排在输出首位
-func buildResponsesObject(id string, created int64, request responsesRequest, result generationResult, compaction map[string]any) (map[string]any, error) {
+// responsesMCPServer 把 mcp 工具映射为 MCP 服务器连接：authorization 写为 Bearer 授权头，allowed_tools 按工具名与只读要求限定
+func responsesMCPServer(tool responsesTool) (aistudio.MCPServer, error) {
+	if tool.ConnectorID != "" {
+		return aistudio.MCPServer{}, fmt.Errorf("mcp connector_id %q is an OpenAI hosted connector; upstream connects only to a server_url", tool.ConnectorID)
+	}
+	if tool.ServerLabel == "" || tool.ServerURL == "" {
+		return aistudio.MCPServer{}, fmt.Errorf("mcp server_label and server_url are required")
+	}
+	server := aistudio.MCPServer{Name: tool.ServerLabel, URL: tool.ServerURL, Headers: maps.Clone(tool.Headers)}
+	if tool.Authorization != "" {
+		if server.Headers == nil {
+			server.Headers = map[string]string{}
+		}
+		server.Headers["Authorization"] = "Bearer " + tool.Authorization
+	}
+	if rawJSONConfigured(tool.AllowedTools) {
+		var filter struct {
+			ToolNames []string `json:"tool_names"`
+			ReadOnly  *bool    `json:"read_only"`
+		}
+		if json.Unmarshal(tool.AllowedTools, &server.AllowedTools) != nil {
+			if err := json.Unmarshal(tool.AllowedTools, &filter); err != nil {
+				return aistudio.MCPServer{}, fmt.Errorf("mcp allowed_tools: %w", err)
+			}
+			server.AllowedTools = filter.ToolNames
+			server.ReadOnly = filter.ReadOnly != nil && *filter.ReadOnly
+		}
+	}
+	return server, nil
+}
+
+// buildResponsesObject 用与流式相同的输出累积构造非流式响应对象，prefix 排在输出首位
+func buildResponsesObject(id string, created int64, request responsesRequest, result generationResult, prefix []map[string]any) (map[string]any, error) {
 	writer := newResponsesWriter(nil, id, created, request)
-	writer.compaction = compaction
+	writer.prefix = prefix
 	for _, event := range result.events {
 		if err := writer.receive(event); err != nil {
 			return nil, err
@@ -1031,7 +1196,7 @@ func responseShell(id string, created int64, status string, request responsesReq
 }
 
 func rawJSONValue(raw json.RawMessage, defaultValue any) any {
-	if len(raw) == 0 || string(raw) == "null" {
+	if !rawJSONConfigured(raw) {
 		return defaultValue
 	}
 	var value any
@@ -1039,13 +1204,17 @@ func rawJSONValue(raw json.RawMessage, defaultValue any) any {
 	return value
 }
 
+// rawJSONConfigured 判断 JSON 字段是否给出了 null 以外的值
 func rawJSONConfigured(raw json.RawMessage) bool {
-	value := strings.TrimSpace(string(raw))
-	return value != "" && value != "null"
+	value := bytes.TrimSpace(raw)
+	return len(value) > 0 && string(value) != "null"
 }
 
-// responseFunctionCall 按声明的工具类型把函数调用投影为 Responses 输出项
+// responseFunctionCall 按声明的工具类型把函数调用投影为 Responses 输出项，需要批准的 MCP 工具调用投影为 mcp_approval_request 项
 func responseFunctionCall(call aistudio.FunctionCall, tools []responsesTool) map[string]any {
+	if label, name, ok := mcpApprovalTarget(tools, call.Name); ok {
+		return map[string]any{"id": "mcpr_" + call.ID, "type": "mcp_approval_request", "server_label": label, "name": name, "arguments": string(call.Arguments)}
+	}
 	item := map[string]any{"id": "fc_" + call.ID, "status": "completed", "call_id": call.ID}
 	switch responsesToolKind(tools, call.Name) {
 	case "local_shell":
@@ -1056,6 +1225,16 @@ func responseFunctionCall(call aistudio.FunctionCall, tools []responsesTool) map
 		return item
 	case "apply_patch":
 		item["type"], item["operation"] = "apply_patch_call", rawJSONValue(call.Arguments, map[string]any{})
+		return item
+	case "computer_use_preview":
+		item["type"], item["action"], item["pending_safety_checks"] = "computer_call", rawJSONValue(call.Arguments, map[string]any{}), []any{}
+		return item
+	case "computer":
+		var arguments struct {
+			Actions []any `json:"actions"`
+		}
+		_ = json.Unmarshal(call.Arguments, &arguments)
+		item["type"], item["actions"], item["pending_safety_checks"] = "computer_call", arguments.Actions, []any{}
 		return item
 	case "custom":
 		item["type"], item["name"], item["input"] = "custom_tool_call", call.Name, customToolInput(call.Arguments)
@@ -1084,7 +1263,7 @@ func responsesNamespace(tools []responsesTool, name string) string {
 	return ""
 }
 
-func responseImageGenerationItem(responseID string, index int, media aistudio.Media) (map[string]any, error) {
+func responseImageGenerationItem(responseID string, index int, media aistudio.Blob) (map[string]any, error) {
 	if !strings.HasPrefix(media.MIME, "image/") || len(media.Data) == 0 {
 		return nil, fmt.Errorf("Responses API cannot represent media %q without inline image data", media.MIME)
 	}
@@ -1110,7 +1289,7 @@ func responsesUsage(usage *aistudio.Usage) map[string]any {
 	}
 }
 
-// responsesOutput 按事件生成顺序累积 Responses 输出项：思考为 reasoning 项，正文为 message 项，代码执行、搜索、图片与函数调用为各自的调用项；请求 encrypted_content 时函数调用的签名写入其前的 reasoning 项
+// responsesOutput 按事件生成顺序累积 Responses 输出项：思考为 reasoning 项，正文为 message 项，代码执行、搜索、图片与函数调用为各自的调用项
 type responsesOutput struct {
 	id        string
 	request   responsesRequest
@@ -1127,6 +1306,8 @@ type responsesOutput struct {
 	images    int
 	searches  int
 	citations []aistudio.Citation
+	// mcpCalls 是等待结果的上游 MCP 工具调用
+	mcpCalls map[string]aistudio.ServerToolStep
 }
 
 // itemID 返回新输出项的 ID：同类首项为前缀加响应 ID，之后的项再加序号
@@ -1154,6 +1335,9 @@ func (o *responsesOutput) add(event aistudio.Event) ([]map[string]any, error) {
 	}
 	switch event.Kind {
 	case aistudio.EventReasoning:
+		if event.Text == "" {
+			break
+		}
 		if !isLast(o.reasoning) {
 			o.reasoning = map[string]any{"id": o.itemID("rs_"), "type": "reasoning", "status": "completed", "summary": []any{map[string]any{"type": "summary_text", "text": ""}}}
 			o.texts[o.reasoning["id"].(string)] = &strings.Builder{}
@@ -1170,10 +1354,7 @@ func (o *responsesOutput) add(event aistudio.Event) ([]map[string]any, error) {
 		write(o.message, o.message["content"].([]any)[0].(map[string]any), event.Text)
 		o.text += len(event.Text)
 	case aistudio.EventToolCall:
-		if event.ToolCall == nil {
-			break
-		}
-		call := *event.ToolCall
+		call := *event.FunctionCall
 		if len(call.Arguments) == 0 {
 			call.Arguments = json.RawMessage(`{}`)
 		}
@@ -1186,19 +1367,24 @@ func (o *responsesOutput) add(event aistudio.Event) ([]map[string]any, error) {
 		}
 		push(responseFunctionCall(call, o.tools))
 	case aistudio.EventMedia:
-		if event.Media == nil {
+		if event.InlineData == nil {
 			break
 		}
-		item, err := responseImageGenerationItem(o.id, o.images, *event.Media)
+		media := *event.InlineData
+		if tool := imageGenerationTool(o.request.Tools); tool != nil {
+			converted, err := convertImage(media, "image/"+cmp.Or(tool.OutputFormat, "png"))
+			if err != nil {
+				return nil, err
+			}
+			media = converted
+		}
+		item, err := responseImageGenerationItem(o.id, o.images, media)
 		if err != nil {
 			return nil, err
 		}
 		o.images++
 		push(item)
 	case aistudio.EventExecutableCode:
-		if event.ExecutableCode == nil {
-			break
-		}
 		o.code = map[string]any{
 			"id": fmt.Sprintf("ci_%s_%d", o.id, o.codes), "type": "code_interpreter_call",
 			"status": "incomplete", "code": event.ExecutableCode.Code, "container_id": "aistudio", "outputs": nil,
@@ -1206,13 +1392,13 @@ func (o *responsesOutput) add(event aistudio.Event) ([]map[string]any, error) {
 		o.codes++
 		push(o.code)
 	case aistudio.EventCodeExecutionResult:
-		if event.CodeExecutionResult == nil || o.code == nil {
+		if o.code == nil {
 			break
 		}
 		result := event.CodeExecutionResult
 		status, logs := "completed", result.Output
 		if result.Outcome != "OUTCOME_OK" {
-			status, logs = "failed", result.Error
+			status = "failed"
 			if logs != "" {
 				logs = "stderr:\n" + logs
 			}
@@ -1222,20 +1408,39 @@ func (o *responsesOutput) add(event aistudio.Event) ([]map[string]any, error) {
 			o.code["outputs"] = []any{map[string]any{"type": "logs", "logs": logs}}
 		}
 		o.code = nil
-	case aistudio.EventCitation:
-		if event.Citation != nil {
-			o.citations = append(o.citations, *event.Citation)
+	case aistudio.EventServerToolCall:
+		if step := event.ToolCall; step.Type == mcpToolType {
+			o.mcpCalls[step.ID] = *step
 		}
-	case aistudio.EventGrounding:
-		if event.Grounding == nil {
+	case aistudio.EventServerToolResponse:
+		step := event.ToolResponse
+		call, ok := o.mcpCalls[step.ID]
+		if !ok {
 			break
 		}
+		delete(o.mcpCalls, step.ID)
+		server, name := mcpToolName(call.Name)
+		arguments := "{}"
+		if len(call.Data) > 0 {
+			arguments = string(call.Data)
+		}
+		item := map[string]any{
+			"id": o.itemID("mcp_"), "type": "mcp_call", "status": "completed", "server_label": server, "name": name,
+			"arguments": arguments, "output": mcpOutputText(step.Data), "error": nil, "approval_request_id": nil,
+		}
+		if failure := mcpCallError(step.Data); failure != nil {
+			item["status"], item["output"], item["error"] = "failed", nil, failure
+		}
+		push(item)
+	case aistudio.EventCitation:
+		o.citations = append(o.citations, *event.Citation)
+	case aistudio.EventGrounding:
 		o.citations = append(o.citations, groundingCitations(*event.Grounding)...)
 		if !responsesUsesWebSearch(o.request.Tools) {
 			break
 		}
 		var queries []any
-		for _, query := range event.Grounding.WebSearchQueries {
+		for _, query := range slices.Concat(event.Grounding.WebSearchQueries, event.Grounding.ImageSearchQueries) {
 			if _, exists := o.queries[query]; !exists {
 				o.queries[query] = struct{}{}
 				queries = append(queries, query)
@@ -1287,8 +1492,16 @@ type responsesStreamWriter struct {
 	code     map[string]any
 	search   bool
 	held     []aistudio.Event
-	// compaction 为生成前自动压缩得到的 compaction 项，排在输出首位
-	compaction map[string]any
+	// prefix 是生成前得到的 compaction 项与批准后执行的 mcp_call 项，排在输出首位
+	prefix []map[string]any
+}
+
+// outputPrefix 返回排在输出首位的 compaction 项与批准后执行的 mcp_call 项
+func outputPrefix(compaction map[string]any, prepared responsesPreparation) []map[string]any {
+	if compaction == nil {
+		return prepared.approved
+	}
+	return append([]map[string]any{compaction}, prepared.approved...)
 }
 
 // newResponsesWriter 返回 Responses 输出写出器，声明搜索时正文等到搜索结果之后再写出
@@ -1298,7 +1511,7 @@ func newResponsesWriter(w http.ResponseWriter, id string, created int64, request
 		w: w, id: id, created: created, request: request, search: responsesUsesWebSearch(request.Tools),
 		output: &responsesOutput{
 			id: id, request: request, tools: slices.Concat(request.Tools, additional), texts: make(map[string]*strings.Builder),
-			starts: make(map[string]int), queries: make(map[string]struct{}),
+			starts: make(map[string]int), queries: make(map[string]struct{}), mcpCalls: make(map[string]aistudio.ServerToolStep),
 		},
 	}
 }
@@ -1319,12 +1532,18 @@ func (s *server) streamResponses(w http.ResponseWriter, r *http.Request, request
 
 // streamOutput 写出输出项事件与终止事件并保存最终响应，report 决定生成出错时是否写出 response.failed；返回生成或写出的错误
 func (s *server) streamOutput(ctx context.Context, writer *responsesStreamWriter, prepared responsesPreparation, events <-chan aistudio.Event, compaction map[string]any, report func(error) bool) error {
-	if compaction != nil {
-		writer.compaction = compaction
-		if err := writer.emit("response.output_item.added", map[string]any{"output_index": 0, "item": compaction}); err != nil {
+	writer.prefix = outputPrefix(compaction, prepared)
+	for index, item := range writer.prefix {
+		if item["type"] == "mcp_call" {
+			if err := writer.mcpCall(item, index); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": item}); err != nil {
 			return err
 		}
-		if err := writer.emit("response.output_item.done", map[string]any{"output_index": 0, "item": compaction}); err != nil {
+		if err := writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": item}); err != nil {
 			return err
 		}
 	}
@@ -1359,7 +1578,7 @@ func (writer *responsesStreamWriter) emit(eventType string, payload map[string]a
 	if writer.w == nil {
 		return nil
 	}
-	return writeSSE(writer.w, eventType, payload)
+	return writeSSE(writer.w, eventType, officialOrder("responses", payload))
 }
 
 // receive 写出一个事件；声明搜索时从首个正文起暂存事件，带查询的搜索结果或结束事件到达后先写出它再补发暂存的事件
@@ -1368,7 +1587,7 @@ func (writer *responsesStreamWriter) receive(event aistudio.Event) error {
 		return writer.live(event)
 	}
 	switch {
-	case event.Kind == aistudio.EventFinish || event.Kind == aistudio.EventGrounding && event.Grounding != nil && len(event.Grounding.WebSearchQueries) > 0:
+	case event.Kind == aistudio.EventFinish || event.Kind == aistudio.EventGrounding && len(event.Grounding.WebSearchQueries) > 0:
 		if err := writer.live(event); err != nil {
 			return err
 		}
@@ -1394,18 +1613,14 @@ func (writer *responsesStreamWriter) release() error {
 
 // index 返回输出项在响应 output 中的位置
 func (writer *responsesStreamWriter) index(item map[string]any) int {
-	base := 0
-	if writer.compaction != nil {
-		base = 1
-	}
-	return base + slices.IndexFunc(writer.output.items, func(candidate map[string]any) bool { return candidate["id"] == item["id"] })
+	return len(writer.prefix) + slices.IndexFunc(writer.output.items, func(candidate map[string]any) bool { return candidate["id"] == item["id"] })
 }
 
-// items 返回已累积的输出项，compaction 项排在首位
+// items 返回已累积的输出项，prefix 排在首位
 func (writer *responsesStreamWriter) items() []any {
-	output := make([]any, 0, 1+len(writer.output.items))
-	if writer.compaction != nil {
-		output = append(output, writer.compaction)
+	output := make([]any, 0, len(writer.prefix)+len(writer.output.items))
+	for _, item := range writer.prefix {
+		output = append(output, item)
 	}
 	for _, item := range writer.output.items {
 		output = append(output, item)
@@ -1413,7 +1628,7 @@ func (writer *responsesStreamWriter) items() []any {
 	return output
 }
 
-// live 写出一个事件：新输出项开始前先完成仍打开的项，reasoning 与 message 项保持打开到下一个输出项或结束，代码执行项在执行结果到达时完成，其余项立即完成
+// live 写出一个事件，新输出项开始前先完成仍打开的项，reasoning 与 message 项保持打开到下一个输出项或结束
 func (writer *responsesStreamWriter) live(event aistudio.Event) error {
 	added, err := writer.output.add(event)
 	if err != nil {
@@ -1426,6 +1641,9 @@ func (writer *responsesStreamWriter) live(event aistudio.Event) error {
 	}
 	switch event.Kind {
 	case aistudio.EventReasoning:
+		if event.Text == "" {
+			return nil
+		}
 		return writer.emit("response.reasoning_summary_text.delta", map[string]any{
 			"item_id": writer.output.reasoning["id"], "output_index": writer.index(writer.output.reasoning), "summary_index": 0, "delta": event.Text,
 		})
@@ -1511,6 +1729,13 @@ func (writer *responsesStreamWriter) added(item map[string]any) error {
 			}
 		}
 		return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
+	case item["type"] == "mcp_call":
+		return writer.mcpCall(item, index)
+	case item["type"] == "mcp_approval_request":
+		if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": item}); err != nil {
+			return err
+		}
+		return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
 	case item["type"] == "image_generation_call":
 		pending := map[string]any{"id": item["id"], "type": "image_generation_call", "status": "in_progress", "result": nil}
 		if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": pending}); err != nil {
@@ -1525,6 +1750,29 @@ func (writer *responsesStreamWriter) added(item map[string]any) error {
 		return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
 	}
 	return writer.toolCall(item, index)
+}
+
+// mcpCall 写出 mcp_call 项的 added、参数、进行中与结束状态和 done 事件
+func (writer *responsesStreamWriter) mcpCall(item map[string]any, index int) error {
+	pending := maps.Clone(item)
+	pending["status"], pending["arguments"], pending["output"], pending["error"] = "in_progress", "", nil, nil
+	if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": pending}); err != nil {
+		return err
+	}
+	for _, event := range []map[string]any{
+		{"type": "response.mcp_call_arguments.delta", "delta": item["arguments"]},
+		{"type": "response.mcp_call_arguments.done", "arguments": item["arguments"]},
+		{"type": "response.mcp_call.in_progress"},
+		{"type": "response.mcp_call." + item["status"].(string)},
+	} {
+		eventType := event["type"].(string)
+		delete(event, "type")
+		event["item_id"], event["output_index"] = item["id"], index
+		if err := writer.emit(eventType, event); err != nil {
+			return err
+		}
+	}
+	return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
 }
 
 // toolCall 写出函数调用项的 added、参数增量与 done 事件

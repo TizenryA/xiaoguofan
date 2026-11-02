@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
 import { nextTick, ref } from 'vue'
 import { useI18n } from '@/i18n'
 import UiIcon from '@/playground/ui/UiIcon.vue'
@@ -8,13 +7,14 @@ import UiSlider from '@/playground/ui/UiSlider.vue'
 import UiSwitch from '@/playground/ui/UiSwitch.vue'
 import ModelCard from '../ModelCard.vue'
 import RunSettingsFrame from '../RunSettingsFrame.vue'
-import { speechProtocols, useSpeech } from './speech'
+import { defaultAlias, speechProtocols, useSpeech } from './speech'
+import { voiceTraits } from './speech-voices'
 
 defineProps<{ open: boolean; narrow: boolean }>()
 const emit = defineEmits<{ close: []; code: []; voice: [speaker: number] }>()
 const { t } = useI18n()
 const speech = useSpeech()
-const { state, currentModel, daikon, multi, openAIMulti, usedSpeakers } = speech
+const { state, currentModel, daikon, multi, openAIMulti, usedSpeakers, temperature } = speech
 const modelOpen = ref(false)
 // editing 是正在编辑名称的说话人序号
 const editing = ref(-1)
@@ -29,10 +29,7 @@ function setTemperature(event: Event): void {
 // characteristics 与官网一致返回说话人卡片的描述与音高
 function characteristics(voice: string): string {
   const detail = speech.voiceDetail(voice)
-  if (!detail) return ''
-  return [...(detail.descriptions ?? []), detail.pitch ? `${detail.pitch} pitch` : '']
-    .filter(Boolean)
-    .join(', ')
+  return detail ? voiceTraits(detail).join(', ') : ''
 }
 
 // editAlias 开始编辑说话人名称
@@ -41,11 +38,13 @@ function editAlias(index: number): void {
   void nextTick(() => aliasInput.value[0]?.select())
 }
 
-// saveAlias 保存说话人名称，空名称或与另一位重名时恢复默认名称
+// saveAlias 保存说话人名称：名称未改时保持原值，空名称或与另一位重名时恢复默认名称
 function saveAlias(index: number, event: Event): void {
   const value = (event.target as HTMLInputElement).value.trim()
-  const other = state.speakers[index === 0 ? 1 : 0]!.alias
-  state.speakers[index]!.alias = value && value !== other ? value : `Speaker ${index + 1}`
+  const other = index === 0 ? 1 : 0
+  const taken = [state.speakers[other]!.alias, speech.speakerName(other)]
+  if (value !== speech.speakerName(index))
+    state.speakers[index]!.alias = value && !taken.includes(value) ? value : defaultAlias(index)
   editing.value = -1
 }
 </script>
@@ -62,7 +61,7 @@ function saveAlias(index: number, event: Event): void {
       <ModelCard
         :model="currentModel"
         kind="speech"
-        :has-content="state.blocks.length > 0"
+        has-content
         @select="speech.setModel($event.id)"
       />
       <div
@@ -97,7 +96,7 @@ function saveAlias(index: number, event: Event): void {
         <h3 class="item-description-title">{{ t('pg.temperature') }}</h3>
         <div class="ms-slider">
           <UiSlider
-            :model-value="state.settings.temperature ?? currentModel?.temperature ?? 1"
+            :model-value="temperature"
             :min="0"
             :max="currentModel?.max_temperature ?? 2"
             :step="0.05"
@@ -112,7 +111,7 @@ function saveAlias(index: number, event: Event): void {
             :max="currentModel?.max_temperature ?? 2"
             step="0.05"
             :aria-label="t('pg.temperature')"
-            :value="state.settings.temperature ?? currentModel?.temperature ?? 1"
+            :value="temperature"
             @change="setTemperature"
           />
         </div>
@@ -125,7 +124,7 @@ function saveAlias(index: number, event: Event): void {
         <button
           type="button"
           class="active-voice-card-trigger"
-          :aria-label="`${state.speakers[index]!.alias} - ${state.speakers[index]!.voice}`"
+          :aria-label="`${speech.speakerName(index)} - ${state.speakers[index]!.voice}`"
           @click="emit('voice', index)"
         ></button>
         <div class="text-info">
@@ -136,7 +135,7 @@ function saveAlias(index: number, event: Event): void {
               ref="aliasInput"
               ms-input
               class="small speaker-alias-input"
-              :value="state.speakers[index]!.alias"
+              :value="speech.speakerName(index)"
               :aria-label="t('pg.speakerName')"
               @blur="saveAlias(index, $event)"
               @keydown.enter.prevent="($event.target as HTMLInputElement).blur()"
@@ -150,7 +149,7 @@ function saveAlias(index: number, event: Event): void {
               :disabled="!multi"
               @click="editAlias(index)"
             >
-              {{ state.speakers[index]!.alias }}
+              {{ speech.speakerName(index) }}
             </button>
           </div>
           <div class="voice-characteristics">

@@ -1,17 +1,7 @@
 <script setup lang="ts">
 defineProps<{ adminUsername?: string }>()
 const emit = defineEmits<{ logout: [] }>()
-import {
-  computed,
-  defineAsyncComponent,
-  h,
-  onMounted,
-  onUnmounted,
-  reactive,
-  ref,
-  shallowRef,
-  watch,
-} from 'vue'
+import { computed, defineAsyncComponent, h, onMounted, ref, watch } from 'vue'
 import type { AsyncComponentLoader } from 'vue'
 import {
   DropdownMenuContent,
@@ -20,20 +10,9 @@ import {
   DropdownMenuRoot,
   DropdownMenuTrigger,
 } from 'reka-ui'
-import { api, openAdminEvents, type EventConnection } from '@/api'
+import { useConsole } from '@/console'
 import { useI18n, type TranslationKey } from '@/i18n'
-import type {
-  Account,
-  AdminLog,
-  AdminEvent,
-  Model,
-  Cooldown,
-  RequestSummary,
-  ServiceConfig,
-  ServiceStatus,
-  TabID,
-  UpdateStatus,
-} from '@/types'
+import type { TabID } from '@/types'
 import AccountsPanel from '@/components/AccountsPanel.vue'
 import LogsPanel from '@/components/LogsPanel.vue'
 import ModelsTable from '@/components/ModelsTable.vue'
@@ -43,10 +22,10 @@ import ThemeToggle from '@/components/ThemeToggle.vue'
 import UiIcon from '@/components/UiIcon.vue'
 import { readPreference, writePreference } from '@/preference'
 import { useTabParam } from '@/url'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import type { IconName } from '@/icons'
 
-const { availableLocales, locale, setLocale, t, errorText } = useI18n()
+const { availableLocales, locale, setLocale, t, logText } = useI18n()
 // lazyPanel 创建按需加载的页面组件
 function lazyPanel(loader: AsyncComponentLoader) {
   return defineAsyncComponent({
@@ -71,31 +50,33 @@ const validTabs: TabID[] = [
   'requests',
   'usage',
   'settings',
-  'playground',
   'version',
 ]
 const { tab: currentTab, select: selectTab } = useTabParam(validTabs, 'logs')
 const router = useRouter()
+const route = useRoute()
+// currentTab 在从试用页返回时同步目标管理页面
+watch(
+  () => route.fullPath,
+  () => {
+    if (route.name === 'console') {
+      const tab = route.query.tab as TabID
+      currentTab.value = validTabs.includes(tab) ? tab : 'logs'
+    }
+  },
+)
 
 // openTab 切换页面，API 试用进入独立的试用页
 function openTab(tab: TabID): void {
   if (tab === 'playground') void router.push('/prompts/new_chat')
   else selectTab(tab)
 }
-watch(
-  currentTab,
-  (tab) => {
-    if (tab === 'playground') void router.replace('/prompts/new_chat')
-  },
-  { immediate: true },
-)
 const navigationBar = ref<HTMLElement | null>(null)
 
 // revealCurrentTab 把窄屏横向导航的当前项横向滚入视野
 function revealCurrentTab(): void {
-  const bar = navigationBar.value
-  const item = bar?.querySelector<HTMLElement>('[aria-current="page"]')
-  if (!bar || !item) return
+  const bar = navigationBar.value!
+  const item = bar.querySelector('[aria-current="page"]')!
   const barRect = bar.getBoundingClientRect()
   const itemRect = item.getBoundingClientRect()
   if (itemRect.left < barRect.left) bar.scrollLeft -= barRect.left - itemRect.left
@@ -137,13 +118,6 @@ function moveSidebarResize(event: PointerEvent): void {
   )
 }
 
-function stopSidebarResize(event: PointerEvent): void {
-  if (!resizingSidebar.value) return
-  const handle = event.currentTarget as HTMLElement
-  if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId)
-  resizingSidebar.value = false
-}
-
 function resizeSidebarWithKeyboard(event: KeyboardEvent): void {
   if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
   event.preventDefault()
@@ -151,37 +125,35 @@ function resizeSidebarWithKeyboard(event: KeyboardEvent): void {
     sidebarWidth.value + (event.key === 'ArrowRight' ? 16 : -16),
   )
 }
-const status = ref<ServiceStatus | null>(null)
-const logs = shallowRef<AdminLog[]>([])
-const accounts = ref<Account[]>([])
-const models = ref<Model[]>([])
-const cooldowns = ref<Cooldown[]>([])
-const requests = ref<RequestSummary[]>([])
-const config = ref<ServiceConfig | null>(null)
-const update = ref<UpdateStatus | null>(null)
-const startPending = ref(false)
-const stopPending = ref(false)
-const launchCancellationRequested = ref(false)
-const notice = reactive({ message: '', tone: 'success' as 'success' | 'error' })
-const loading = reactive({
-  accounts: true,
-  models: true,
-  requests: true,
-  cooldowns: true,
-  config: true,
-})
-const errors = reactive({ accounts: '', models: '', requests: '', cooldowns: '', config: '' })
-let eventConnection: EventConnection | undefined
-let mounted = false
-let noticeTimer: number | undefined
-const pendingDelete = shallowRef<{ account: Account; timer: number } | null>(null)
-const deletingAccounts = ref(new Set<string>())
-const visibleAccounts = computed(() =>
-  accounts.value.filter(
-    (account) =>
-      account.id !== pendingDelete.value?.account.id && !deletingAccounts.value.has(account.id),
-  ),
-)
+const {
+  status,
+  logs,
+  accounts,
+  visibleAccounts,
+  models,
+  cooldowns,
+  requests,
+  config,
+  update,
+  loading,
+  errors,
+  notice,
+  pendingDelete,
+  serviceState,
+  startPending,
+  stopPending,
+  showNotice,
+  loadAccountData,
+  loadRequestData,
+  updateAccount,
+  deleteAccount,
+  undoDelete,
+  commitDelete,
+  startService,
+  stopService,
+  clearLogs,
+  waitForRestart,
+} = useConsole()
 
 const navigation: { id: TabID; label: TranslationKey; icon: IconName }[] = [
   { id: 'logs', label: 'nav.logs', icon: 'logs' },
@@ -194,13 +166,6 @@ const navigation: { id: TabID; label: TranslationKey; icon: IconName }[] = [
   { id: 'version', label: 'nav.version', icon: 'version' },
 ]
 
-const serviceState = computed(() => {
-  if (status.value === null) return 'unavailable'
-  if (status.value.state === 'RUNNING') return 'running'
-  if (status.value.state === 'LAUNCHING') return 'launching'
-  if (startPending.value && !launchCancellationRequested.value) return 'launching'
-  return 'stopped'
-})
 const statusColor = computed(() => {
   if (serviceState.value === 'running') return 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]'
   if (serviceState.value === 'launching') return 'bg-cyan-400 animate-pulse'
@@ -211,59 +176,8 @@ const statusTextColor = computed(() => {
   if (serviceState.value === 'launching') return 'text-cyan-300'
   return 'text-gray-500'
 })
-
-// messageOf 统一呈现服务端错误内容
-function messageOf(error: unknown): string {
-  return errorText(error)
-}
-
-// showNotice 显示一次短暂操作结果
-function showNotice(message: string, tone: 'success' | 'error'): void {
-  notice.message = message
-  notice.tone = tone
-  if (noticeTimer !== undefined) window.clearTimeout(noticeTimer)
-  noticeTimer = window.setTimeout(() => {
-    notice.message = ''
-  }, 3200)
-}
-
-// deleteAccount 隐藏账户并在撤销时限结束后删除，新的删除会先提交上一项
-function deleteAccount(account: Account): void {
-  void commitDelete()
-  pendingDelete.value = { account, timer: window.setTimeout(() => void commitDelete(), 6000) }
-}
-
-// undoDelete 撤销尚未提交的账户删除
-function undoDelete(): void {
-  if (pendingDelete.value === null) return
-  window.clearTimeout(pendingDelete.value.timer)
-  pendingDelete.value = null
-}
-
-// commitDelete 立即提交等待中的账户删除，页面关闭时使用 keepalive 请求
-async function commitDelete(keepalive = false): Promise<void> {
-  const pending = pendingDelete.value
-  if (pending === null) return
-  window.clearTimeout(pending.timer)
-  pendingDelete.value = null
-  const id = pending.account.id
-  deletingAccounts.value = new Set(deletingAccounts.value).add(id)
-  try {
-    await api.deleteAccount(id, keepalive)
-    await loadAccountData()
-  } catch (error) {
-    showNotice(messageOf(error), 'error')
-  } finally {
-    const deleting = new Set(deletingAccounts.value)
-    deleting.delete(id)
-    deletingAccounts.value = deleting
-  }
-}
-
-// flushDelete 在页面隐藏时提交等待中的删除
-function flushDelete(): void {
-  void commitDelete(true)
-}
+// serviceStateLabel 是生成服务状态在当前语言下的文案
+const serviceStateLabel = computed(() => t(`state.${serviceState.value}`))
 
 // logout 先在当前会话内提交等待中的删除再退出登录
 async function logout(): Promise<void> {
@@ -271,227 +185,7 @@ async function logout(): Promise<void> {
   emit('logout')
 }
 
-async function loadStatus(): Promise<void> {
-  try {
-    status.value = await api.status()
-  } catch {
-    status.value = null
-  }
-}
-
-async function loadAccounts(): Promise<void> {
-  loading.accounts = accounts.value.length === 0
-  errors.accounts = ''
-  try {
-    accounts.value = await api.accounts()
-  } catch (error) {
-    errors.accounts = messageOf(error)
-  } finally {
-    loading.accounts = false
-  }
-}
-
-async function loadAccountData(): Promise<void> {
-  await Promise.all([loadAccounts(), loadModels(), loadStatus()])
-}
-
-async function loadModels(): Promise<void> {
-  loading.models = models.value.length === 0
-  errors.models = ''
-  try {
-    models.value = await api.models()
-  } catch (error) {
-    errors.models = messageOf(error)
-  } finally {
-    loading.models = false
-  }
-}
-
-async function loadCooldowns(): Promise<void> {
-  loading.cooldowns = cooldowns.value.length === 0
-  errors.cooldowns = ''
-  try {
-    cooldowns.value = await api.cooldowns()
-  } catch (error) {
-    errors.cooldowns = messageOf(error)
-  } finally {
-    loading.cooldowns = false
-  }
-}
-
-async function loadRequests(): Promise<void> {
-  loading.requests = requests.value.length === 0
-  errors.requests = ''
-  try {
-    requests.value = await api.requests()
-  } catch (error) {
-    errors.requests = messageOf(error)
-  } finally {
-    loading.requests = false
-  }
-}
-
-async function loadRequestData(): Promise<void> {
-  await Promise.all([loadRequests(), loadCooldowns()])
-}
-
-async function loadConfig(): Promise<void> {
-  loading.config = config.value === null
-  errors.config = ''
-  try {
-    config.value = await api.config()
-  } catch (error) {
-    errors.config = messageOf(error)
-  } finally {
-    loading.config = false
-  }
-}
-
-async function refreshAll(): Promise<void> {
-  await Promise.all([
-    loadStatus(),
-    loadAccounts(),
-    loadModels(),
-    loadCooldowns(),
-    loadRequests(),
-    loadConfig(),
-  ])
-}
-
-async function startService(): Promise<void> {
-  startPending.value = true
-  launchCancellationRequested.value = false
-  try {
-    status.value = await api.startService()
-    if (launchCancellationRequested.value || status.value.state !== 'RUNNING') return
-    showNotice(t('app.start'), 'success')
-    await Promise.all([loadAccounts(), loadModels(), loadCooldowns()])
-  } catch (error) {
-    if (!launchCancellationRequested.value) showNotice(messageOf(error), 'error')
-    await loadStatus()
-  } finally {
-    startPending.value = false
-  }
-}
-
-async function stopService(): Promise<void> {
-  launchCancellationRequested.value = serviceState.value === 'launching'
-  stopPending.value = true
-  try {
-    status.value = await api.stopService()
-    showNotice(t('app.stop'), 'success')
-    await Promise.all([loadAccounts(), loadModels(), loadCooldowns(), loadRequests()])
-  } catch (error) {
-    showNotice(messageOf(error), 'error')
-    await loadStatus()
-  } finally {
-    stopPending.value = false
-  }
-}
-
-let pendingLogs: AdminLog[] = []
-let logFlushTimer: number | undefined
-
-function flushLogs(): void {
-  logFlushTimer = undefined
-  if (pendingLogs.length === 0) return
-  logs.value = logs.value.concat(pendingLogs).slice(-2000)
-  pendingLogs = []
-}
-
-async function clearLogs(): Promise<void> {
-  try {
-    await api.clearLogs()
-    pendingLogs = []
-    if (logFlushTimer !== undefined) {
-      window.clearTimeout(logFlushTimer)
-      logFlushTimer = undefined
-    }
-    logs.value = []
-  } catch (error) {
-    showNotice(messageOf(error), 'error')
-  }
-}
-
-function replaceByID<T extends { id: string }>(items: T[], incoming: T): void {
-  const index = items.findIndex((item) => item.id === incoming.id)
-  if (index === -1) items.unshift(incoming)
-  else items[index] = incoming
-}
-
-// waitForRestart 在线更新后等新进程接管再刷新页面：状态接口返回其他版本或要求重新登录都表示旧进程已退出
-function waitForRestart(previous = status.value?.version): void {
-  eventConnection?.close()
-  window.setTimeout(async () => {
-    const response = await fetch('/api/status', { cache: 'no-store' }).catch(() => undefined)
-    const current: ServiceStatus | undefined = response?.ok
-      ? await response.json().catch(() => undefined)
-      : undefined
-    if (response?.status === 401 || (current !== undefined && current.version !== previous)) {
-      window.location.reload()
-      return
-    }
-    waitForRestart(previous)
-  }, 1000)
-}
-
-function handleAdminEvent(event: AdminEvent): void {
-  if (event.type === 'status') {
-    status.value = event.data
-    return
-  }
-  if (event.type === 'log') {
-    pendingLogs.push(event.data)
-    if (logFlushTimer === undefined) {
-      logFlushTimer = window.setTimeout(flushLogs, 40)
-    }
-    return
-  }
-  if (event.type === 'accounts') {
-    accounts.value = event.data.accounts
-    return
-  }
-  if (event.type === 'models') {
-    models.value = event.data.models
-    return
-  }
-  if (event.type === 'cooldowns') {
-    cooldowns.value = event.data
-    return
-  }
-  replaceByID(requests.value, event.data)
-}
-
-onMounted(async () => {
-  mounted = true
-  window.addEventListener('pagehide', flushDelete)
-  document.title = 'AIStudio2API'
-  revealCurrentTab()
-  await refreshAll()
-  if (!mounted) return
-  api.updateStatus().then(
-    (value) => (update.value = value),
-    () => undefined,
-  )
-  eventConnection = openAdminEvents(handleAdminEvent, () => {
-    pendingLogs = []
-    if (logFlushTimer !== undefined) {
-      window.clearTimeout(logFlushTimer)
-      logFlushTimer = undefined
-    }
-    logs.value = []
-    requests.value = []
-  })
-})
-
-onUnmounted(() => {
-  mounted = false
-  eventConnection?.close()
-  if (logFlushTimer !== undefined) window.clearTimeout(logFlushTimer)
-  if (noticeTimer !== undefined) window.clearTimeout(noticeTimer)
-  window.removeEventListener('pagehide', flushDelete)
-  flushDelete()
-})
+onMounted(revealCurrentTab)
 </script>
 
 <template>
@@ -503,10 +197,7 @@ onUnmounted(() => {
       <div
         class="flex h-14 min-w-0 items-center gap-2.5 border-b border-line px-4 [grid-area:brand]"
       >
-        <span
-          v-tooltip="`${t('app.status')}: ${serviceState.toUpperCase()}`"
-          class="relative shrink-0"
-        >
+        <span v-tooltip="`${t('app.status')}: ${serviceStateLabel}`" class="relative shrink-0">
           <img src="/favicon.svg" alt="" class="h-6 w-6" />
           <span
             class="absolute -right-0.5 -bottom-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-panel"
@@ -592,7 +283,7 @@ onUnmounted(() => {
             v-if="item.id === 'version' && update?.available"
             class="size-2 shrink-0 rounded-full bg-amber-400 md:ml-auto"
             aria-hidden="true"
-            :title="t('version.available').replace('{version}', update.latest ?? '')"
+            :title="t('version.available').replace('{version}', update.latest!)"
           />
         </button>
       </nav>
@@ -605,11 +296,11 @@ onUnmounted(() => {
         <div class="mb-2 hidden text-xs text-gray-500 md:block">{{ t('app.status') }}</div>
         <div class="flex items-center justify-between gap-2 md:mb-4">
           <div class="flex min-w-0 items-center gap-2 md:contents">
-            <span class="font-mono font-bold" :class="statusTextColor">
-              {{ serviceState.toUpperCase() }}
+            <span class="font-mono font-bold uppercase" :class="statusTextColor">
+              {{ serviceStateLabel }}
             </span>
             <span
-              v-tooltip="status?.version || ''"
+              v-tooltip="status?.version"
               class="max-w-[65%] truncate font-mono text-xs text-gray-500"
             >
               {{ status?.version || '—' }}
@@ -669,16 +360,37 @@ onUnmounted(() => {
         :aria-valuenow="sidebarWidth"
         @pointerdown="startSidebarResize"
         @pointermove="moveSidebarResize"
-        @pointerup="stopSidebarResize"
-        @pointercancel="stopSidebarResize"
+        @pointerup="resizingSidebar = false"
+        @pointercancel="resizingSidebar = false"
         @dblclick="sidebarWidth = defaultSidebarWidth"
         @keydown="resizeSidebarWithKeyboard"
       ></div>
     </aside>
 
     <main class="flex min-h-0 min-w-0 flex-1 flex-col bg-canvas">
+      <div
+        v-if="config?.reserved_listen_addr"
+        role="alert"
+        class="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-sm break-words text-amber-200 md:px-8"
+      >
+        {{
+          t('app.listenReserved')
+            .replace('{reserved}', config.reserved_listen_addr)
+            .replace('{active}', config.active_listen_addr)
+        }}
+      </div>
+      <div
+        v-if="config?.invalid.length"
+        role="alert"
+        class="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-sm break-words text-amber-200 md:px-8"
+      >
+        <p>{{ t('app.invalidConfig') }}</p>
+        <p v-for="item in config.invalid" :key="item.key" class="mt-1 font-mono text-xs">
+          {{ item.value ? `${item.key}=${item.value}` : item.key }} · {{ logText(item.reason) }}
+        </p>
+      </div>
       <Transition name="page">
-        <KeepAlive include="SettingsPanel,VersionPanel">
+        <KeepAlive include="AccountsPanel,SettingsPanel,VersionPanel,UsagePanel">
           <LogsPanel v-if="currentTab === 'logs'" :logs="logs" @clear="clearLogs" />
           <AccountsPanel
             v-else-if="currentTab === 'accounts'"
@@ -686,6 +398,7 @@ onUnmounted(() => {
             :loading="loading.accounts"
             :error="errors.accounts"
             @refresh="loadAccountData"
+            @updated="updateAccount"
             @notice="showNotice"
             @delete="deleteAccount"
           />
@@ -713,6 +426,8 @@ onUnmounted(() => {
           <SettingsPanel
             v-else-if="currentTab === 'settings'"
             :config="config"
+            :accounts="accounts"
+            :models="models"
             :loading="loading.config"
             :error="errors.config"
             @saved="config = $event"
@@ -743,7 +458,7 @@ onUnmounted(() => {
               : 'border-green-500/50 text-green-300'
           "
         >
-          {{ notice.message }}
+          {{ logText(notice.message) }}
         </div>
       </Transition>
       <Transition name="notice">

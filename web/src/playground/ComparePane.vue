@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
 import { computed, ref } from 'vue'
 import { useI18n } from '@/i18n'
 import UiDialog from '@/playground/ui/UiDialog.vue'
@@ -11,7 +10,7 @@ import RunSettings from './RunSettings.vue'
 import { providePlayground, useCompare, type Playground } from './session'
 
 const props = defineProps<{ pane: Playground; index: number }>()
-const { t, locale } = useI18n()
+const { t, tokenLabel } = useI18n()
 const { closePane } = useCompare()
 providePlayground(props.pane)
 const { session, currentModel } = props.pane
@@ -22,12 +21,7 @@ const confirmClose = ref(false)
 
 // tokens 是窗格对话的 token 数
 const tokens = computed(() =>
-  session.promptTokens === null
-    ? ''
-    : t('pg.tokens').replace(
-        '{count}',
-        new Intl.NumberFormat(locale.value).format(session.promptTokens),
-      ),
+  session.promptTokens === null ? '' : tokenLabel(session.promptTokens),
 )
 
 // close 确认后关闭窗格
@@ -38,7 +32,7 @@ function close(): void {
 </script>
 
 <template>
-  <div class="chat-view-container side-by-side">
+  <div class="chat-view-container">
     <div class="chat-settings-header-container">
       <ModelCard
         :model="currentModel"
@@ -139,7 +133,8 @@ function close(): void {
   position: fixed;
   z-index: 4;
   inset: 0;
-  background-color: var(--color-overlay-background);
+  backdrop-filter: blur(8px);
+  background-color: var(--color-v3-overlay-background);
 }
 
 .confirm-text {

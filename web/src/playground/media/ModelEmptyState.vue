@@ -6,21 +6,18 @@ import UiIcon from '@/playground/ui/UiIcon.vue'
 export interface Starter {
   title: string
   prompt: string
-  thumb?: string
 }
 
-// Example 是右侧的示例卡片，悬停时播放视频
+// Example 是右侧的示例卡片
 export interface Example {
   title: string
   prompt: string
   preview: string
-  video?: string
-  art?: string
   detection?: { label: string; inset?: string }
 }
 
 defineProps<{
-  kind: 'video' | 'music' | 'chat' | 'images' | 'robotics' | 'live'
+  kind: 'music' | 'chat' | 'images' | 'robotics' | 'live'
   title: string
   description: string
   starters: readonly Starter[]
@@ -46,7 +43,6 @@ const { t } = useI18n()
         <ul v-if="starters.length" class="starters" :aria-label="t('pg.promptsToTry')">
           <li v-for="(item, index) in starters" :key="item.title" :style="{ '--i': index }">
             <button type="button" class="starter" @click="emit('starter', item)">
-              <img v-if="item.thumb" class="starter__thumb" :src="item.thumb" alt="" />
               <span>{{ item.title }}</span>
             </button>
           </li>
@@ -70,37 +66,22 @@ const { t } = useI18n()
           class="tile"
           :style="{ '--i': index }"
         >
-          <span class="tile__halo" aria-hidden="true"></span>
-          <button
-            type="button"
-            class="tile__frame"
-            @click="emit('example', item)"
-            @mouseenter="($event.currentTarget as HTMLElement).querySelector('video')?.play()"
-            @mouseleave="($event.currentTarget as HTMLElement).querySelector('video')?.pause()"
-          >
-            <img :src="item.preview" alt="" />
-            <video
-              v-if="item.video"
-              class="tile__video"
-              :src="item.video"
-              muted
-              loop
-              playsinline
-              preload="none"
-            ></video>
-            <span v-if="item.art" class="tile__art-title">{{ item.art }}</span>
-            <span
-              v-if="item.detection"
-              class="detection"
-              :style="item.detection.inset ? { inset: item.detection.inset } : undefined"
-              aria-hidden="true"
-            >
-              <b>{{ item.detection.label }}</b>
+          <button type="button" class="tile__frame" @click="emit('example', item)">
+            <span class="tile__media">
+              <span class="tile__halo" aria-hidden="true"></span>
+              <span class="tile__window">
+                <img :src="item.preview" alt="" />
+                <span
+                  v-if="item.detection"
+                  class="detection"
+                  :style="item.detection.inset ? { inset: item.detection.inset } : undefined"
+                  aria-hidden="true"
+                >
+                  <b>{{ item.detection.label }}</b>
+                </span>
+              </span>
             </span>
             <span class="tile__label">
-              <svg v-if="item.video" viewBox="0 0 16 16" aria-hidden="true">
-                <path d="M5 3.5l8 4.5-8 4.5z" class="filled" />
-              </svg>
               {{ item.title }}
             </span>
           </button>
@@ -111,12 +92,6 @@ const { t } = useI18n()
 </template>
 
 <style scoped>
-@property --empty-halo-angle {
-  inherits: true;
-  initial-value: 220deg;
-  syntax: '<angle>';
-}
-
 .ms-model-empty-state {
   display: flex;
   flex-direction: column;
@@ -188,21 +163,6 @@ const { t } = useI18n()
   line-height: 21px;
 }
 
-.empty-state svg {
-  flex: none;
-  width: 14px;
-  height: 14px;
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 1.5;
-}
-
-.filled {
-  fill: currentColor;
-}
-
 .empty-state h3,
 .empty-state__description,
 .starters li,
@@ -263,15 +223,6 @@ const { t } = useI18n()
   background: var(--fill);
 }
 
-.starter__thumb {
-  flex: none;
-  width: 24px;
-  height: 18px;
-  border-radius: 5px;
-  box-shadow: 0 0 0 1px var(--line);
-  object-fit: cover;
-}
-
 .empty-state__examples {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -290,7 +241,7 @@ const { t } = useI18n()
 .tile__halo {
   position: absolute;
   inset: 0;
-  animation: empty-halo-sway calc(var(--empty-duration, 10s) * 1.5) ease-in-out infinite alternate;
+  animation: empty-halo-sway calc(var(--empty-duration) * 1.5) ease-in-out infinite alternate;
   transition: opacity 0.3s;
 }
 
@@ -300,7 +251,7 @@ const { t } = useI18n()
   inset: -3px;
   border-radius: 20px;
   background: conic-gradient(
-    from var(--empty-halo-angle),
+    from 220deg,
     #3186ff,
     #3186ff 22%,
     #ff4641 40%,
@@ -314,8 +265,8 @@ const { t } = useI18n()
 }
 
 .tile__halo::before {
-  animation: empty-halo-visit calc(var(--empty-duration, 10s) * 2) ease-in-out infinite;
-  animation-delay: calc(0.5s + var(--i) * var(--empty-duration, 10s) * 2 / var(--count, 1));
+  animation: empty-halo-visit calc(var(--empty-duration) * 2) ease-in-out infinite;
+  animation-delay: calc(0.5s + var(--i) * var(--empty-duration) * 2 / var(--count));
 }
 
 .empty-state__examples[data-count='1'] .tile__halo::before {
@@ -367,27 +318,23 @@ const { t } = useI18n()
 
 @keyframes empty-halo-sway {
   0% {
-    --empty-halo-angle: 204deg;
+    transform: rotate(-4deg);
   }
 
   to {
-    --empty-halo-angle: 238deg;
+    transform: rotate(4deg);
   }
 }
 
 .tile__frame {
   position: relative;
   display: block;
-  isolation: isolate;
   width: 100%;
   height: 100%;
   padding: 0;
-  overflow: hidden;
   border: 0;
   border-radius: 16px;
-  aspect-ratio: 3 / 2;
-  background: var(--fill);
-  box-shadow: 0 0 0 1px var(--line);
+  background: none;
   text-align: left;
   transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
 }
@@ -396,25 +343,30 @@ const { t } = useI18n()
   transform: translateY(-2px);
 }
 
-.tile__frame img,
-.tile__video {
+.tile__media {
+  position: relative;
+  display: block;
+  height: 100%;
+  aspect-ratio: 3 / 2;
+}
+
+.tile__window {
+  position: absolute;
+  inset: 0;
+  isolation: isolate;
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--fill);
+  box-shadow: 0 0 0 1px var(--line);
+}
+
+.tile__window img {
   position: absolute;
   inset: 0;
   display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
-}
-
-.tile__video {
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.25s ease;
-}
-
-.tile:focus-within .tile__video,
-.tile:hover .tile__video {
-  opacity: 1;
 }
 
 .tile__label {
@@ -432,18 +384,15 @@ const { t } = useI18n()
   color: var(--color-v3-text-on-button-reverse);
   font-size: 12px;
   line-height: 1.3;
-}
-
-.tile__label svg {
-  width: 10px;
-  height: 10px;
+  hyphens: auto;
+  overflow-wrap: anywhere;
 }
 
 .empty-state[data-kind='chat'] .tile:first-child {
   grid-column: 1 / -1;
 }
 
-.empty-state[data-kind='chat'] .tile:first-child .tile__frame {
+.empty-state[data-kind='chat'] .tile:first-child .tile__media {
   aspect-ratio: 16 / 9;
 }
 
@@ -459,15 +408,15 @@ const { t } = useI18n()
   grid-row: 1 / -1;
 }
 
-.empty-state[data-kind='images'] .tile:first-child .tile__frame {
+.empty-state[data-kind='images'] .tile:first-child .tile__media {
   aspect-ratio: 3 / 4;
 }
 
-.empty-state[data-kind='images'] .tile:not(:first-child) .tile__frame {
+.empty-state[data-kind='images'] .tile:not(:first-child) .tile__media {
   aspect-ratio: auto;
 }
 
-.empty-state[data-kind='live'] .tile__frame {
+.empty-state[data-kind='live'] .tile__media {
   aspect-ratio: 16 / 11;
 }
 
@@ -475,7 +424,7 @@ const { t } = useI18n()
   object-position: center 47%;
 }
 
-.empty-state[data-kind='robotics'] .tile__frame {
+.empty-state[data-kind='robotics'] .tile__media {
   aspect-ratio: 1280 / 875;
 }
 
@@ -542,22 +491,6 @@ const { t } = useI18n()
   white-space: nowrap;
 }
 
-.empty-state[data-kind='video'] .empty-state__examples {
-  grid-template-columns: 1.4fr 1fr;
-}
-
-.empty-state[data-kind='video'] .tile__frame {
-  aspect-ratio: 4 / 3;
-}
-
-.empty-state[data-kind='video'] .tile:nth-child(2) .tile__frame {
-  aspect-ratio: auto;
-}
-
-.empty-state[data-kind='video'] img {
-  animation: empty-push-in calc(var(--empty-duration, 10s) * 2.5) ease-in-out infinite alternate;
-}
-
 @keyframes empty-detect {
   0% {
     opacity: 0;
@@ -570,31 +503,8 @@ const { t } = useI18n()
   }
 }
 
-@keyframes empty-push-in {
-  0% {
-    transform: scale(1.02);
-  }
-
-  to {
-    transform: scale(1.1) translate(-1.5%, 1%);
-  }
-}
-
-.empty-state[data-kind='music'] .tile__frame {
+.empty-state[data-kind='music'] .tile__media {
   aspect-ratio: 1;
-}
-
-.tile__art-title {
-  position: absolute;
-  top: 16px;
-  left: 16px;
-  max-width: 70%;
-  color: var(--color-v3-text-on-button-reverse);
-  font-size: 20px;
-  font-weight: 500;
-  letter-spacing: -0.5px;
-  line-height: 1.05;
-  text-shadow: 0 1px 6px rgb(0 0 0 / 45%);
 }
 
 @container (max-width: 640px) {
@@ -606,6 +516,34 @@ const { t } = useI18n()
 
   .empty-state h3 {
     font-size: 24px;
+  }
+
+  .empty-state__examples {
+    row-gap: 16px;
+  }
+
+  .empty-state__examples[data-count='3'] .tile:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .empty-state[data-kind='images'] .empty-state__examples {
+    grid-template-rows: none;
+  }
+
+  .empty-state[data-kind='images'] .tile:first-child {
+    grid-row: auto;
+  }
+
+  .empty-state[data-kind='images'] .tile:first-child .tile__media {
+    aspect-ratio: 4 / 3;
+  }
+
+  .empty-state[data-kind='images'] .tile:not(:first-child) .tile__media {
+    aspect-ratio: 1;
+  }
+
+  .tile__media {
+    height: auto;
   }
 }
 
@@ -620,7 +558,6 @@ const { t } = useI18n()
   .empty-state h3,
   .detection,
   .empty-state__docs-link,
-  .empty-state[data-kind='video'] img,
   .empty-state__description,
   .starter,
   .starters li,
@@ -628,8 +565,7 @@ const { t } = useI18n()
   .tile__frame,
   .tile__halo,
   .tile__halo::after,
-  .tile__halo::before,
-  .tile__video {
+  .tile__halo::before {
     animation: none;
     transition: none;
   }

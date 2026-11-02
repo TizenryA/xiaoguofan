@@ -2,17 +2,19 @@ import type { ThinkingLevel } from '@/types'
 import type { Tool } from './catalog'
 import type { Protocol } from './protocols'
 
-// Part 是 Gemini API 的内容片段
+// Part 是 Gemini API 的内容片段；fileName 是附件的文件名，请求中写为 inlineData.displayName；tokenCount 是试用页附件显示的 token 数，不随请求发送
 export interface Part {
   text?: string
   thought?: boolean
   thoughtSignature?: string
-  inlineData?: { mimeType: string; data: string }
+  inlineData?: { mimeType: string; data: string; displayName?: string }
   fileData?: { mimeType?: string; fileUri: string }
   functionCall?: { name: string; args?: Record<string, unknown>; id?: string }
   functionResponse?: { name: string; response: Record<string, unknown>; id?: string }
   executableCode?: { language: string; code: string }
   codeExecutionResult?: { outcome: string; output?: string }
+  fileName?: string
+  tokenCount?: number
 }
 
 // Source 是搜索与地图依据中的一个来源

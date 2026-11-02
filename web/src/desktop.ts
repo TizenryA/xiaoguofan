@@ -1,4 +1,6 @@
-import { watch, type Ref } from 'vue'
+import { shallowReactive, watch, type Ref } from 'vue'
+import type { Router } from 'vue-router'
+import { useTheme } from './theme'
 
 declare global {
   interface Window {
@@ -33,16 +35,45 @@ export function sendDesktop(command: string): void {
 
 // openExternal 把新窗口打开的链接交给系统浏览器，桌面窗口本身只显示管理页面
 function openExternal(event: MouseEvent): void {
-  const link = (event.target as Element | null)?.closest('a[target="_blank"]')
+  const link = (event.target as Element).closest('a[target="_blank"]')
   if (!(link instanceof HTMLAnchorElement)) return
   event.preventDefault()
   sendDesktop(`open:${link.href}`)
 }
 
-// startDesktop 在桌面窗口中加载 Wails 运行时的拖动与缩放处理，外部链接用系统浏览器打开，界面语言同步到托盘菜单
-export function startDesktop(locale: Readonly<Ref<string>>): void {
+// blockDrop 取消页面没有处理的拖放，拖入的链接与文件不会让桌面窗口离开管理页面
+function blockDrop(event: DragEvent): void {
+  if (event.defaultPrevented) return
+  event.preventDefault()
+  if (event.type === 'dragover' && event.dataTransfer) event.dataTransfer.dropEffect = 'none'
+}
+
+// keepers 是关闭窗口时需要保留页面的条件：进行中的生成、保存与未保存的内容
+const keepers = shallowReactive(new Set<() => boolean>())
+
+// keepPage 登记关闭窗口时需要保留页面的条件，返回撤销登记的函数
+export function keepPage(condition: () => boolean): () => void {
+  keepers.add(condition)
+  return () => keepers.delete(condition)
+}
+
+// startDesktop 在桌面窗口中加载 Wails 运行时的拖动与缩放处理，外部链接用系统浏览器打开，页面没有处理的拖放被取消，界面语言与配色同步到托盘菜单，当前路由与是否需要保留页面同步到桌面壳
+export function startDesktop(locale: Readonly<Ref<string>>, router: Router): void {
   if (desktopPlatform === '') return
   void import('@wailsio/runtime')
   document.addEventListener('click', openExternal, true)
+  window.addEventListener('dragover', blockDrop)
+  window.addEventListener('drop', blockDrop)
   watch(locale, (value) => sendDesktop(`locale:${value}`), { immediate: true })
+  watch(useTheme().theme, (value) => sendDesktop(`theme:${value}`), { immediate: true })
+  watch(
+    () => [...keepers].some((keep) => keep()),
+    (busy) => sendDesktop(`busy:${busy ? 1 : 0}`),
+    { immediate: true },
+  )
+  watch(
+    () => router.currentRoute.value.fullPath,
+    (path) => sendDesktop(`route:${path}`),
+    { immediate: true },
+  )
 }

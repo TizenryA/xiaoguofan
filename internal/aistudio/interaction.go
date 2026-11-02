@@ -21,11 +21,19 @@ var interactionThinkingLevels = map[int64]int64{4: 1, 1: 2, 2: 3, 3: 4}
 // interactionCancelTimeout 是取消后台任务的期限，包含等待账户请求槽位的时间
 const interactionCancelTimeout = time.Minute
 
-// interactionVideoMIME 表示 Interaction 视频内容的 MIME 枚举
-var interactionVideoMIME = map[int64]string{1: "video/mp4"}
+// interactionMediaMIME 是 content delta 各媒体字段的 MIME 枚举表，与官网前端相同
+var interactionMediaMIME = map[int]interactionMIME{
+	1: {codes: map[int64]string{1: "image/png", 2: "image/jpeg", 3: "image/webp", 4: "image/heic", 5: "image/heif", 7: "image/gif", 8: "image/bmp", 9: "image/tiff"}, unlisted: "image/jpeg"},
+	2: {codes: map[int64]string{1: "audio/wav", 2: "audio/mp3", 3: "audio/aiff", 4: "audio/aac", 5: "audio/ogg", 6: "audio/flac", 7: "audio/mpeg", 8: "audio/m4a", 9: "audio/l16", 10: "audio/s16le", 11: "audio/opus", 12: "audio/alaw", 13: "audio/mulaw"}, unlisted: "audio/wav"},
+	3: {codes: map[int64]string{1: "application/pdf"}, unlisted: "application/pdf"},
+	4: {codes: map[int64]string{1: "video/mp4", 2: "video/mpeg", 3: "video/mpg", 4: "video/mov", 5: "video/avi", 6: "video/x-flv", 7: "video/webm", 8: "video/wmv", 9: "video/3gpp"}, unlisted: "video/mp4"},
+}
 
-// interactionImageMIME 表示 Interaction 图片内容的 MIME 枚举
-var interactionImageMIME = map[int64]string{1: "image/png"}
+// interactionMIME 是一类媒体的 MIME 枚举与枚举缺省或不在表中时的 MIME
+type interactionMIME struct {
+	codes    map[int64]string
+	unlisted string
+}
 
 // interactionStatusHTTP 把流尾 google.rpc 状态码换算为 HTTP 状态
 var interactionStatusHTTP = map[int64]int{
@@ -71,7 +79,7 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 		}
 	}
 	interaction := make([]any, 54)
-	if system := strings.TrimSpace(request.System); system != "" {
+	if system := strings.TrimSpace(SystemText(request.System)); system != "" {
 		interaction[6] = system
 	}
 	interaction[17] = []any{wireModelName(request.Model), config}
@@ -82,10 +90,7 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 	} else {
 		interaction[53] = []any{[]any{[]any{nil, nil, nil, video}}}
 	}
-	body, err := json.Marshal([]any{int64(1), int64(1), nil, interaction, nil, int64(1)})
-	if err != nil {
-		return nil, nil, fmt.Errorf("编码 CreateInteractionStream: %w", err)
-	}
+	body, _ := json.Marshal([]any{int64(1), int64(1), nil, interaction, nil, int64(1)})
 	return body, binding, nil
 }
 
@@ -137,7 +142,7 @@ func interactionVideoFormat(config *VideoConfig, resolution string) ([]any, int6
 	return format, task, nil
 }
 
-// encodeInteractionSteps 把规范消息编码为用户 step field 1 与模型 step field 2 交替的 input steps，工具 part 改为文本转录，模型消息的附件移到下一个用户 step
+// encodeInteractionSteps 把规范消息编码为用户 step field 1 与模型 step field 2 交替的 input steps
 func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) {
 	type step struct {
 		model bool
@@ -159,10 +164,12 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 		texts := make([]Part, 0, len(content.Parts))
 		for _, part := range content.Parts {
 			switch {
+			case part.VideoMetadata != nil || part.MediaProcessing != "" || part.ToolCall != nil || part.ToolResponse != nil:
+				return nil, nil, false, fmt.Errorf("Interaction 模型的 contents[%d] 不接受视频截取、采样、处理方式与处理步骤", index)
 			case part.Thought:
 				continue
 			case part.ExecutableCode != nil || part.CodeExecutionResult != nil:
-				transcript, err := toolPartTranscript(part)
+				transcript, err := ToolPartTranscript(part)
 				if err != nil {
 					return nil, nil, false, fmt.Errorf("Interaction 模型的 contents[%d]: %w", index, err)
 				}
@@ -307,7 +314,7 @@ func (c *Client) interactionEvents(ctx context.Context, request GenerateRequest,
 				return ctx.Err()
 			}
 		}
-		var output generatedOutputParts
+		var output Output
 		var usage *Event
 		finished := false
 		matchedStopSequence := ""
@@ -325,7 +332,7 @@ func (c *Client) interactionEvents(ctx context.Context, request GenerateRequest,
 					}
 				}
 			default:
-				output.observe(event)
+				output.Add(event)
 			}
 			return send(event)
 		}
@@ -486,7 +493,7 @@ func decodeInteractionEvent(method string, raw json.RawMessage, emit func(Event)
 	return true, emit(Event{Kind: EventFinish, FinishReason: "stop"})
 }
 
-// decodeInteractionDelta 解码 content delta：field 1 文本、field 2 图片、field 5 视频、field 6 思考摘要、field 7 思考签名、field 10 引用
+// decodeInteractionDelta 解码 content delta：field 1 文本、field 2 图片、field 3 音频、field 4 文档、field 5 视频、field 6 思考摘要、field 7 思考签名、field 10 引用
 func decodeInteractionDelta(method string, raw json.RawMessage, emit func(Event) error) error {
 	delta, err := rawArray(raw, "$delta", raw)
 	if err != nil || len(delta) < 2 {
@@ -513,22 +520,18 @@ func decodeInteractionDelta(method string, raw json.RawMessage, emit func(Event)
 			if err := emit(Event{Kind: EventText, Text: decoded}); err != nil {
 				return err
 			}
-		case 1, 4:
-			mimes := interactionImageMIME
-			if index == 4 {
-				mimes = interactionVideoMIME
-			}
-			media, err := decodeInteractionMedia(method, value, index, mimes, raw)
+		case 1, 2, 3, 4:
+			media, err := decodeInteractionMedia(method, value, index, raw)
 			if err != nil {
 				return err
 			}
-			if err := emit(Event{Kind: EventMedia, Media: media}); err != nil {
+			if err := emit(Event{Kind: EventMedia, InlineData: media}); err != nil {
 				return err
 			}
 		case 5:
 			text := strings.Join(interactionStrings(value), "")
 			if text != "" {
-				if err := emit(Event{Kind: EventReasoning, Text: text}); err != nil {
+				if err := emit(Event{Kind: EventReasoning, Text: text, Thought: true}); err != nil {
 					return err
 				}
 			}
@@ -599,27 +602,20 @@ func EncodeCreateInteractionRequest(request GenerateRequest) ([]byte, []Content,
 		return nil, nil, err
 	}
 	interaction := make([]any, 27)
-	if system := strings.TrimSpace(request.System); system != "" {
+	if system := strings.TrimSpace(SystemText(request.System)); system != "" {
 		interaction[6] = system
 	}
 	interaction[7] = interactionTaskTools
 	// field 19 为 agent 名称与官网固定的 agent 配置
 	interaction[18] = []any{strings.TrimPrefix(strings.TrimSpace(request.Model), "models/"), nil, []any{int64(1), int64(2)}}
 	interaction[26] = []any{steps}
-	body, err := json.Marshal([]any{nil, int64(1), int64(1), interaction, nil, int64(1)})
-	if err != nil {
-		return nil, nil, fmt.Errorf("编码 CreateInteraction: %w", err)
-	}
+	body, _ := json.Marshal([]any{nil, int64(1), int64(1), interaction, nil, int64(1)})
 	return body, binding, nil
 }
 
 // EncodeGetInteractionStreamRequest 编码按 interaction ID 读取后台任务增量与终态的请求
 func EncodeGetInteractionStreamRequest(id string, model string) ([]byte, error) {
-	body, err := json.Marshal([]any{id, int64(1), nil, nil, nil, int64(1), wireModelName(model)})
-	if err != nil {
-		return nil, fmt.Errorf("编码 GetInteractionStream: %w", err)
-	}
-	return body, nil
+	return json.Marshal([]any{id, int64(1), nil, nil, nil, int64(1), wireModelName(model)})
 }
 
 // decodeCreateInteractionResponse 读取 CreateInteraction 返回的 interaction ID
@@ -746,20 +742,23 @@ func decodeInteractionCitations(method string, value json.RawMessage, raw json.R
 	return nil
 }
 
-// decodeInteractionMedia 解码图片或视频 content：MIME 枚举与 Base64 数据
-func decodeInteractionMedia(method string, value json.RawMessage, index int, mimes map[int64]string, raw json.RawMessage) (*Media, error) {
+// decodeInteractionMedia 解码媒体 content：MIME 枚举与 Base64 数据，枚举缺省或不在表中时按官网取该类媒体的默认 MIME
+func decodeInteractionMedia(method string, value json.RawMessage, index int, raw json.RawMessage) (*Blob, error) {
 	path := fmt.Sprintf("$delta[1][%d]", index)
 	media, err := rawArray(value, path, raw)
 	if err != nil || len(media) < 2 {
 		return nil, &ProtocolEvidenceError{Method: method, Path: path, Detail: "媒体 delta 无效", Raw: cloneRaw(raw)}
 	}
-	code, err := rawInt64(media[0], path+"[0]", raw)
-	if err != nil {
-		return nil, withMethod(err, method)
+	var code int64
+	if !isJSONNull(media[0]) {
+		if code, err = rawInt64(media[0], path+"[0]", raw); err != nil {
+			return nil, withMethod(err, method)
+		}
 	}
-	mimeType, ok := mimes[code]
+	kind := interactionMediaMIME[index]
+	mimeType, ok := kind.codes[code]
 	if !ok {
-		return nil, &ProtocolEvidenceError{Method: method, Path: path + "[0]", Detail: fmt.Sprintf("未识别的媒体 MIME 枚举 %d", code), Raw: cloneRaw(raw)}
+		mimeType = kind.unlisted
 	}
 	encoded, err := rawString(media[1], path+"[1]", raw)
 	if err != nil {
@@ -769,5 +768,5 @@ func decodeInteractionMedia(method string, value json.RawMessage, index int, mim
 	if err != nil {
 		return nil, &ProtocolEvidenceError{Method: method, Path: path + "[1]", Detail: "媒体数据不是 Base64", Raw: cloneRaw(raw)}
 	}
-	return &Media{MIME: mimeType, Data: data}, nil
+	return &Blob{MIME: mimeType, Data: data}, nil
 }

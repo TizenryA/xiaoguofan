@@ -1,49 +1,53 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
-import { onUnmounted, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from '@/i18n'
 import UiIcon from '@/playground/ui/UiIcon.vue'
 import MediaViewDialog from './MediaViewDialog.vue'
+import { failureText } from '../request'
 import { downloadMedia } from './api'
 
-const props = defineProps<{ path: string; aspectRatio: string }>()
-const { t } = useI18n()
+// path 是服务端视频结果的下载路径，src 是已有的视频地址，aspectRatio 是视频加载前占位框的宽高比
+const props = defineProps<{ path?: string; src?: string; aspectRatio?: string }>()
+const { t, logText } = useI18n()
 const element = ref<HTMLVideoElement>()
-const source = ref('')
+const downloaded = ref('')
 const error = ref('')
 const playing = ref(false)
 const largeView = ref(false)
+// portrait 为视频是否竖屏，加载后按视频实际宽高确定
+const portrait = ref(props.aspectRatio === '9:16')
+// source 是播放的视频地址
+const source = computed(() => props.src ?? downloaded.value)
 
 watch(
   () => props.path,
   async (path) => {
-    if (source.value) URL.revokeObjectURL(source.value)
-    source.value = ''
+    if (downloaded.value) URL.revokeObjectURL(downloaded.value)
+    downloaded.value = ''
     error.value = ''
-    if (path === '') return
+    if (!path) return
     try {
-      source.value = URL.createObjectURL(await downloadMedia(path))
+      downloaded.value = URL.createObjectURL(await downloadMedia(path))
     } catch (reason) {
-      error.value = reason instanceof Error ? reason.message : String(reason)
+      error.value = failureText(reason, t('pg.videoDownloadUnreachable'))
     }
   },
   { immediate: true },
 )
 onUnmounted(() => {
-  if (source.value) URL.revokeObjectURL(source.value)
+  if (downloaded.value) URL.revokeObjectURL(downloaded.value)
 })
 
 // toggle 播放或暂停
 function toggle(): void {
-  const video = element.value
-  if (video === undefined) return
+  const video = element.value!
   if (video.paused) void video.play()
   else video.pause()
 }
 
 // openLargeView 暂停预览并在对话框中打开大图查看
 function openLargeView(): void {
-  element.value?.pause()
+  element.value!.pause()
   largeView.value = true
 }
 
@@ -51,17 +55,14 @@ function openLargeView(): void {
 function save(): void {
   const link = document.createElement('a')
   link.href = source.value
-  link.download = `video-${props.path.split('/').at(-2) ?? 'veo'}.mp4`
+  link.download = props.path ? `video-${props.path.split('/').at(-2)}.mp4` : 'video.mp4'
   link.click()
 }
 </script>
 
 <template>
-  <div
-    class="gallery-video"
-    :class="aspectRatio === '9:16' ? 'nine-by-sixteen' : 'sixteen-by-nine'"
-  >
-    <p v-if="error" class="video-error">{{ error }}</p>
+  <div class="gallery-video" :class="portrait ? 'nine-by-sixteen' : 'sixteen-by-nine'">
+    <p v-if="error" class="video-error">{{ logText(error) }}</p>
     <div v-else class="video-container" :class="{ pending: !source }">
       <div v-if="!source" class="video-placeholder"></div>
       <template v-else>
@@ -71,6 +72,7 @@ function save(): void {
           :src="source"
           loop
           playsinline
+          @loadedmetadata="portrait = element!.videoHeight > element!.videoWidth"
           @play="playing = true"
           @pause="playing = false"
           @click="toggle"
@@ -174,16 +176,6 @@ function save(): void {
     var(--color-loading-background) 60%
   );
   background-size: 800px;
-}
-
-@keyframes moving-gradient {
-  0% {
-    background-position: -400px 0;
-  }
-
-  to {
-    background-position: 400px 0;
-  }
 }
 
 .bottom-controls-container {

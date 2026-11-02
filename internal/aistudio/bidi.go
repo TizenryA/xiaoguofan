@@ -196,7 +196,7 @@ type BidiTranscription struct {
 type BidiEvent struct {
 	Kind          BidiEventKind      `json:"kind"`
 	Text          string             `json:"text,omitempty"`
-	Media         *Media             `json:"media,omitempty"`
+	Media         *Blob              `json:"media,omitempty"`
 	Transcription *BidiTranscription `json:"transcription,omitempty"`
 	ToolCall      *FunctionCall      `json:"tool_call,omitempty"`
 	ToolCallIDs   []string           `json:"tool_call_ids,omitempty"`
@@ -371,10 +371,7 @@ func EncodeBidiTextRequest(text string) ([]byte, string, error) {
 	}
 	wire := make([]any, 6)
 	wire[2] = []any{nil, nil, nil, nil, text}
-	body, err := json.Marshal(wire)
-	if err != nil {
-		return nil, "", fmt.Errorf("编码 bidi text: %w", err)
-	}
+	body, _ := json.Marshal(wire)
 	return body, "", nil
 }
 
@@ -395,10 +392,7 @@ func EncodeBidiMediaRequest(mimeType string, data []byte) ([]byte, string, error
 	}
 	wire := make([]any, 6)
 	wire[2] = realtimeInput
-	body, err := json.Marshal(wire)
-	if err != nil {
-		return nil, "", fmt.Errorf("编码 bidi media: %w", err)
-	}
+	body, _ := json.Marshal(wire)
 	return body, "", nil
 }
 
@@ -406,10 +400,7 @@ func EncodeBidiMediaRequest(mimeType string, data []byte) ([]byte, string, error
 func EncodeBidiMediaEndRequest() ([]byte, string, error) {
 	wire := make([]any, 6)
 	wire[2] = []any{nil, nil, int64(1)}
-	body, err := json.Marshal(wire)
-	if err != nil {
-		return nil, "", fmt.Errorf("编码 bidi media end: %w", err)
-	}
+	body, _ := json.Marshal(wire)
 	return body, "", nil
 }
 
@@ -772,9 +763,9 @@ func parseBidiContent(raw json.RawMessage, evidence json.RawMessage) ([]BidiEven
 			case EventText:
 				events = append(events, BidiEvent{Kind: BidiEventText, Text: event.Text})
 			case EventMedia:
-				events = append(events, BidiEvent{Kind: BidiEventMedia, Media: event.Media})
+				events = append(events, BidiEvent{Kind: BidiEventMedia, Media: event.InlineData})
 			case EventToolCall:
-				events = append(events, BidiEvent{Kind: BidiEventToolCall, ToolCall: event.ToolCall})
+				events = append(events, BidiEvent{Kind: BidiEventToolCall, ToolCall: event.FunctionCall})
 			default:
 				encoded, marshalErr := json.Marshal(event)
 				if marshalErr != nil {

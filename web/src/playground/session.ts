@@ -12,12 +12,20 @@ import {
 } from 'vue'
 import { api, ApiError } from '@/api'
 import { useConsole } from '@/console'
+import { keepPage } from '@/desktop'
 import { useI18n } from '@/i18n'
-import type { Model, SavedPrompt } from '@/types'
-import { defaultChatModel, hasCode, toolCodes, toolCompatible, type Tool } from './catalog'
+import type { Model, SavedPrompt, SystemInstructionPreset } from '@/types'
+import {
+  Capability,
+  defaultChatModel,
+  hasCode,
+  toolCodes,
+  toolCompatible,
+  type Tool,
+} from './catalog'
 import { readImage } from './media/api'
 import { generate, protocolsFor } from './protocols'
-import { apiKey, appendParts, buildRequest, countTokens, StreamError } from './request'
+import { apiKey, apiPart, appendParts, buildRequest, countTokens, failureText } from './request'
 import type {
   CompareData,
   PaneData,
@@ -28,6 +36,7 @@ import type {
   SafetyThreshold,
   Turn,
 } from './types'
+import { requestTitle } from './title'
 import type { ZeroStarter } from './zero-configs'
 
 // safetyCategories 是官网安全设置对话框的类别顺序
@@ -47,9 +56,6 @@ export const safetyThresholds: SafetyThreshold[] = [
   'BLOCK_LOW_AND_ABOVE',
 ]
 
-// lastModelKey 是记住上次所选模型的本机存储键
-const lastModelKey = 'playground_model'
-
 // outputLimit 返回模型输出长度上限，自动续写模型为输入上限
 export function outputLimit(model: Model | undefined): number | undefined {
   return model?.capabilities?.output_continuation
@@ -57,13 +63,13 @@ export function outputLimit(model: Model | undefined): number | undefined {
     : model?.output_token_limit
 }
 
-// modelDefaults 返回随模型变化的运行设置默认值
+// modelDefaults 返回随模型变化的运行设置默认值，官网面板隐藏的采样参数默认不发送
 function modelDefaults(model: Model | undefined): Partial<RunSettings> {
   return {
     model: model?.id ?? '',
-    temperature: model?.temperature ?? null,
-    topP: model?.top_p ?? null,
-    topK: model?.top_k ?? null,
+    temperature: hasCode(model, Capability.Temperature) ? (model?.temperature ?? null) : null,
+    topP: hasCode(model, Capability.TopP) ? (model?.top_p ?? null) : null,
+    topK: hasCode(model, Capability.TopK) ? (model?.top_k ?? null) : null,
     maxOutputTokens: model?.output_token_limit ?? null,
     thinkingLevel: model?.default_thinking_level ?? null,
     thinkingBudget: -1,
@@ -117,7 +123,7 @@ export function defaultSettings(model: Model | undefined): RunSettings {
   }
 }
 
-// newTurnID 生成 32 位十六进制的轮次与对话 ID，非 HTTPS 的远程地址中同样可用
+// newTurnID 生成 32 位十六进制的轮次与对话 ID
 export function newTurnID(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
     byte.toString(16).padStart(2, '0'),
@@ -127,7 +133,7 @@ export function newTurnID(): string {
 }
 
 // SaveState 是对话保存状态
-export type SaveState = 'idle' | 'saving' | 'saved' | 'error'
+type SaveState = 'idle' | 'saving' | 'saved' | 'error'
 
 // cloneData 以 JSON 往返复制对话数据，嵌套的响应式对象一并复制为普通对象
 function cloneData<T>(value: T): T {
@@ -137,17 +143,6 @@ function cloneData<T>(value: T): T {
 // models 返回实时模型目录
 function models(): Model[] {
   return useConsole().models.value
-}
-
-// startingModel 返回新对话的模型：上次所选且仍在目录中，否则为默认对话模型
-function startingModel(): Model | undefined {
-  let remembered = ''
-  try {
-    remembered = localStorage.getItem(lastModelKey) ?? ''
-  } catch {
-    remembered = ''
-  }
-  return models().find((model) => model.id === remembered) ?? defaultChatModel(models())
 }
 
 // SessionLinks 是对话实例与页面其他窗格的关联：compare 返回随对话一起保存的右侧窗格，save 是右侧窗格变化时保存页面对话的函数
@@ -161,6 +156,7 @@ function createSession(temporary = false, links: SessionLinks = {}) {
   const session = reactive({
     id: null as string | null,
     title: '',
+    description: '',
     settings: defaultSettings(undefined),
     turns: [] as Turn[],
     draft: '',
@@ -176,7 +172,9 @@ function createSession(temporary = false, links: SessionLinks = {}) {
   })
 
   let controller: AbortController | undefined
-  let saveTimer = 0
+  const saveTimer = ref(0)
+  // opened 是 open 装入的运行设置，换入它引起的设置变化不触发保存
+  let opened: RunSettings | undefined
   let tokenController: AbortController | undefined
   const scope = effectScope(true)
 
@@ -191,7 +189,8 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     Object.assign(session, {
       id: null,
       title: '',
-      settings: { ...defaultSettings(startingModel()), systemInstruction },
+      description: '',
+      settings: { ...defaultSettings(defaultChatModel(models())), systemInstruction },
       turns: [],
       draft: '',
       attachments: [],
@@ -206,7 +205,7 @@ function createSession(temporary = false, links: SessionLinks = {}) {
   // ensureModel 在目录到达后为没有模型的对话补上默认模型
   function ensureModel(): void {
     if (session.settings.model === '' && models().length > 0) {
-      const model = startingModel()
+      const model = defaultChatModel(models())
       session.settings = {
         ...defaultSettings(model),
         systemInstruction: session.settings.systemInstruction,
@@ -214,8 +213,8 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     }
   }
 
-  // selectModel 切换模型：参数换为新模型默认值，去掉新模型不支持的工具；remember 为真时记为下次新对话的模型
-  function selectModel(id: string, remember = true): void {
+  // selectModel 切换模型：参数换为新模型默认值，去掉新模型不支持的工具
+  function selectModel(id: string): void {
     const model = models().find((item) => item.id === id)
     Object.assign(session.settings, modelDefaults(model))
     session.settings.tools = session.settings.tools.filter((tool) =>
@@ -223,15 +222,9 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     )
     if (!protocolsFor(model).some((item) => item.value === session.settings.protocol))
       session.settings.protocol = 'gemini'
-    if (!remember) return
-    try {
-      localStorage.setItem(lastModelKey, id)
-    } catch {
-      // 本机存储不可用时只影响下次默认模型
-    }
   }
 
-  // open 读取对话库中的对话并返回其内容，loaded 为已读取的内容，读取失败时返回 undefined
+  // open 读取对话库中的对话并返回其内容，loaded 为已读取的内容，读取失败时换成空白对话并记录原因，返回 undefined
   async function open(
     id: string,
     loaded?: SavedPrompt<PromptData>,
@@ -245,6 +238,7 @@ function createSession(temporary = false, links: SessionLinks = {}) {
       Object.assign(session, {
         id,
         title: prompt.title,
+        description: prompt.description,
         settings: { ...defaultSettings(undefined), ...prompt.data.settings },
         turns: prompt.data.turns,
         draft: '',
@@ -254,11 +248,13 @@ function createSession(temporary = false, links: SessionLinks = {}) {
         promptTokens: null,
         saveState: 'saved',
       })
+      opened = session.settings
       void refreshTokens()
       return prompt
     } catch (error) {
+      newChat()
       session.loadError =
-        error instanceof ApiError && error.status === 404 ? 'not_found' : String(error)
+        error instanceof ApiError && error.status === 404 ? 'not_found' : useI18n().errorText(error)
       return undefined
     } finally {
       session.loading = false
@@ -279,17 +275,22 @@ function createSession(temporary = false, links: SessionLinks = {}) {
   // save 把调用时的对话连同对比模式的右侧窗格写入对话库，右侧窗格保存所在的页面对话，其他临时对话不保存；保存状态只回写到仍在显示的同一对话
   async function save(): Promise<void> {
     if (links.save) return links.save()
-    if (session.temporary || session.turns.length === 0) return
+    if (
+      session.temporary ||
+      (session.id === null &&
+        session.turns.length === 0 &&
+        session.settings.systemInstruction.trim() === '')
+    )
+      return
     const compare = links.compare?.()
     session.id ??= newTurnID()
-    if (session.title === '') session.title = promptTitle()
     const id = session.id
     session.saveState = 'saving'
     try {
       await api.savePrompt<PromptData>(id, {
         title: session.title,
         model: session.settings.model,
-        description: promptTitle(),
+        description: session.description,
         data: { settings: session.settings, turns: session.turns, ...(compare && { compare }) },
       })
       if (session.id === id) session.saveState = 'saved'
@@ -300,22 +301,23 @@ function createSession(temporary = false, links: SessionLinks = {}) {
 
   // scheduleSave 在对话变化后合并保存，生成中到时的保存由生成结束时的保存代替
   function scheduleSave(): void {
-    window.clearTimeout(saveTimer)
-    saveTimer = window.setTimeout(() => {
-      saveTimer = 0
+    if (session.saveState === 'saved') session.saveState = 'idle'
+    window.clearTimeout(saveTimer.value)
+    saveTimer.value = window.setTimeout(() => {
+      saveTimer.value = 0
       if (!session.running) void save()
     }, 600)
   }
 
   // pending 表示对话有尚未到时的合并保存或正在生成
   function pending(): boolean {
-    return saveTimer !== 0 || session.running
+    return saveTimer.value !== 0 || session.running
   }
 
   // discard 撤销尚未到时的合并保存并中止生成
   function discard(): void {
-    window.clearTimeout(saveTimer)
-    saveTimer = 0
+    window.clearTimeout(saveTimer.value)
+    saveTimer.value = 0
     controller?.abort()
   }
 
@@ -342,6 +344,22 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     }
   }
 
+  // countAttachment 与官网一致：附件加入时单独统计它的 token 数，写入片段的 tokenCount
+  async function countAttachment(part: Part): Promise<void> {
+    const model = currentModel.value
+    if (model === undefined) return
+    try {
+      part.tokenCount = await countTokens(
+        model.id,
+        apiKey(),
+        { contents: [{ role: 'user', parts: [apiPart(part)] }], generationConfig: {} },
+        new AbortController().signal,
+      )
+    } catch {
+      // 统计失败时附件不显示 token 数
+    }
+  }
+
   // append 把输入框内容作为用户轮次加入对话但不运行并安排保存，输入为空时返回 false
   function append(): boolean {
     const text = session.draft.trim()
@@ -357,7 +375,6 @@ function createSession(temporary = false, links: SessionLinks = {}) {
 
   // submit 发送输入框内容；输入为空且最后一轮为用户轮次时直接运行
   async function submit(): Promise<void> {
-    if (session.running) return
     if (!append() && session.turns.at(-1)?.role !== 'user') return
     await run()
   }
@@ -369,7 +386,9 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     const request = buildRequest(session.settings, model, session.turns)
     void refreshTokens()
     const turn = reactive<Turn>({ id: newTurnID(), role: 'model', parts: [], created: Date.now() })
-    session.turns.push(turn)
+    // owner 是本次生成所属对话的轮次，打开其他对话或开始新对话时被整体替换
+    const owner = session.turns
+    owner.push(turn)
     session.running = true
     session.started = performance.now()
     controller = new AbortController()
@@ -415,8 +434,7 @@ function createSession(temporary = false, links: SessionLinks = {}) {
       })
     } catch (error) {
       if (!signal.aborted) {
-        turn.error =
-          error instanceof StreamError || error instanceof Error ? error.message : String(error)
+        turn.error = failureText(error, useI18n().t('pg.chatUnreachable'))
         useConsole().showNotice(useI18n().t('pg.generateFailed'), 'error')
       }
     } finally {
@@ -433,8 +451,29 @@ function createSession(temporary = false, links: SessionLinks = {}) {
         turn.finishReason === undefined
       )
         session.turns.splice(index, 1)
-      scheduleSave()
+      if (!links.save && session.title === '' && session.turns.includes(turn))
+        void generateTitle(model.id)
+      if (session.turns === owner) scheduleSave()
     }
+  }
+
+  // generateTitle 与官网一样在对话未命名时以最后一轮用户文本与模型回答生成标题，失败时保持未命名
+  async function generateTitle(model: string): Promise<void> {
+    const turns = session.turns
+    const text = (role: Turn['role']) =>
+      turns
+        .filter((turn) => turn.role === role)
+        .at(-1)
+        ?.parts.filter((part) => part.text && !part.thought)
+        .map((part) => part.text)
+        .join('') ?? ''
+    const title = await requestTitle(model, text('user'), text('model'), () => ({
+      owner: session.turns,
+      title: session.title,
+    }))
+    if (title === '') return
+    session.title = title
+    scheduleSave()
   }
 
   // stop 中止当前生成
@@ -445,15 +484,12 @@ function createSession(temporary = false, links: SessionLinks = {}) {
   // rerun 从某一轮重新生成：模型轮次替换自身，用户轮次替换其后的回复
   function rerun(index: number): void {
     if (session.running) return
-    const turn = session.turns[index]
-    if (turn === undefined) return
-    session.turns.splice(turn.role === 'model' ? index : index + 1)
+    session.turns.splice(session.turns[index]!.role === 'model' ? index : index + 1)
     void run()
   }
 
   // respond 以用户填写的函数响应继续生成：响应为 JSON 对象时原样发送，否则作为 result 字段发送
   function respond(call: NonNullable<Part['functionCall']>, text: string): void {
-    if (session.running) return
     let response: Record<string, unknown>
     try {
       const value: unknown = JSON.parse(text)
@@ -477,8 +513,7 @@ function createSession(temporary = false, links: SessionLinks = {}) {
 
   // editTurn 用新文本替换某一轮的文本片段
   function editTurn(index: number, text: string): void {
-    const turn = session.turns[index]
-    if (turn === undefined) return
+    const turn = session.turns[index]!
     const others = turn.parts.filter((part) => part.text === undefined || part.thought)
     turn.parts = text === '' ? others : [...others, { text }]
     scheduleSave()
@@ -501,7 +536,7 @@ function createSession(temporary = false, links: SessionLinks = {}) {
         .t(titleKey)
         .replace('{title}', session.title || promptTitle()),
       model: session.settings.model,
-      description: promptTitle(),
+      description: session.description,
       data: cloneData({ settings: session.settings, turns: session.turns.slice(0, index + 1) }),
     })
     return id
@@ -532,13 +567,15 @@ function createSession(temporary = false, links: SessionLinks = {}) {
         session.attachments.push({ inlineData: await readImage(await response.blob()) })
       }
     } catch (error) {
-      useConsole().showNotice(String(error), 'error')
+      const failed = useI18n().t('pg.sampleImageFailed')
+      useConsole().showNotice(failureText(error, failed, failed), 'error')
     }
   }
 
-  // rename 修改对话标题
-  function rename(title: string): void {
+  // rename 修改对话标题与描述
+  function rename(title: string, description: string): void {
     session.title = title.trim()
+    session.description = description.trim()
     scheduleSave()
   }
 
@@ -552,8 +589,9 @@ function createSession(temporary = false, links: SessionLinks = {}) {
   scope.run(() => {
     watch(
       () => [session.settings, session.temporary] as const,
-      () => {
-        if (session.id !== null && !session.running) scheduleSave()
+      ([settings], [previous]) => {
+        if (settings !== previous && settings === opened) return
+        if ((session.id !== null || session.turns.length > 0) && !session.running) scheduleSave()
       },
       { deep: true },
     )
@@ -585,6 +623,7 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     save,
     pending,
     refreshTokens,
+    countAttachment,
     dispose,
   }
 }
@@ -665,6 +704,18 @@ const panes = shallowReactive<Playground[]>([primary])
 // comparing 表示处于对比模式
 const comparing = computed(() => panes.length > 1)
 
+// 关闭桌面窗口时，生成、待写入、写入中或写入失败的对话与未发送的输入保留页面
+keepPage(() =>
+  panes.some(
+    ({ session, pending }) =>
+      pending() ||
+      session.saveState === 'saving' ||
+      session.saveState === 'error' ||
+      session.draft.trim() !== '' ||
+      session.attachments.length > 0,
+  ),
+)
+
 // syncInstructions 与官网一致表示对比模式两侧的系统指令同步，进入对比模式时开启
 const syncInstructions = ref(false)
 
@@ -683,8 +734,8 @@ watch(
 // setSync 与官网一致切换系统指令同步，开启时把 index 窗格的系统指令写入右侧窗格
 function setSync(index: number, value: boolean): void {
   syncInstructions.value = value
-  const text = panes[index]?.session.settings.systemInstruction
-  if (!value || text === undefined) return
+  if (!value) return
+  const text = panes[index]!.session.settings.systemInstruction
   for (const pane of panes.slice(1)) pane.session.settings.systemInstruction = text
 }
 
@@ -719,8 +770,7 @@ function leaveCompare(): void {
 
 // closePane 关闭一个窗格：关闭左侧时右侧的对话与运行设置成为页面对话
 function closePane(index: number): void {
-  const right = panes[1]
-  if (right === undefined) return
+  const right = panes[1]!
   if (index === 0) {
     main.stop()
     right.stop()
@@ -793,4 +843,133 @@ export function useCompare() {
     stopAll,
     toggleRaw,
   }
+}
+
+// localPresetsKey 是浏览器本机保存系统指令预设的键，读取时并入对话库后删除
+const localPresetsKey = 'playground_system_instructions'
+
+// useInstructionPresets 管理保存在对话库中的系统指令预设
+export function useInstructionPresets(
+  open: () => boolean,
+  getText: () => string,
+  setText: (value: string) => void,
+) {
+  const presets = ref<SystemInstructionPreset[]>([])
+  const selected = ref('')
+  const title = ref('')
+  const saved = ref(true)
+  const saveError = ref(false)
+  const { errorText } = useI18n()
+  const { showNotice } = useConsole()
+  let saveTimer = 0
+
+  // currentPreset 是当前选中的系统指令预设
+  const currentPreset = computed(() => presets.value.find((preset) => preset.id === selected.value))
+
+  // syncSelection 按当前系统指令匹配预设选中态
+  function syncSelection(): void {
+    const match = presets.value.find((preset) => preset.text === getText())
+    selected.value = match?.id ?? ''
+    title.value = match?.title ?? ''
+  }
+
+  // persist 等待一次预设写入并更新保存状态
+  async function persist(write: Promise<void>): Promise<void> {
+    saved.value = false
+    saveError.value = false
+    try {
+      await write
+      saved.value = saveTimer === 0
+    } catch (cause) {
+      saveError.value = true
+      showNotice(errorText(cause), 'error')
+    }
+  }
+
+  // commit 把当前标题与系统指令写入预设列表并保存
+  function commit(): void {
+    const text = getText()
+    if (text.trim() === '' && title.value.trim() === '') {
+      saved.value = true
+      return
+    }
+    let preset = currentPreset.value
+    if (preset === undefined) {
+      preset = { id: newTurnID(), title: '', text: '' }
+      presets.value.push(preset)
+      selected.value = preset.id
+    }
+    preset.title = title.value
+    preset.text = text
+    void persist(api.saveSystemInstruction(preset))
+  }
+
+  // flush 立即提交待保存的系统指令预设
+  function flush(): void {
+    if (saveTimer === 0) return
+    window.clearTimeout(saveTimer)
+    saveTimer = 0
+    commit()
+  }
+
+  // remember 在编辑后合并保存当前指令到预设
+  function remember(): void {
+    saved.value = false
+    saveError.value = false
+    window.clearTimeout(saveTimer)
+    saveTimer = window.setTimeout(() => {
+      saveTimer = 0
+      commit()
+    }, 500)
+  }
+
+  // choose 切换到另一条预设或新建空白指令
+  function choose(id: string | number | undefined): void {
+    flush()
+    selected.value = String(id ?? '')
+    const preset = currentPreset.value
+    title.value = preset?.title ?? ''
+    setText(preset?.text ?? '')
+  }
+
+  // remove 删除当前预设并清空指令
+  function remove(): void {
+    window.clearTimeout(saveTimer)
+    saveTimer = 0
+    const id = selected.value
+    presets.value = presets.value.filter((preset) => preset.id !== id)
+    void persist(api.deleteSystemInstruction(id))
+    choose('')
+  }
+
+  // refresh 从服务端读取预设，并入浏览器本机保存的预设后匹配当前指令
+  async function refresh(): Promise<void> {
+    try {
+      presets.value = await api.systemInstructions()
+      const local = localStorage.getItem(localPresetsKey)
+      if (local !== null) {
+        const remote = presets.value
+        const missing = (JSON.parse(local) as SystemInstructionPreset[]).filter(
+          (item) =>
+            !remote.some(
+              (preset) =>
+                preset.id === item.id || (preset.title === item.title && preset.text === item.text),
+            ),
+        )
+        for (const preset of missing) await api.saveSystemInstruction(preset)
+        presets.value = [...remote, ...missing]
+        localStorage.removeItem(localPresetsKey)
+      }
+      syncSelection()
+    } catch (cause) {
+      showNotice(errorText(cause), 'error')
+    }
+  }
+
+  watch(open, (value) => {
+    if (value) void refresh()
+    else flush()
+  })
+
+  return { presets, selected, title, saved, saveError, currentPreset, remember, choose, remove }
 }

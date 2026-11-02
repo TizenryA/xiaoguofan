@@ -1,6 +1,7 @@
 import type { Model } from '@/types'
 import {
   chatRequest,
+  dataURL,
   protocolCall,
   responsesRequest,
   type ImageOptions,
@@ -12,7 +13,7 @@ import type { GenerateRequest } from './request'
 export type CodeLanguage = 'rest' | 'python' | 'typescript' | 'openai-python' | 'openai-typescript'
 
 // CodeInput 是生成示例代码所需的页面请求：协议、是否流式、模型、服务地址、Gemini API 请求与 OpenAI Images 参数
-export interface CodeInput {
+interface CodeInput {
   model: Model | undefined
   modelID: string
   baseURL: string
@@ -87,9 +88,7 @@ const markerPattern = /(["'])__FILE_(raw|url)_(\d+)__\1/g
 // markAttachments 把正文中附件的 Base64 正文与 data URL 换为占位
 function markAttachments(value: unknown, attachments: readonly Attachment[]): unknown {
   if (typeof value === 'string') {
-    const index = attachments.findIndex(
-      (item) => value === item.data || value === `data:${item.mimeType};base64,${item.data}`,
-    )
+    const index = attachments.findIndex((item) => value === item.data || value === dataURL(item))
     if (index === -1) return value
     return markerText({ index, kind: value.startsWith('data:') ? 'url' : 'raw' })
   }
@@ -145,7 +144,7 @@ function pyLiteral(value: unknown, indent = 0): string {
   return `{\n${entries.map(([key, item]) => `${inner}${pyString(key)}: ${pyLiteral(item, indent + 1)},`).join('\n')}\n${pad}}`
 }
 
-// pySignatures 把 Python 字面量中的思考签名换为解码后的字节，SDK 中该字段为 bytes
+// pySignatures 把 Python 字面量中的思考签名换为解码后的字节
 function pySignatures(literal: string): string {
   return literal.replace(
     /('thought_signature': )('[^']*')/g,
@@ -153,7 +152,7 @@ function pySignatures(literal: string): string {
   )
 }
 
-// pyAttachments 返回读取附件的 Python 语句与替换附件占位后的字面量，Gemini SDK 的内联数据为字节
+// pyAttachments 返回读取附件的 Python 语句与替换附件占位后的字面量
 function pyAttachments(
   literal: string,
   attachments: readonly Attachment[],
@@ -164,14 +163,14 @@ function pyAttachments(
     used.add(Number(index))
     const name = `file_${Number(index) + 1}`
     if (kind === 'url')
-      return `f"data:${attachments[Number(index)]?.mimeType};base64,{base64.b64encode(${name}).decode()}"`
+      return `f"data:${attachments[Number(index)]!.mimeType};base64,{base64.b64encode(${name}).decode()}"`
     return bytes ? name : `base64.b64encode(${name}).decode()`
   })
   const setup = [...used]
     .sort((first, second) => first - second)
     .map(
       (index) =>
-        `with open(${pyString(attachments[index]?.file ?? '')}, 'rb') as file:\n    file_${index + 1} = file.read()`,
+        `with open(${pyString(attachments[index]!.file)}, 'rb') as file:\n    file_${index + 1} = file.read()`,
     )
     .join('\n')
   return { setup, literal: replaced }
@@ -187,14 +186,14 @@ function tsAttachments(
     used.add(Number(index))
     const name = `file${Number(index) + 1}`
     return kind === 'url'
-      ? `\`data:${attachments[Number(index)]?.mimeType};base64,\${${name}}\``
+      ? `\`data:${attachments[Number(index)]!.mimeType};base64,\${${name}}\``
       : name
   })
   const setup = [...used]
     .sort((first, second) => first - second)
     .map(
       (index) =>
-        `const file${index + 1} = fs.readFileSync(${JSON.stringify(attachments[index]?.file ?? '')}).toString('base64');`,
+        `const file${index + 1} = fs.readFileSync(${JSON.stringify(attachments[index]!.file)}).toString('base64');`,
     )
     .join('\n')
   return { setup, literal: replaced }
@@ -205,7 +204,7 @@ function tsLiteral(value: unknown, indent = 0): string {
   return JSON.stringify(value, null, 2).replaceAll('\n', `\n${'  '.repeat(indent)}`)
 }
 
-// geminiConfig 把 Gemini API 请求拆为 contents 与 SDK 的 config：生成参数并入系统指令、安全设置与工具
+// geminiConfig 把 Gemini API 请求拆为 contents 与 SDK 的 config：生成参数并入系统指令、安全设置与工具，内联附件去掉 displayName
 function geminiConfig(request: GenerateRequest): {
   contents: unknown
   config: Record<string, unknown>
@@ -214,7 +213,15 @@ function geminiConfig(request: GenerateRequest): {
   if (request.systemInstruction) config.systemInstruction = request.systemInstruction
   if (request.safetySettings) config.safetySettings = request.safetySettings
   if (request.tools) config.tools = request.tools
-  return { contents: request.contents, config }
+  const contents = request.contents.map((content) => ({
+    ...content,
+    parts: content.parts.map((part) => {
+      if (part.inlineData?.displayName === undefined) return part
+      const { displayName: _displayName, ...inlineData } = part.inlineData
+      return { ...part, inlineData }
+    }),
+  }))
+  return { contents, config }
 }
 
 // pythonCode 生成 google-genai Python 的 generateContent 示例，正文与页面以 Gemini API 发送的请求相同
@@ -297,9 +304,9 @@ function shellJSON(body: unknown, attachments: readonly Attachment[]): string {
   return JSON.stringify(body, null, 2)
     .replace(/[\\$`]/g, '\\$&')
     .replace(markerPattern, (_match, _quote, kind: string, index: string) => {
-      const attachment = attachments[Number(index)]
-      const data = `$(base64 < ${attachment?.file} | tr -d '\\n')`
-      return kind === 'url' ? `"data:${attachment?.mimeType};base64,${data}"` : `"${data}"`
+      const attachment = attachments[Number(index)]!
+      const data = `$(base64 < ${attachment.file} | tr -d '\\n')`
+      return kind === 'url' ? `"data:${attachment.mimeType};base64,${data}"` : `"${data}"`
     })
 }
 

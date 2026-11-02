@@ -1,6 +1,6 @@
 # Build 通道
 
-AI Studio 的 Build 应用经官网宿主页调用 MakerSuite 代理 RPC 访问 Gemini API，这部分调用使用与 Playground 分开计算的额度。服务把 Build 作为与 Playground 对等的生成通道：同一账户同时拥有两份额度，生成请求按账户与通道的组合调度。本文定义代理 RPC 的 wire、请求头与 WAA、模型目录与资格、调度与冷却、Gemini API JSON 的逐字段映射、响应解码、错误与额度处理，通道的配置与显示，以及经 `-build` 模型调用的写代码助手通道。WAA proof 的生成见 [WAA 实现](waa.md)，Playground 的 `GenerateContent` 见 [协议规范](protocol.md)。
+AI Studio 的 Build 应用经官网宿主页调用 MakerSuite 代理 RPC 访问 Gemini API，免费账户在这部分调用与 Playground 上计入同一模型的同一份每日请求次数，例如 `gemini-3.8-flash` 为每日 100 次。服务把 Build 作为与 Playground 对等的生成通道，生成请求按账户与通道的组合调度。本文定义代理 RPC 的 wire、请求头与 WAA、模型目录与资格、调度与冷却、Gemini API JSON 的逐字段映射、响应解码、错误与额度处理，通道的配置与显示，以及经 `-build` 模型调用的写代码助手通道。Playground 的 `GenerateContent` 见 [协议规范](protocol.md)。
 
 ## 1. 官网机制与通道配置
 
@@ -26,13 +26,13 @@ Build 应用运行在 `*.scf.usercontent.goog` 的 blob 沙箱 iframe 中。宿�
 | `playground` | 官网 Playground 的 `GenerateContent` |
 | `build` | Build 应用代理的 Gemini API 调用 |
 
-- 默认值为 `playground,build`；逗号分隔，去除空白并转小写；至少一个，不能重复，其他值在配置校验时报错
+- 默认值为 `playground`：上游已对账户停用 Build 代理生成，`build` 作为旧通道保留；逗号分隔，去除空白并转小写；至少一个，不能重复，其他值在配置校验时报错
 - 列表顺序即同一账户内的通道顺序
 - 配置来源为 `.env`、管理页面设置中的“上游通道”（至少保留一个，保存为 `playground,build` 顺序）或 `PUT /api/config` 的 `upstream_channels`；保存值在下一次启动生成服务时生效
 
-`BUILD_NATIVE_NONSTREAM=true` 为默认值：Gemini、Chat、Responses、Anthropic、Interactions、图片和语音端点的非流式请求在每个账户上优先使用 Build 通道，执行 `ProxyUnaryCall` 与 `:generateContent`。Build 通道未启用、该账户的 Build 目录不支持模型或该账户的 Build 额度冷却时，由同一账户的其余可用通道执行；文件引用与专用能力按其 Playground 路由执行。关闭该选项后按原通道顺序调度，选中 Build 的非流式请求仍执行单次调用。
+`BUILD_NATIVE_NONSTREAM=true` 为默认值：Gemini、Chat、Responses、Anthropic、Interactions、图片和语音端点的非流式请求在每个账户上优先使用 Build 通道，执行 `ProxyUnaryCall` 与 `:generateContent`。Build 通道未启用、该账户的 Build 目录不支持模型、该账户的 Build 额度冷却或 Build 已对该账户停用生成时，由同一账户的其余可用通道执行；文件引用与专用能力按其 Playground 路由执行。关闭该选项后按原通道顺序调度，选中 Build 的非流式请求仍执行单次调用。
 
-Playground `GenerateContent` 的响应为 repeated 流帧，完整收集后转换为公开非流式响应。日志的“上游调用”记录实际通道、`native` / `stream` 模式和 RPC；非流式请求使用流式传输时，以 WARN 记录“回退流式”与原因。Build 明确返回单次方法不支持时，尝试该通道的 `ProxyStreamedCall`；参数错误按“错误、额度与能力边界”一节处理。
+Playground `GenerateContent` 的响应为 repeated 流帧，完整收集后转换为公开非流式响应。日志的“上游调用”记录实际通道、`native` / `stream` 模式和 RPC；启用 Build 通道时，非流式请求使用流式传输以 WARN 记录“回退流式”与原因。Build 明确返回单次方法不支持时，尝试该通道的 `ProxyStreamedCall`；参数错误按“错误、额度与能力边界”一节处理。
 
 通道在以下位置显示：
 
@@ -80,7 +80,7 @@ proof 位于 field 3，由账户的同一个 WAA Worker 生成，与 Playground 
 /v1beta/models/<MODEL_ID>:streamGenerateContent {"contents":[...],"generationConfig":{...}}
 ```
 
-摘要为 binding 的 SHA-256 小写十六进制。受保护请求由 Worker 发送，Camoufox 后端经页面原生 `fetch`，纯 Go 后端经账户固定出口的 Go HTTP。
+摘要为 binding 的 SHA-256 小写十六进制。受保护请求由 Worker 发送，Camoufox 后端经页面原生 `fetch`，SpiderMonkey 后端经账户固定出口的 Go HTTP。
 
 ### 响应
 
@@ -110,6 +110,10 @@ ProxyResponse 的索引 `0` 是 JSON 字符串正文，索引 `2` 是 Base64 字
 - 每条请求都带 `model`，`taskType`、`title`、`outputDimensionality` 有值时写入
 - 上游单批最多 100 条；更多输入按顺序分批发送，各批取 fresh proof，向量与 `tokenCount` 按输入顺序合并
 - 响应为 `{"embeddings":[{"values":[...]}],"tokenCount":"<N>"}`；向量数与输入数不一致时返回协议错误；`tokenCount` 计为请求的输入 token
+
+### countTokens
+
+Build 计数经 `ProxyUnaryCall` 调用 `/v1beta/models/<模型>:countTokens`，请求体为 `{"generateContentRequest":{model,contents,systemInstruction?,tools?,generationConfig?{mediaResolution}}}`，响应读取 `totalTokens`、`systemInstructionsTokens`、`contentTokens`、`toolTokens` 与 `promptTokensDetails`。
 
 ### Live 与实时音乐
 
@@ -193,6 +197,7 @@ backchannel envelope 的 payload 是 ProxyResponse 列表，每个元素的索�
 | `inputTokenLimit`、`outputTokenLimit` | token 上限 |
 | `supportedGenerationMethods` | methods；含 `generateContent` 时设置聊天能力 |
 | `thinking` | 思考能力 |
+| `modelStage` | 模型阶段 |
 
 Build 目录保存在账户内存中，不写入 `runtime-state.json`。读取失败时该账户本轮目录同步记为失败，进入待重试集合，按 30 秒周期重试。
 
@@ -206,11 +211,13 @@ Build 目录保存在账户内存中，不写入 `runtime-state.json`。读取�
 4. M 出现在任一账户的 Playground 目录时：M 不是 Interactions 或转录模型，且账户权益满足 M 的 AccessModes
 5. M 只在 Build 目录中时：M 不是只能配合 Computer Use 工具的模型
 
-以下请求只使用 Playground：CountTokens、Playground 目录中的 Live 与 Robotics 模型、Veo、转录、Interactions 模型、带 Drive 文件引用的生成、带多说话人 `mode` 的 TTS。
+以下请求只使用 Playground：Playground 目录中的 Live 与 Robotics 模型、Veo、转录、Interactions 模型、带 Drive 文件引用的生成、带多说话人 `mode` 的 TTS。Playground 目录中模型的 CountTokens 使用 Playground，各 Part 的 `mediaResolution` 不同时经 Build 计数；Build 未启用时与生成一样经 Playground 发送，各 Part 按模型默认分辨率计数。
+
+带 File Search 工具的生成只经 Build 通道，没有可用的 Build 账户或 Build 拒绝请求时返回对应错误。
 
 `MODEL_CHANNELS` 限定的模型只经所列通道调用。限定为 `build` 的模型收到带文件引用或只有 Playground 支持的参数的 `generateContent` 请求时，在选择账户前返回 400，错误写明该模型限定的通道。
 
-Playground 目录没有的 embedding（`embedContent`）、Live（`bidiGenerateContent`）与实时音乐（`bidiGenerateMusic`）模型只经 Build 通道调用：`UPSTREAM_CHANNELS` 启用 `build`，且账户的 Build 目录包含该模型与方法时，账户可以承担请求。`aqa` 等其他方法不进入 Build 通道。
+Playground 目录没有的 embedding（`embedContent`）、Live（`bidiGenerateContent`）、实时音乐（`bidiGenerateMusic`）模型及这类模型的计数（`countTokens`）只经 Build 通道调用：`UPSTREAM_CHANNELS` 启用 `build`，且账户的 Build 目录包含该模型与方法时，账户可以承担请求。`aqa` 等其他方法不进入 Build 通道。
 
 ### 公开目录
 
@@ -236,7 +243,7 @@ Playground 目录没有的 embedding（`embedContent`）、Live（`bidiGenerateC
 
 | 输入 | Build | Playground |
 | --- | --- | --- |
-| 内联附件 | 直接写入 `inlineData` | 上传到本次生成账户的 Drive，以 file ID 引用 |
+| 内联附件 | 直接写入 `inlineData` | 上传到本次生成账户的 Drive，以 file ID 引用；同一账户相同内容复用已上传的文件 |
 | YouTube 链接 | `fileData` | external media Part |
 | Drive 文件引用 | 不接受 | 使用文件所属账户 |
 
@@ -249,11 +256,13 @@ Build 请求与 Playground 共用同一预处理：工具可用性校验、模�
 | 字段 | 取值 |
 | --- | --- |
 | `contents` | 规范 contents |
-| `systemInstruction` | system 非空时为 `{"parts":[{"text":"<SYSTEM>"}]}` |
+| `systemInstruction` | 每段系统指令一个 text Part |
 | `tools` | 工具声明 |
-| `toolConfig` | 同时声明函数与 Google 工具时为 `{"includeServerSideToolInvocations":true}` |
+| `toolConfig` | 内置工具（Google 工具、MCP、File Search）与函数同时声明，或请求 `includeServerSideToolInvocations` 时为 `{"includeServerSideToolInvocations":true}`，图片模型不发送；带检索位置或语言时加 `retrievalConfig {latLng?, languageCode?}` |
 | `generationConfig` | 生成参数 |
 | `safetySettings` | 安全设置 |
+| `serviceTier` | `SERVICE_TIER_<请求值大写>` |
+| `store`、`labels` | 请求值 |
 
 - `safetySettings` 默认为骚扰、仇恨、色情、危险四类 `OFF`，请求中的类别按名称覆盖或追加；图片路由只发送请求中的类别
 
@@ -277,34 +286,39 @@ Build 请求与 Playground 共用同一预处理：工具可用性校验、模�
 
 ### contents
 
-user 与 tool 角色写为 `user`，assistant 写为 `model`，没有 part 的 content 省略。user 文本中的 YouTube 链接先转为 external media part。
+user 与 tool 角色写为 `user`，assistant 写为 `model`，没有 part 的 content 省略。`YOUTUBE_LINKS=true` 时 user 文本中的 YouTube 链接先转为 external media part。
 
 | 规范 Part | Gemini API Part |
 | --- | --- |
 | text | `text`；带说话人或风格时附 `speechMetadata {speaker, style}`；思考文本带 `thought: true` |
-| inline data | `inlineData {mimeType, data}`，data 为标准 Base64 |
-| external media | `fileData {mimeType, fileUri}` |
+| inline data | `inlineData {mimeType, data, displayName?}`，data 为标准 Base64 |
+| external media | `fileData {mimeType, fileUri, displayName?}` |
 | Drive file | 返回参数错误 |
 | function call | `functionCall {name, args, id?}` |
 | function result | `functionResponse {name, response, id?}` |
-| executable code | `executableCode {language, code}` |
-| code execution result | `codeExecutionResult {outcome, output?}` |
+| executable code | `executableCode {id?, language, code}` |
+| code execution result | `codeExecutionResult {id?, outcome, output?}` |
+| 服务端工具调用与结果 | `toolCall {id, toolType?, toolName?, args?}`、`toolResponse {id, toolType?, response?}` |
 | 只有签名 | `text: ""` |
 
 - thought signature 写入 Part 的 `thoughtSignature`；函数调用没有签名时写 `skip_thought_signature_validator`
 - function result 缺少名称时，按 call ID 关联当前轮尚未返回结果的调用，未匹配且只剩一个调用时使用其名称
 - 函数参数与结果是 JSON 对象时原样写入，其他 JSON 值封装为 `{"result":<VALUE>}`
-- 代码执行结果的 outcome 不是 `OUTCOME_OK` 时 `output` 写错误文本
+- 代码执行失败时 `output` 为错误输出
+- Part 的分辨率写为 `mediaResolution {level}`
 
 ### tools
 
 | 工具 | Gemini API |
 | --- | --- |
-| 函数声明 | `{"functionDeclarations":[{"name","description?","parametersJsonSchema?"}]}`，JSON Schema 原样发送 |
+| 函数声明 | `{"functionDeclarations":[{"name","description?","parametersJsonSchema?","responseJsonSchema?"}]}`，JSON Schema 原样发送 |
 | Google Search、Image Search | `{"googleSearch":{...}}`；请求 Image Search 时带 `searchTypes {imageSearch, webSearch?}`；时间范围写 `timeRangeFilter {startTime, endTime}`（RFC 3339 UTC） |
 | Code Execution | `{"codeExecution":{}}` |
 | URL Context | `{"urlContext":{}}` |
-| Google Maps | `{"googleMaps":{}}` |
+| Google Maps | `{"googleMaps":{"enableWidget"?:true}}` |
+| Computer Use | `{"computerUse":{environment?,excludedPredefinedFunctions?,disabledSafetyPolicies?,enablePromptInjectionDetection?}}` |
+| MCP | `{"mcpServers":[{name,streamableHttpTransport{url,headers?,timeout?,sseReadTimeout?,terminateOnClose?}}]}` |
+| File Search | `{"fileSearch":<请求值>}` |
 
 工具选择为默认或 `auto` 时发送工具声明，`none` 时省略 `tools`，其他取值返回参数错误。
 
@@ -316,9 +330,13 @@ user 与 tool 角色写为 `user`，assistant 写为 `model`，没有 part 的 c
 | `temperature`、`topP`、`topK`、`seed` | 请求值或目录默认值 |
 | `responseMimeType` | 请求值 |
 | `responseSchema` | protobuf JSON 形式的 Schema |
+| `responseFormat` | 约束为原样 JSON Schema 时为 `{"text":{"mimeType":"APPLICATION_JSON","schema":<Schema>}}`，此时不发送 `responseMimeType` |
 | `responseModalities` | 大写模态名 |
+| `mediaResolution` | 请求级分辨率 |
 | `imageConfig` | `{aspectRatio?, imageSize?}` |
-| `speechConfig` | 单声音为 `voiceConfig.prebuiltVoiceConfig.voiceName`；多说话人为 `multiSpeakerVoiceConfig.speakerVoiceConfigs[{speaker, voiceConfig}]` |
+| `speechConfig` | 单声音为 `voiceConfig.prebuiltVoiceConfig.voiceName` 或 `voiceConfig.voice`；多说话人为 `multiSpeakerVoiceConfig.speakerVoiceConfigs[{speaker, voiceConfig}]`；语言为 `languageCode` |
+| `audioTranscriptionConfig` | 请求的逐词时间与说话人设置 |
+| `enableEnhancedCivicAnswers` | 请求为真时发送 |
 | `thinkingConfig` | `includeThoughts`（请求要求输出思考时为 true）、`thinkingBudget`、`thinkingLevel` |
 
 - `maxOutputTokens` 按模型上限校验；带语音配置且未显式设置时不发送
@@ -342,21 +360,30 @@ Playground 私有字段在 Build 请求中不发送：账户时区、GenerateCon
 | `text`（`thought` 为假） | text |
 | `text`（`thought: true`） | reasoning |
 | `inlineData`（`thought` 为假） | media，Base64 解码为字节 |
+| `fileData` | media，外部 URI |
 | `executableCode` | executable code |
 | `codeExecutionResult` | code execution result；`OUTCOME_OK` 时 `output` 为输出，否则为错误 |
 | `functionCall` | tool call，`args` 缺失时为 `{}` |
+| `toolCall`、`toolResponse` | 服务端工具调用与结果 |
+| text Part 的 `audioTranscription` | 正文的转录元数据（`text`、`speakerLabel`、`words`） |
 | 只有 `thoughtSignature` 的 Part | thought signature |
-| `citationMetadata.citationSources` | citation（`uri`、`title`、`startIndex`、`endIndex`） |
+| `citationMetadata.citationSources` | citation（`uri`、`title`、`license`、`startIndex`、`endIndex`） |
 | `groundingMetadata` | grounding |
 | `urlContextMetadata.urlMetadata` | grounding 的 URL 读取结果（`retrievedUrl`、`urlRetrievalStatus`） |
 | `usageMetadata` | usage |
+| `modelVersion` | 事件的 provider model |
+| `responseId` | 该帧全部事件的上游 responseId |
+| `turnToken` | 该帧全部事件的轮次令牌 |
+| `debugInfo` | 该帧全部事件的调试信息 |
+| 候选的 `detailedFinishReason` | finish 的细分结束原因 |
+| 候选与 `promptFeedback` 的 `safetyRatings` | finish 与输入拒绝的安全评级 |
 | `finishReason` | usage 与 finish |
 
 - Part 的 `thoughtSignature` 附在该 Part 产生的事件上
-- 带 `thought: true` 的 `inlineData` 是图片模型思考过程中的草图，不作为输出媒体
-- `groundingMetadata` 读取 `webSearchQueries`、`searchEntryPoint {renderedContent, sdkBlob}`、`groundingChunks` 的 `web`、`retrievedContext`、`maps`（`uri`、`title`、`text`、`placeId`）、`groundingSupports`（segment 的 `partIndex`、`startIndex`、`endIndex`、`text`，`groundingChunkIndices`，`confidenceScores`）与 `googleMapsWidgetContextToken`
-- `usageMetadata` 的 `totalTokenCount` 大于 0 时记录：`promptTokenCount` 为输入，`candidatesTokenCount` 为输出，`thoughtsTokenCount` 为思考，`toolUsePromptTokenCount` 为工具；缺少 `candidatesTokenCount` 时输出为总数减去其余三项
-- 第一次出现 `finishReason` 时先发出最近的 usage，再发出 finish；终止原因为去掉 `FINISH_REASON_` 前缀后的小写枚举名，与 Playground 的规范终止原因一致，`UNSPECIFIED` 为 `unspecified`
+- 带 `thought: true` 的 `inlineData` 是图片模型思考过程中的草图，作为带 thought 标记的媒体事件
+- `groundingMetadata` 读取 `webSearchQueries`、`imageSearchQueries`、`searchEntryPoint {renderedContent, sdkBlob}`、`groundingChunks` 的 `web`（`uri`、`title`、`domain`、`siteName`、`searchResultMapping`）、`image`（`sourceUri`、`imageUri`、`title`、`domain`）、`retrievedContext`、`maps`（`uri`、`title`、`text`、`placeId`、`placeAnswerSources`）、chunk 的 `origin` 与 `referenceId`、`groundingSupports`（segment 的 `partIndex`、`startIndex`、`endIndex`、`text`，`groundingChunkIndices`，`confidenceScores`，`renderedParts`，`origin`）与 `googleMapsWidgetContextToken`
+- `usageMetadata` 的 `totalTokenCount` 大于 0 时记录，并写入该帧全部事件作为帧用量：`promptTokenCount` 为输入，`candidatesTokenCount` 为输出，`thoughtsTokenCount` 为思考，`toolUsePromptTokenCount` 为工具；缺少 `candidatesTokenCount` 时输出为总数减去其余三项
+- 第一次出现 `finishReason` 时，该帧的内容事件标记为结束帧，随后发出最近的 usage 与 finish；终止原因为去掉 `FINISH_REASON_` 前缀后的小写枚举名，与 Playground 的规范终止原因一致，`UNSPECIFIED` 为 `unspecified`
 - 没有 candidate 且带 `promptFeedback.blockReason` 时返回 prompt feedback 错误，原因为去掉 `BLOCK_REASON_` 前缀的小写枚举名
 - candidate 数量不是 1、正文不是 JSON 或 Base64 无效时返回带路径的协议错误；流结束时没有 `finishReason` 与读取中断相同，报告为上游流中断与已接收帧数
 
@@ -393,7 +420,8 @@ HTTP 非 200 响应解码为协议错误，保留 HTTP 状态、google.rpc code�
 | 其他 | 502 |
 
 - HTTP 429 按元数据或消息识别分钟限额与每日限额：分钟限额冷却到窗口重置，每日限额冷却到下一个额度日；非全局限额写入 `build:<模型>`，全局限额写入账户 `*`；列出的额度项上限全部为 `limit: 0` 时冷却类型为“无配额”
-- HTTP 400、Code 3 发生在可经 Playground 完成的请求上且 Playground 通道启用时，同一账户改经 Playground 重试，需要 Build 的结构化输出改用 Playground 载体；只启用 Build 时返回 Build 的错误。Playground 返回首个事件后按 `build:<模型>` 递增冷却 1、5、15、30、60 分钟，该范围成功一次后从 1 分钟开始；Playground 同样拒绝时返回 Playground 的错误
+- HTTP 400、Code 3 发生在可经 Playground 完成的请求上且 Playground 通道启用时，请求改经 Playground 重试且不再发往 Build：该账户的 Playground 可用时由同一账户执行，冷却时换其他账户，需要 Build 的结构化输出改用 Playground 载体；只启用 Build 时返回 Build 的错误。Playground 返回首个事件后对被拒账户按 `build:<模型>` 递增冷却 1、5、15、30、60 分钟，该范围成功一次后从 1 分钟开始；Playground 同样拒绝时返回 Playground 的错误；带 File Search 的请求不改经 Playground
+- Build 对账户返回 `PROXY_GENERATION_DISABLED`（HTTP 400、Code 3）时，错误原样返回客户端，不改经 Playground，也不写入冷却
 - 流尾错误按换算后的 HTTP 状态处理；首个上游语义事件之前的 401、403、404、429 与 5xx 进入换号、换通道与冷却流程，之后的错误以流内 error 结束
 - HTTP 403 与 Code 7 保留账户与模型资格，请求切换到其他账户
 - 模型不存在返回 404 Code 5；只能配合 Computer Use 的模型在纯文本请求时返回 400 Code 3，这类模型不进入 Build 通道
@@ -452,7 +480,7 @@ HTTP 非 200 响应解码为协议错误，保留 HTTP 状态、google.rpc code�
 | 范围 | 必须确认的结果 |
 | --- | --- |
 | 通道选择 | `playground`、`build` 单独启用和同时启用时，目录与实际路由一致 |
-| 额度隔离 | 一个通道进入模型冷却后，同一账户的另一个通道仍可承担请求；全局冷却同时作用于两者 |
+| 通道冷却 | 一个通道进入模型冷却后，同一账户的另一个通道仍可承担请求；全局冷却同时作用于两者 |
 | 协议 | Chat、Responses、Anthropic 与 Gemini 的非流式、流式正文和终态一致 |
 | 内容 | system、多轮、函数、Google 工具、图片输入、TTS 与图片输出按模型能力编码 |
 | 生命周期 | 取消、客户端断开、停止序列与流尾错误都释放租约和账户并发槽位 |
@@ -476,9 +504,9 @@ ListModels 行的主能力码（field 65）含 48 的模型，即 Build 设置�
 | ID | `<基础模型 ID>-build` |
 | 名称 | `<基础模型名称> (Build)` |
 | methods | 基础模型 methods 中的 `generateContent` 与 `countTokens` |
-| capabilities | `assistant_route`，加基础模型具备的 `chat_model`、`thinking`、`thinking_level` |
+| capabilities | `assistant_route`、`function_declarations`、`google_search`，加基础模型具备的 `chat_model`、`thinking`、`thinking_level` |
 | 能力选项 | 空 |
-| 默认参数 | 输出上限与可选 thinking level 取基础模型，思考开启，默认 level 为 high（3） |
+| 默认参数 | 输出上限与可选 thinking level 取基础模型，思考开启，默认 level 为 high（3），基础模型不支持 high 时取最接近的可用 level；目录的默认档位为该 level |
 | 其余字段 | 取基础模型，含描述、token 上限与 AccessModes |
 
 ```text
@@ -499,11 +527,33 @@ ListModels: gemini-3.8-flash（主能力码含 48）
 | --- | --- |
 | contents | field 1 |
 | system | field 9 自定义指令 |
+| 内置工具禁止说明 | field 9 开头 |
+| 函数声明 | field 9 中系统提示之前的函数调用说明 |
 | 思考强度或思考预算 | field 19 的 thinking level |
 
-- 上游请求只携带对话轮、系统提示与思考强度；生成参数、结构化输出与安全设置使用助手的服务端设置
+- 上游请求只携带对话轮、系统提示、函数调用说明与思考强度；生成参数、结构化输出与安全设置使用助手的服务端设置
 - 内联附件按官网对话面板上传，对话轮中以 Part field 18 `[mime, 上传路径, 文件名, 字节数]` 引用，文件名为 `attachment-<序号>`，序号按附件在请求中的顺序从 1 开始；上传见“附件上传”
-- `-build` 条目没有函数与 Google 工具能力：工具声明在发送前丢弃，历史中的函数调用与结果按 [协议规范](protocol.md) 改写为文本
+- field 9 以内置工具禁止说明开头：写代码助手服务端指令声明的 25 个工作区工具（`run_command`、`write_to_file`、`view_file`、`search_web` 等）作用于与对话无关的空应用，说明列出这些工具名并禁止调用；请求带 Google Search 工具时列表不含 `search_web`，并在说明末尾允许调用 `search_web`
+- `CodeAssistantOffline` 没有客户端函数声明字段，对话轮中的函数调用与结果 Part 不进入模型输入。请求声明函数且 tool choice 不是 `none` 时，函数声明以 JSON 写入下面的函数调用说明，接在禁止说明之后（中间空一行）
+- 对话轮中的函数调用与结果 Part 转录为代码块文本：同一轮内相邻的调用合为一个 `function_calls` 块，相邻的结果合为一个 `function_results` 块，元素分别为 `{"name","arguments"}` 与 `{"name","response"}`；转录在上传附件与计算 WAA binding 之前完成
+- 写代码助手只把对话轮中的 user 轮放入模型输入，model 轮被丢弃，多个 user 轮合为一轮。服务把 model 轮去掉思考与空 Part 后，首尾加上 `<assistant_turn>\n` 与 `\n</assistant_turn>` 两个文本 Part，以 user 轮发送；对话含 model 轮时，field 9 的说明之后另起一段写入下面的模型轮说明
+- 本进程读到的回复中，`search_web` 步骤的查询与摘要按请求所用 API key、该轮之前对话轮的角色与正文摘要、回复正文保存（最多 1000 条回复）；之后以同一 API key 发送的请求中，某个 model 轮之前的对话与正文都和某条回复相同时，在该轮开头补回文本 Part `search_web results for "<查询>":\n<摘要>`，每次搜索一个
+
+````text
+You can call the following client functions. They run on the user's machine, not in this workspace, and are the only way to read or change the user's files, run the user's commands or reach the user's services.
+<函数声明 JSON>
+To call functions, reply with only one fenced block and no other text:
+```function_calls
+[{"name": "<function name>", "arguments": {<arguments>}}]
+```
+Function results arrive in a later user turn as a fenced function_results block. Never write a function_results block yourself; stop after the function_calls block and wait for the results. Answer normally when no function is needed.
+````
+
+````text
+Your own earlier replies in this conversation, including your function_calls blocks, appear in the user message between <assistant_turn> and </assistant_turn>. Continue from the latest content and never write these tags yourself.
+````
+
+- Google Search 工具不写入请求：写代码助手按需调用内置的 `search_web`，搜索步骤按“任务流”输出为 grounding；其他 Google 工具在发送前丢弃
 - 停止序列在本地匹配截断，见“停止序列、usage 与终态”
 - thinking level 为 high `3`、medium `2`、low `1`、minimal `4`；未指定时为 high。`reasoning_effort`、`thinkingLevel` 与 Anthropic `output_config.effort` 的 `xhigh`、`max` 按 high，`none` 按 minimal；思考预算 `<=0`、`<=1024`、`<=8192` 与更大值分别取 minimal、low、medium、high。模型不支持所得 level 时取强度顺序 minimal、low、medium、high 中最接近的可用 level
 
@@ -513,7 +563,7 @@ ListModels: gemini-3.8-flash（主能力码含 48）
 /_/upload（每个内联附件一次）               → 上传路径
 CreateApplet                                → 应用 ID
 CodeAssistantOffline（WAA proof）           → 任务 ID
-StreamCodeAssistantOfflineGeneration        → 步骤快照流，读到上游关闭
+StreamCodeAssistantOfflineGeneration        → 步骤快照流，读到本轮回复结束或上游关闭
 流关闭后在后台：
   CancelCodeAssistantOfflineGeneration      （已取得任务 ID 且流没有正常解码完成时）
   DeleteApplet
@@ -570,14 +620,14 @@ StreamCodeAssistantOfflineGeneration        → 步骤快照流，读到上游�
 | 2 | WAA proof |
 | 6 | `1` |
 | 8 | `models/<基础模型 ID>` |
-| 9 | 系统提示；system 为空时为 `null` |
+| 9 | 自定义指令：内置工具禁止说明、函数调用说明、模型轮说明与系统提示 |
 | 12 | 应用 ID |
 | 14 | `[2,null,2]` |
 | 16 | `1` |
 | 19 | 思考配置 `[1,null,null,<thinking level>]` |
 | 29 | 每个请求新生成的大写 UUID v4 |
 
-WAA binding 与 Playground `GenerateContent` 相同：contents 各 Part 依次取文本、内联数据的标准 Base64 或 Drive file ID，其余 Part 取空字符串，以单个空格连接；proof 写入 field 2。Camoufox 后端的页面输入框写入 contents 各 Part 的文本，以空格连接。proof 生成与发送见 [WAA 实现](waa.md)。
+WAA binding 与 Playground `GenerateContent` 相同：contents 各 Part 依次取文本、内联数据的标准 Base64 或 Drive file ID，其余 Part 取空字符串，以单个空格连接；proof 写入 field 2。Camoufox 后端的页面输入框写入 contents 各 Part 的文本，以空格连接。
 
 响应：
 
@@ -626,7 +676,7 @@ WAA binding 与 Playground `GenerateContent` 相同：contents 各 Part 依次�
 | 1 | 对话轮列表 `[[[Part...], role]]` |
 | 3 | 应用文件修改 |
 | 7、8 | 时间戳 `["<秒>", <纳秒>]` |
-| 10 | 工具执行，例如编译应用 |
+| 10 | 工具动作，例如编译应用；其中 field 19 为 `search_web` 搜索 `[查询, 域名, 摘要, [[标题, 地址]...]]` |
 | 11 | `[应用 ID, 时间戳]` |
 | 12 | 步骤序号，用户轮为 0 |
 | 6 | 失败原因 `[消息, 详情]` |
@@ -644,13 +694,15 @@ Part 的 field 2 为文本，field 13 为 `1` 或 `true` 时是思考。只修�
 3. 跳过 role 不是 `model` 的对话轮。模型轮的 Part 以（步骤序号，Part 序号）定位，同一步骤内多个模型轮的 Part 序号连续编号
 4. Part 文本是该位置的完整快照：以上一次快照开头时输出新增部分，与上一次相同时不输出；不以上一次快照开头时返回协议错误 “步骤正文不是上一次快照的延续”
 5. 思考 Part 的增量输出为 reasoning，其余为 text；text 来自与上一段 text 不同的步骤、且是该 Part 的第一段增量时，前面加 `\n\n`
-6. 状态为 `1` 的步骤含模型轮时，回复记为已完成
-7. 消息列表结束后读取流尾状态，code 0 为成功，其他 code 按“错误、额度与能力边界”的表换算 HTTP 状态
-8. 流关闭时回复已完成：有用量时先输出用量之和，再以 `stop` 结束；回复没有完成时返回协议错误 “流结束前没有完成的模型回复”
+6. 请求声明了函数时，语言标记为 `function_calls`、`function_results`、`function_call`、`tool_calls`、`tool_call` 与 `tool_code` 的代码块暂缓到以换行加 ```` ``` ```` 结束（流结束时补上结尾）再判定，围栏可以出现在行中；其他代码块按原文输出为 text，可能是围栏开头的结尾反引号暂缓输出。判定取代码块中的第一个 JSON 值，解码失败时把不合法转义（如 `\x27`）的反斜杠按字面字符再解码一次；值为调用数组或单个调用对象时，每个元素输出为一个函数调用，调用 ID 为新的 UUID，`arguments` 为 `null` 或缺失时为 `{}`。`function_calls` 块接受任意函数名，其余标记的块只在函数均已声明时解码为调用，否则按原文输出。`function_results` 块不输出；输出函数调用之后的正文不再输出；无法解码的 `function_calls` 块不输出，回复以 `malformed_function_call` 结束
+7. 状态为 `1` 的步骤的 field 10 带 `search_web` 时，查询记入 `webSearchQueries`，每个 `[标题, 地址]` 记为一个网页来源块；同一步骤只记录一次
+8. 状态为 `1` 的步骤含模型轮时，回复记为已完成；消息中最后一个步骤状态为 `1`、含非思考正文且 field 10 为空时，本轮回复结束；输出函数调用之后模型继续输出非空白正文时，本轮回复在调用处结束，任务流关闭后取消生成任务。两种情况都不再读取后续消息与流尾状态
+9. 消息列表结束后读取流尾状态，code 0 为成功，其他 code 按“错误、额度与能力边界”的表换算 HTTP 状态
+10. 本轮回复结束或流关闭时回复已完成：依次输出暂缓的文本、记录的搜索 grounding、用量之和，再以 `stop` 结束（无法解码的 `function_calls` 块时为 `malformed_function_call`）；回复没有完成时返回协议错误 “流结束前没有完成的模型回复”
 
 用量之和：输入为各步骤未命中缓存的输入与缓存命中之和，缓存为缓存命中之和，输出为输出之和，总数为输入加输出。
 
-最后一个步骤完成后，上游约 1 到 14 秒后关闭流，finish 在流关闭后输出。
+最后一个步骤完成后，上游在数秒到数分钟后才关闭流；finish 在本轮回复结束时输出。
 
 ### 错误
 

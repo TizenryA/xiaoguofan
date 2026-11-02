@@ -350,12 +350,7 @@ func (s *server) compactResponses(ctx context.Context, request responsesRequest,
 
 // instructionItem 判断条目是否为 developer 或 system 消息
 func instructionItem(item json.RawMessage) bool {
-	var head struct {
-		Type string `json:"type"`
-		Role string `json:"role"`
-	}
-	_ = json.Unmarshal(item, &head)
-	return (head.Type == "message" || head.Type == "") && (head.Role == "developer" || head.Role == "system")
+	return compactionItemSide(item) == "instruction"
 }
 
 // conversationItems 返回去掉 developer 与 system 消息后的条目，客户端每次请求都重新发送这些指令
@@ -372,9 +367,13 @@ func (s *server) compactionSummary(ctx context.Context, request responsesRequest
 	}
 	request.Input, _ = json.Marshal(items)
 	generate, _, err := request.toGenerateRequest(id)
+	if err == nil {
+		generate, err = s.resolveMCPTools(ctx, generate)
+	}
 	if err != nil {
 		return "", nil, err
 	}
+	generate = s.prepareSearch(generate)
 	if err := inlineRemoteMedia(ctx, generate.Contents); err != nil {
 		return "", nil, err
 	}
@@ -385,7 +384,7 @@ func (s *server) compactionSummary(ctx context.Context, request responsesRequest
 	if err != nil {
 		return "", nil, err
 	}
-	result, err := consumeEvents(ctx, events, nil)
+	result, err := consumeEvents(ctx, events)
 	if err != nil {
 		return "", nil, err
 	}
@@ -407,7 +406,7 @@ func (s *server) handleResponsesCompact(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	id := newID("resp")
-	prepared, err := s.prepareResponses(r.Context(), &request, id)
+	prepared, err := s.prepareResponses(r.Context(), &request, id, false)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -429,7 +428,7 @@ func (s *server) handleResponsesCompact(w http.ResponseWriter, r *http.Request) 
 	if usage != nil {
 		response["usage"] = responsesUsage(usage)
 	}
-	writeJSON(w, http.StatusOK, response)
+	writeJSON(w, http.StatusOK, officialOrder("responses", response))
 }
 
 // responsesCompactionTrigger 返回输入是否以 compaction_trigger 项结尾
@@ -478,7 +477,7 @@ func (s *server) handleCompactionTrigger(w http.ResponseWriter, r *http.Request,
 		s.storeCompaction(r.Context(), id, request, prepared, item, retained, response)
 	}
 	if writer == nil {
-		writeJSON(w, http.StatusOK, response)
+		writeJSON(w, http.StatusOK, officialOrder("responses", response))
 		return
 	}
 	if err := writer.emit("response.output_item.done", map[string]any{"output_index": 0, "item": item}); err != nil {

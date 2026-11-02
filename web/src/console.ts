@@ -1,5 +1,5 @@
 import { computed, reactive, ref, shallowRef } from 'vue'
-import { api, openAdminEvents, type EventConnection } from '@/api'
+import { api, openAdminEvents } from '@/api'
 import { useI18n } from '@/i18n'
 import type {
   Account,
@@ -55,7 +55,9 @@ const serviceState = computed<'unavailable' | 'running' | 'launching' | 'stopped
   return 'stopped'
 })
 
-let eventConnection: EventConnection | undefined
+let eventConnection: EventSource | undefined
+// consoleGeneration 为 startConsole 与 stopConsole 的调用序号，离开后才完成的初始化据此不再订阅事件
+let consoleGeneration = 0
 let noticeTimer: number | undefined
 let pendingLogs: AdminLog[] = []
 let logFlushTimer: number | undefined
@@ -64,7 +66,7 @@ let logFlushTimer: number | undefined
 function showNotice(message: string, tone: 'success' | 'error'): void {
   notice.message = message
   notice.tone = tone
-  if (noticeTimer !== undefined) window.clearTimeout(noticeTimer)
+  window.clearTimeout(noticeTimer)
   noticeTimer = window.setTimeout(() => {
     notice.message = ''
   }, 3200)
@@ -219,17 +221,14 @@ async function stopService(): Promise<void> {
 
 function flushLogs(): void {
   logFlushTimer = undefined
-  if (pendingLogs.length === 0) return
   logs.value = logs.value.concat(pendingLogs).slice(-2000)
   pendingLogs = []
 }
 
 function resetLogs(): void {
   pendingLogs = []
-  if (logFlushTimer !== undefined) {
-    window.clearTimeout(logFlushTimer)
-    logFlushTimer = undefined
-  }
+  window.clearTimeout(logFlushTimer)
+  logFlushTimer = undefined
   logs.value = []
 }
 
@@ -246,6 +245,12 @@ function replaceByID<T extends { id: string }>(items: T[], incoming: T): void {
   const index = items.findIndex((item) => item.id === incoming.id)
   if (index === -1) items.unshift(incoming)
   else items[index] = incoming
+}
+
+// updateAccount 用接口返回的账户替换列表中的同一账户
+function updateAccount(account: Account): void {
+  const index = accounts.value.findIndex((item) => item.id === account.id)
+  if (index !== -1) accounts.value[index] = account
 }
 
 // waitForRestart 在线更新后等新进程接管再刷新页面：状态接口返回其他版本或要求重新登录都表示旧进程已退出
@@ -291,6 +296,7 @@ function handleAdminEvent(event: AdminEvent): void {
 
 // startConsole 加载全部管理数据并订阅管理事件
 async function startConsole(): Promise<void> {
+  const generation = ++consoleGeneration
   window.addEventListener('pagehide', flushDelete)
   await Promise.all([
     loadStatus(),
@@ -300,6 +306,7 @@ async function startConsole(): Promise<void> {
     loadRequests(),
     loadConfig(),
   ])
+  if (generation !== consoleGeneration) return
   api.updateStatus().then(
     (value) => (update.value = value),
     () => undefined,
@@ -312,10 +319,12 @@ async function startConsole(): Promise<void> {
 
 // stopConsole 关闭事件订阅并提交等待中的删除
 function stopConsole(): void {
+  consoleGeneration++
   eventConnection?.close()
   eventConnection = undefined
-  if (logFlushTimer !== undefined) window.clearTimeout(logFlushTimer)
-  if (noticeTimer !== undefined) window.clearTimeout(noticeTimer)
+  window.clearTimeout(logFlushTimer)
+  window.clearTimeout(noticeTimer)
+  notice.message = ''
   window.removeEventListener('pagehide', flushDelete)
   flushDelete()
 }
@@ -342,6 +351,7 @@ export function useConsole() {
     showNotice,
     loadAccountData,
     loadRequestData,
+    updateAccount,
     deleteAccount,
     undoDelete,
     commitDelete,

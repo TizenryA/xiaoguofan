@@ -1,17 +1,22 @@
 import { computed, reactive } from 'vue'
 import { useConsole } from '@/console'
+import { keepPage } from '@/desktop'
+import { useI18n, type TranslationKey } from '@/i18n'
 import type { Model } from '@/types'
+import { failureText } from '../request'
 import { newTurnID } from '../session'
 import { audioBlob, generateContent, responseText, type InlineImage } from './api'
+import { modelMatches } from '../catalog'
 import { pageKindOf } from './kinds'
+import { requestTitle } from '../title'
 
 // MusicImage 是音乐提示中的参考图片
-export interface MusicImage extends InlineImage {
+interface MusicImage extends InlineImage {
   name: string
 }
 
 // MusicAudio 是播放栏中的音频，sample 表示官网示例音频
-export interface MusicAudio {
+interface MusicAudio {
   url: string
   name: string
   sample?: boolean
@@ -24,8 +29,18 @@ export type MusicView = 'text' | 'composer'
 export const sectionTypes = ['Intro', 'Verse', 'Chorus', 'Bridge', 'Outro', 'Build'] as const
 export type SectionType = (typeof sectionTypes)[number]
 
+// sectionLabels 是段落类型在界面上的名称，提示词中的类型保持官网英文
+export const sectionLabels: Record<SectionType, TranslationKey> = {
+  Intro: 'pg.sectionIntro',
+  Verse: 'pg.sectionVerse',
+  Chorus: 'pg.sectionChorus',
+  Bridge: 'pg.sectionBridge',
+  Outro: 'pg.sectionOutro',
+  Build: 'pg.sectionBuild',
+}
+
 // MusicSection 是分段编排中的一段：类型、起止秒数、强度与描述
-export interface MusicSection {
+interface MusicSection {
   id: string
   type: SectionType
   description: string
@@ -40,6 +55,8 @@ export const maxSections = 10
 // defaultModel 是官网音乐页的默认模型
 const defaultModel = 'lyria-3-pro-preview'
 
+const { t } = useI18n()
+
 // sectionPattern 与官网一致匹配 [m:ss - m:ss] Type: Intensity: n/10. 描述
 const sectionPattern =
   /\[(\d+:\d{2})\s*-\s*(\d+:\d{2})\]\s*(\w+):\s*Intensity:\s*(\d+)\/10\.[ ]*([\s\S]*?)(?=\s*\[\d+:\d{2}\s*-\s*\d+:\d{2}\]|$)/g
@@ -52,11 +69,11 @@ export function clock(seconds: number): string {
 // seconds 把 m:ss 解析为秒数
 export function seconds(value: string): number {
   const [minutes, rest] = value.split(':').map(Number)
-  return (minutes ?? 0) * 60 + (rest ?? 0)
+  return minutes! * 60 + rest!
 }
 
 // serializeSections 与官网一致把分段写为提示词
-export function serializeSections(sections: readonly MusicSection[]): string {
+function serializeSections(sections: readonly MusicSection[]): string {
   return sections
     .map(
       (section) =>
@@ -66,14 +83,14 @@ export function serializeSections(sections: readonly MusicSection[]): string {
 }
 
 // parseSections 与官网一致从提示词解析分段，没有分段格式时返回 null
-export function parseSections(text: string): MusicSection[] | null {
+function parseSections(text: string): MusicSection[] | null {
   const matches = [...text.matchAll(sectionPattern)]
   if (matches.length === 0) return null
   const sections: MusicSection[] = []
   let cursor = 0
   for (const match of matches) {
     const between = text.slice(cursor, match.index).trim()
-    let description = match[5] ?? ''
+    let description = match[5]!
     const last = sections.at(-1)
     if (between) {
       if (last) last.description = last.description ? `${last.description}\n\n${between}` : between
@@ -116,12 +133,17 @@ const state = reactive({
 })
 let controller: AbortController | undefined
 
+// 关闭桌面窗口时，生成中与只存在于页面的音乐保留页面
+keepPage(() => state.running || state.audio?.url.startsWith('blob:') === true)
+// sessionEpoch 在每次回到空态时递增，标识标题请求所属的会话
+let sessionEpoch = 0
+
 const currentModel = computed(() => models().find((model) => model.id === state.model))
 
 // ensureModel 选定模型：地址中的模型优先，其次保留当前模型，再次为官网默认模型
 function ensureModel(requested?: string): void {
   const list = models()
-  const wanted = list.find((model) => model.id === requested)
+  const wanted = list.find((model) => modelMatches(model, requested))
   if (wanted) state.model = wanted.id
   else if (!list.some((model) => model.id === state.model))
     state.model = (list.find((model) => model.id === defaultModel) ?? list[0])?.id ?? ''
@@ -145,6 +167,7 @@ function edit(prompt = '', sample?: MusicAudio): void {
 // newSession 回到空态
 function newSession(): void {
   controller?.abort()
+  sessionEpoch++
   Object.assign(state, {
     editing: false,
     view: 'text',
@@ -183,7 +206,6 @@ function syncSections(): void {
 
 // addSection 与官网一致在末尾加入一段，起点接上一段终点，时长 10 秒
 function addSection(type: SectionType): void {
-  if (state.sections.length >= maxSections) return
   const start = state.sections.at(-1)?.endTime ?? 0
   state.sections.push({
     id: newTurnID(),
@@ -198,7 +220,6 @@ function addSection(type: SectionType): void {
 
 // moveSection 与官网一致移动段落，各位置保留原有的起止时间
 function moveSection(from: number, to: number): void {
-  if (to < 0 || to >= state.sections.length) return
   const times = state.sections.map(({ startTime, endTime }) => ({ startTime, endTime }))
   const [section] = state.sections.splice(from, 1)
   state.sections.splice(to, 0, section!)
@@ -213,7 +234,7 @@ function removeSection(index: number): void {
 }
 
 // requestBody 按官网运行请求组合 generateContent：图片在前，提示词在后，输出音频
-function requestBody(model: Model | undefined = currentModel.value): Record<string, unknown> {
+function requestBody(model: Model): Record<string, unknown> {
   return {
     contents: [
       {
@@ -227,17 +248,27 @@ function requestBody(model: Model | undefined = currentModel.value): Record<stri
       },
     ],
     generationConfig: {
-      ...(model?.top_p === undefined ? {} : { topP: model.top_p }),
-      ...(model?.top_k === undefined ? {} : { topK: model.top_k }),
+      ...(model.top_p === undefined ? {} : { topP: model.top_p }),
+      ...(model.top_k === undefined ? {} : { topK: model.top_k }),
       responseModalities: ['AUDIO'],
     },
   }
+}
+
+// generateTitle 与官网一样在歌曲未命名时于提交时以提示词生成歌名，失败时保持未命名
+async function generateTitle(model: string, prompt: string): Promise<void> {
+  const title = await requestTitle(model, prompt, prompt, () => ({
+    owner: sessionEpoch,
+    title: state.title,
+  }))
+  if (title !== '') state.title = title
 }
 
 // run 生成音乐，结果放入播放栏，文字部分作为歌词与段落说明
 async function run(): Promise<void> {
   const model = currentModel.value
   if (state.running || model === undefined || state.prompt.trim() === '') return
+  if (state.title === '') void generateTitle(model.id, state.prompt)
   state.running = true
   state.error = ''
   controller = new AbortController()
@@ -249,13 +280,14 @@ async function run(): Promise<void> {
     const blob = audioBlob(parts)
     state.lyrics = responseText(parts)
     if (blob === undefined) {
-      state.error = candidate?.finishReason ?? response.promptFeedback?.blockReason ?? 'No audio'
+      const reason = candidate?.finishReason ?? response.promptFeedback?.blockReason
+      state.error = reason ? t('pg.noAudioReason').replace('{reason}', reason) : t('pg.noAudio')
     } else {
       const extension = blob.type.includes('wav') ? 'wav' : 'mp3'
       setAudio({ url: URL.createObjectURL(blob), name: `${model.id}.${extension}` })
     }
   } catch (error) {
-    if (!signal.aborted) state.error = error instanceof Error ? error.message : String(error)
+    if (!signal.aborted) state.error = failureText(error, t('pg.musicUnreachable'))
   } finally {
     state.running = false
     controller = undefined
@@ -281,7 +313,6 @@ export function useMusic() {
     addSection,
     moveSection,
     removeSection,
-    requestBody,
     run,
     stop,
   }

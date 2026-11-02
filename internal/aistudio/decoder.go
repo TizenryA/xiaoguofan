@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"unicode"
 )
@@ -21,9 +22,10 @@ type ProtocolEvidenceError struct {
 
 // PromptFeedbackError 表示上游拒绝当前输入且没有返回候选
 type PromptFeedbackError struct {
-	Reason  string
-	Message string
-	Raw     json.RawMessage
+	Reason        string
+	Message       string
+	SafetyRatings []SafetyRating
+	Raw           json.RawMessage
 }
 
 // Error 返回协议证据错误
@@ -202,7 +204,7 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 		if err := decoder.Decode(&raw); err != nil {
 			return fail(fmt.Sprintf("$[0][%d]", index), err)
 		}
-		if err := consume(append(json.RawMessage(nil), raw...)); err != nil {
+		if err := consume(raw); err != nil {
 			return err
 		}
 		index++
@@ -218,6 +220,11 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 		var raw json.RawMessage
 		if err := decoder.Decode(&raw); err != nil {
 			return fail(fmt.Sprintf("$[%d]", fieldIndex), err)
+		}
+		if fieldIndex == 1 {
+			if err := trailerError("GenerateContent", raw); err != nil {
+				return err
+			}
 		}
 		fieldIndex++
 	}
@@ -235,6 +242,26 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 		return fail("$", err)
 	}
 	return nil
+}
+
+// trailerError 解码流式响应列表之后的 google.rpc 状态，code 不为 0 时返回上游错误
+func trailerError(method string, raw json.RawMessage) error {
+	status, err := rawArray(raw, "$[1]", raw)
+	if err != nil || len(status) == 0 {
+		return &ProtocolEvidenceError{Method: method, Path: "$[1]", Detail: "流尾状态无效", Raw: cloneRaw(raw)}
+	}
+	code, err := rawInt64(status[0], "$[1][0]", raw)
+	if err != nil {
+		return withMethod(err, method)
+	}
+	if code == 0 {
+		return nil
+	}
+	statusCode := http.StatusBadGateway
+	if mapped, ok := interactionStatusHTTP[code]; ok {
+		statusCode = mapped
+	}
+	return DecodeRPCError(method, statusCode, raw)
 }
 
 func rawArray(raw json.RawMessage, path string, evidence json.RawMessage) ([]json.RawMessage, error) {

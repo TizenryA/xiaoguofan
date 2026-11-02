@@ -185,7 +185,7 @@ func (p *ProxyPool) Binding(accountID string) string {
 
 // Available 判断代理是否在当前参与分配的代理中
 func (p *ProxyPool) Available(proxy string) bool {
-	if p == nil || proxy == "" {
+	if p == nil {
 		return false
 	}
 	p.mu.Lock()
@@ -215,9 +215,7 @@ func (p *ProxyPool) ReportFailure(proxy string, err error) ([]string, error) {
 		return nil, nil
 	}
 	entry.failures++
-	if err != nil {
-		entry.lastError = err.Error()
-	}
+	entry.lastError = err.Error()
 	if entry.down || entry.failures < proxyFailureThreshold || !p.otherAvailableLocked(entry) {
 		return nil, nil
 	}
@@ -246,22 +244,16 @@ func (p *ProxyPool) otherAvailableLocked(target *proxyEntry) bool {
 	return false
 }
 
-// Probe 用 check 逐个检测代理：失败的代理标为不可用，恢复的代理重新参与分配，绑定在不可用代理上的账户改绑到可用代理，返回绑定变化的账户
+// Probe 用 check 逐个检测代理，失败的代理标为不可用，恢复的代理重新参与分配，返回绑定变化的账户
 func (p *ProxyPool) Probe(ctx context.Context, check func(context.Context, string) error) ([]string, error) {
 	if p == nil {
 		return nil, nil
 	}
-	p.mu.Lock()
-	proxies := make([]string, 0, len(p.entries))
-	for _, entry := range p.entries {
-		proxies = append(proxies, entry.proxy)
-	}
-	p.mu.Unlock()
-	results := make([]error, len(proxies))
+	results := make([]error, len(p.entries))
 	var wait sync.WaitGroup
-	for index, proxy := range proxies {
+	for index, entry := range p.entries {
 		wait.Go(func() {
-			results[index] = check(ctx, proxy)
+			results[index] = check(ctx, entry.proxy)
 		})
 	}
 	wait.Wait()
@@ -271,21 +263,16 @@ func (p *ProxyPool) Probe(ctx context.Context, check func(context.Context, strin
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now().UTC()
-	for index, proxy := range proxies {
-		for _, entry := range p.entries {
-			if entry.proxy != proxy {
-				continue
-			}
-			entry.checkedAt = now
-			if results[index] != nil {
-				entry.down = true
-				entry.lastError = results[index].Error()
-				continue
-			}
-			entry.down = false
-			entry.failures = 0
-			entry.lastError = ""
+	for index, entry := range p.entries {
+		entry.checkedAt = now
+		if results[index] != nil {
+			entry.down = true
+			entry.lastError = results[index].Error()
+			continue
 		}
+		entry.down = false
+		entry.failures = 0
+		entry.lastError = ""
 	}
 	return p.assignLocked()
 }

@@ -186,7 +186,7 @@ const total = computed(() => props.report.totals.requests)
         <tbody>
           <template v-for="row in rows" :key="row.key">
             <tr class="border-t border-line/60 text-gray-300 hover:bg-raised/40">
-              <th scope="row" class="max-w-72 px-4 py-2 font-normal">
+              <th scope="row" class="w-[30%] max-w-0 px-4 py-2 font-normal">
                 <div class="flex items-center gap-1.5">
                   <button
                     v-if="children(row.key).length > 0"
@@ -213,15 +213,13 @@ const total = computed(() => props.report.totals.requests)
                 <div class="mt-1 ml-5 h-1 rounded-full bg-raised">
                   <div
                     class="h-1 rounded-full bg-blue-500/70"
-                    :style="{ width: `${Math.max((row.requests / Math.max(total, 1)) * 100, 1)}%` }"
+                    :style="{ width: `${Math.max((row.requests / total) * 100, 1)}%` }"
                   ></div>
                 </div>
               </th>
               <td class="px-2 py-2 text-right tabular-nums">
                 {{ integer(row.requests) }}
-                <span class="ml-1 text-gray-500">{{
-                  percent(row.requests / Math.max(total, 1), 0)
-                }}</span>
+                <span class="ml-1 text-gray-500">{{ percent(row.requests / total, 0) }}</span>
               </td>
               <td class="px-2 py-2 text-right tabular-nums" :class="rateTone(successRate(row))">
                 {{ percent(successRate(row)) }}
@@ -253,7 +251,7 @@ const total = computed(() => props.report.totals.requests)
                 :key="`${row.key}/${child.key}`"
                 class="bg-canvas/60 text-gray-400"
               >
-                <th scope="row" class="max-w-72 py-1.5 pr-4 pl-11 font-normal">
+                <th scope="row" class="w-[30%] max-w-0 py-1.5 pr-4 pl-11 font-normal">
                   <span v-tooltip="child.label" class="block truncate">{{ child.label }}</span>
                 </th>
                 <td class="px-2 py-1.5 text-right tabular-nums">

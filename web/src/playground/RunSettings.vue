@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
 import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n, type TranslationKey } from '@/i18n'
 import UiIcon from '@/playground/ui/UiIcon.vue'
 import UiSelect from '@/playground/ui/UiSelect.vue'
@@ -13,16 +13,19 @@ import RunSettingsFrame from './RunSettingsFrame.vue'
 import SafetyDialog from './SafetyDialog.vue'
 import SystemInstructions from './SystemInstructions.vue'
 import ThinkingBudgetSetting from './ThinkingBudgetSetting.vue'
-import { hasCode, thinkingLevelLabels, thinkingLevelTooltips } from './catalog'
+import { Capability, hasCode, thinkingLevelLabels, thinkingLevelTooltips } from './catalog'
 import { protocolOptions, protocolsFor, protocolSupports, type ProtocolSetting } from './protocols'
 import { defaultSettings, outputLimit, useCompare, usePlayground } from './session'
 import { useTools } from './tools'
 import type { ImageOutput, ImageQuality, MediaResolution } from './types'
+import type { Model } from '@/types'
 import type { IconName } from '@/playground/ui/icons'
 
 defineProps<{ open: boolean; narrow: boolean; title?: string | undefined }>()
 const emit = defineEmits<{ close: [] }>()
 const { t } = useI18n()
+const route = useRoute()
+const router = useRouter()
 const playground = usePlayground()
 const { session, currentModel } = playground
 const { panes, comparing, syncInstructions, setSync } = useCompare()
@@ -38,10 +41,42 @@ const schemaOpen = ref(false)
 const functionsOpen = ref(false)
 const codeOpen = ref(false)
 const stopDraft = ref('')
+const samplingPreset = ref('custom')
 
 const settings = computed(() => session.settings)
 const model = computed(() => currentModel.value)
 const can = (code: number) => hasCode(model.value, code)
+// samplingPresets 是一次设定温度、Top P 与 Top K 的采样组合
+const samplingPresets = [
+  { value: 'code', label: 'pg.samplingCode', temperature: 0.1, topP: 0.1, topK: 4 },
+  { value: 'balanced', label: 'pg.samplingBalanced', temperature: 1, topP: 0.95, topK: 64 },
+  { value: 'creative', label: 'pg.samplingCreative', temperature: 1.1, topP: 0.95, topK: 64 },
+] as const
+
+// applySamplingPreset 设置采样组合，温度不超过模型上限，自定义保留当前值
+function applySamplingPreset(value: string): void {
+  const preset = samplingPresets.find((item) => item.value === value)
+  if (preset) {
+    settings.value.temperature = Math.min(preset.temperature, model.value?.max_temperature ?? 1)
+    settings.value.topP = preset.topP
+    settings.value.topK = preset.topK
+  }
+  samplingPreset.value = value
+}
+
+watch(
+  [
+    settings,
+    () => settings.value.model,
+    () => settings.value.temperature,
+    () => settings.value.topP,
+    () => settings.value.topK,
+  ],
+  () => {
+    samplingPreset.value = 'custom'
+  },
+  { flush: 'sync' },
+)
 // supports 判断所选协议能否表达某项设置
 const supports = (setting: ProtocolSetting) => protocolSupports(settings.value.protocol, setting)
 // protocolTip 是所选协议不支持某项设置时的说明
@@ -61,7 +96,7 @@ const mediaResolutions: { value: MediaResolution; label: string }[] = [
   { value: 'MEDIA_RESOLUTION_HIGH', label: 'pg.high' },
 ]
 // imageModel 表示所选模型输出图片
-const imageModel = computed(() => can(21))
+const imageModel = computed(() => can(Capability.ImageRoute))
 // videoOptions 是 Omni 模型目录中的视频输出选项，没有视频任务的模型为 undefined
 const videoOptions = computed(() => {
   const options = model.value?.capability_options
@@ -91,10 +126,16 @@ const videoTaskLabels: Record<string, TranslationKey> = {
   extend: 'pg.videoTaskExtend',
 }
 
+// selectModel 切换对话模型，新对话与官网一样把模型写入地址
+function selectModel(model: Model): void {
+  playground.selectModel(model.id)
+  if (route.params.id === undefined)
+    void router.push({ query: { ...route.query, model: model.id } })
+}
+
 // setVideoDuration 设置视频时长，与默认值相同时不发送
 function setVideoDuration(value: number): void {
-  if (!videoOptions.value) return
-  const { min, max, initial } = videoOptions.value.duration
+  const { min, max, initial } = videoOptions.value!.duration
   const seconds = Math.min(max, Math.max(min, Math.round(value)))
   settings.value.videoDuration = seconds === initial ? null : seconds
 }
@@ -155,7 +196,7 @@ const systemSubtitle = computed(
 )
 // temperatureTooltip 是温度滑块的说明
 const temperatureTooltip = computed(() => {
-  if (can(27)) return t('pg.temperatureFixed')
+  if (can(Capability.FixedTemperature)) return t('pg.temperatureFixed')
   return /gemini-3/.test(model.value?.id ?? '')
     ? t('pg.temperatureGemini3')
     : t('pg.temperatureTip')
@@ -232,25 +273,27 @@ watch(schemaOpen, (open) => {
     :open="open"
     :narrow="narrow"
     :title="title"
+    :code-button="!comparing"
     @close="emit('close')"
     @code="codeOpen = true"
     @reset="reset"
   >
     <div class="field-group">
       <ModelCard
+        v-if="!comparing"
         :model="model"
         kind="chat"
         :has-content="session.turns.length > 0"
-        @select="playground.selectModel($event.id)"
+        @select="selectModel"
       />
       <div class="system-instructions-panel">
         <button
-          v-tooltip.left="can(8) ? '' : t('pg.systemUnsupported')"
+          v-tooltip.left="can(Capability.SystemInstruction) ? '' : t('pg.systemUnsupported')"
           type="button"
           class="settings-card system-instructions-card"
-          :class="{ 'disabled-interactive': !can(8) }"
+          :class="{ 'disabled-interactive': !can(Capability.SystemInstruction) }"
           :aria-label="t('pg.systemInstructions')"
-          @click="can(8) && (systemOpen = true)"
+          @click="can(Capability.SystemInstruction) && (systemOpen = true)"
         >
           <span class="title">{{ t('pg.systemInstructions') }}</span>
           <span class="subtitle">{{ systemSubtitle }}</span>
@@ -259,15 +302,22 @@ watch(schemaOpen, (open) => {
           v-if="comparing"
           v-tooltip.below="t('pg.syncInstructionsTip')"
           class="sync-button"
-          :class="{ disabled: !can(8) }"
+          :class="{ disabled: !can(Capability.SystemInstruction) }"
         >
-          <input
-            type="checkbox"
-            :checked="can(8) && syncInstructions"
-            :disabled="!can(8)"
-            :aria-label="t('pg.syncInstructions')"
-            @change="setSync(paneIndex, ($event.target as HTMLInputElement).checked)"
-          />
+          <span class="checkbox">
+            <input
+              type="checkbox"
+              :checked="can(Capability.SystemInstruction) && syncInstructions"
+              :disabled="!can(Capability.SystemInstruction)"
+              :aria-label="t('pg.syncInstructions')"
+              @change="setSync(paneIndex, ($event.target as HTMLInputElement).checked)"
+            />
+            <span class="checkbox-background" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path fill="none" d="M1.73,12.91 8.1,19.28 22.79,4.59" />
+              </svg>
+            </span>
+          </span>
           <span class="sync-checkbox-label">{{ t('pg.sync') }}</span>
         </label>
       </div>
@@ -354,10 +404,16 @@ watch(schemaOpen, (open) => {
       </div>
 
       <div
-        v-if="can(62) || (imageModel && (aspectRatios.length || imageSizes.length))"
+        v-if="
+          can(Capability.Temperature) || (imageModel && (aspectRatios.length || imageSizes.length))
+        "
         class="field-group"
       >
-        <div v-if="can(62)" v-tooltip.left="temperatureTooltip" class="settings-item-column">
+        <div
+          v-if="can(Capability.Temperature)"
+          v-tooltip.left="temperatureTooltip"
+          class="settings-item-column"
+        >
           <h3 class="item-description-title">{{ t('pg.temperature') }}</h3>
           <div class="ms-slider">
             <UiSlider
@@ -365,7 +421,7 @@ watch(schemaOpen, (open) => {
               :min="0"
               :max="model?.max_temperature ?? 1"
               :step="0.05"
-              :disabled="can(27)"
+              :disabled="can(Capability.FixedTemperature)"
               :label="t('pg.temperature')"
               @update:model-value="settings.temperature = $event"
             />
@@ -376,7 +432,7 @@ watch(schemaOpen, (open) => {
               :min="0"
               :max="model?.max_temperature ?? 1"
               step="0.05"
-              :disabled="can(27)"
+              :disabled="can(Capability.FixedTemperature)"
               :aria-label="t('pg.temperature')"
               :value="settings.temperature ?? model?.temperature ?? 1"
               @change="settings.temperature = numberInput($event)"
@@ -472,7 +528,10 @@ watch(schemaOpen, (open) => {
         </div>
       </div>
 
-      <div v-if="can(52) && model?.thinking_levels?.length" class="field-group">
+      <div
+        v-if="can(Capability.ThinkingLevel) && model?.thinking_levels?.length"
+        class="field-group"
+      >
         <div v-tooltip.left="t('pg.thinkingLevelTip')" class="settings-item-column">
           <h3 class="item-description-title">{{ t('pg.thinkingLevel') }}</h3>
           <UiSelect
@@ -494,7 +553,7 @@ watch(schemaOpen, (open) => {
           </UiSelect>
         </div>
       </div>
-      <div v-else-if="can(35)" class="field-group">
+      <div v-else-if="can(Capability.ThinkingBudget)" class="field-group">
         <ThinkingBudgetSetting
           v-model="settings.thinkingBudget"
           :config="model?.thinking_budget"
@@ -576,8 +635,22 @@ watch(schemaOpen, (open) => {
           <UiIcon name="chevronDown" :size="20" class="expand-icon" />
         </button>
         <template v-if="advancedOpen">
+          <div v-if="!can(Capability.FixedTemperature)" class="settings-item-column">
+            <h3 class="item-description-title">{{ t('pg.samplingPreset') }}</h3>
+            <UiSelect
+              :model-value="samplingPreset"
+              class="w-full"
+              :aria-label="t('pg.samplingPreset')"
+              @update:model-value="applySamplingPreset(String($event))"
+            >
+              <option value="custom">{{ t('pg.samplingCustom') }}</option>
+              <option v-for="preset in samplingPresets" :key="preset.value" :value="preset.value">
+                {{ t(preset.label) }}
+              </option>
+            </UiSelect>
+          </div>
           <div
-            v-if="can(43)"
+            v-if="can(Capability.MediaResolution)"
             v-tooltip.left="settingTip('mediaResolution', t('pg.mediaResolutionTip'))"
             class="settings-item-column"
           >
@@ -594,7 +667,7 @@ watch(schemaOpen, (open) => {
             </UiSelect>
           </div>
           <div
-            v-if="can(28)"
+            v-if="can(Capability.SafetySettings)"
             v-tooltip.left="settingTip('safety', t('pg.safetyTip'))"
             class="settings-item"
           >
@@ -611,7 +684,7 @@ watch(schemaOpen, (open) => {
             </button>
           </div>
           <div
-            v-if="can(63)"
+            v-if="can(Capability.StopSequences)"
             v-tooltip.left="settingTip('stopSequences', t('pg.stopTip'))"
             class="stop-sequences"
           >
@@ -648,7 +721,7 @@ watch(schemaOpen, (open) => {
             </div>
           </div>
           <div
-            v-if="can(64)"
+            v-if="can(Capability.MaxOutputTokens)"
             v-tooltip.left="t('pg.outputLengthTip')"
             class="settings-item output-length"
           >
@@ -664,29 +737,66 @@ watch(schemaOpen, (open) => {
               :value="settings.maxOutputTokens ?? outputLimit(model)"
               @change="setOutputLength"
             />
-            <p v-if="model?.capabilities?.output_continuation" class="output-length-hint">
+            <p v-if="model?.capabilities?.output_continuation" class="setting-hint">
               {{ t('pg.outputContinuation') }}
             </p>
           </div>
           <div
-            v-if="can(24)"
-            v-tooltip.left="settingTip('topK', t('pg.topKTip'))"
-            class="settings-item"
+            v-if="!can(Capability.Temperature)"
+            v-tooltip.left="t('pg.temperatureTip')"
+            class="settings-item-column"
           >
-            <h3 class="item-description-title">{{ t('pg.topK') }}</h3>
-            <input
-              ms-input
-              class="small number-input"
-              type="number"
-              min="1"
-              step="1"
-              :disabled="!supports('topK')"
-              :aria-label="t('pg.topK')"
-              :value="settings.topK"
-              @change="setTopK"
-            />
+            <h3 class="item-description-title">{{ t('pg.temperature') }}</h3>
+            <div class="ms-slider">
+              <UiSlider
+                :model-value="settings.temperature ?? model?.temperature ?? 1"
+                :min="0"
+                :max="model?.max_temperature ?? 1"
+                :step="0.05"
+                :label="t('pg.temperature')"
+                @update:model-value="settings.temperature = $event"
+              />
+              <input
+                ms-input
+                class="small slider-number-input"
+                type="number"
+                :min="0"
+                :max="model?.max_temperature ?? 1"
+                step="0.05"
+                :aria-label="t('pg.temperature')"
+                :value="settings.temperature ?? model?.temperature ?? 1"
+                @change="settings.temperature = numberInput($event)"
+              />
+            </div>
+            <p class="setting-hint">{{ t('pg.samplingIgnored') }}</p>
           </div>
-          <div v-if="can(23)" v-tooltip.left="t('pg.topPTip')" class="settings-item-column">
+          <div v-tooltip.left="settingTip('topK', t('pg.topKTip'))" class="settings-item-column">
+            <h3 class="item-description-title">{{ t('pg.topK') }}</h3>
+            <div class="ms-slider">
+              <UiSlider
+                :model-value="settings.topK ?? model?.top_k ?? 64"
+                :min="1"
+                :max="128"
+                :step="1"
+                :disabled="!supports('topK')"
+                :label="t('pg.topK')"
+                @update:model-value="settings.topK = $event"
+              />
+              <input
+                ms-input
+                class="small slider-number-input"
+                type="number"
+                min="1"
+                step="1"
+                :disabled="!supports('topK')"
+                :aria-label="t('pg.topK')"
+                :value="settings.topK ?? model?.top_k ?? 64"
+                @change="setTopK"
+              />
+            </div>
+            <p v-if="!can(Capability.TopK)" class="setting-hint">{{ t('pg.samplingIgnored') }}</p>
+          </div>
+          <div v-tooltip.left="t('pg.topPTip')" class="settings-item-column">
             <h3 class="item-description-title">{{ t('pg.topP') }}</h3>
             <div class="ms-slider">
               <UiSlider
@@ -709,6 +819,7 @@ watch(schemaOpen, (open) => {
                 @change="settings.topP = numberInput($event)"
               />
             </div>
+            <p v-if="!can(Capability.TopP)" class="setting-hint">{{ t('pg.samplingIgnored') }}</p>
           </div>
           <div v-if="videoOptions" class="settings-item-column">
             <h3 class="item-description-title">{{ t('pg.videoTask') }}</h3>
@@ -719,7 +830,7 @@ watch(schemaOpen, (open) => {
             >
               <option value="">{{ t('pg.videoTaskUnspecified') }}</option>
               <option v-for="task in videoOptions.tasks" :key="task" :value="task">
-                {{ t(videoTaskLabels[task] ?? 'pg.videoTaskUnspecified') }}
+                {{ t(videoTaskLabels[task]!) }}
               </option>
             </UiSelect>
           </div>
@@ -779,16 +890,66 @@ watch(schemaOpen, (open) => {
   justify-self: end;
   height: 40px;
   padding-right: 12px;
+  line-height: 17.5px;
   color: var(--color-run-settings-text);
   cursor: pointer;
 }
 
-.sync-button input {
+.checkbox {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+}
+
+.checkbox input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: inherit;
+}
+
+.checkbox-background {
+  display: flex;
   width: 18px;
   height: 18px;
-  margin: 11px;
-  accent-color: var(--color-v3-outline-accent);
-  cursor: inherit;
+  border: 2px solid var(--color-v3-outline);
+  border-radius: 2px;
+  pointer-events: none;
+  transition:
+    background-color 90ms cubic-bezier(0.4, 0, 0.6, 1),
+    border-color 90ms cubic-bezier(0.4, 0, 0.6, 1);
+}
+
+.checkbox-background svg {
+  width: 100%;
+  opacity: 0;
+  color: var(--mat-sys-on-primary);
+  stroke: currentColor;
+  stroke-width: 3.12px;
+}
+
+.checkbox input:checked + .checkbox-background {
+  border-color: var(--color-v3-text);
+  background-color: var(--color-v3-text);
+}
+
+.checkbox:hover input:checked + .checkbox-background {
+  border-color: var(--color-v3-text-var);
+  background-color: var(--color-v3-text-var);
+}
+
+.checkbox input:checked + .checkbox-background svg {
+  opacity: 1;
+}
+
+.checkbox input:disabled + .checkbox-background {
+  border-color: var(--color-v3-outline-var);
 }
 
 .sync-button.disabled {
@@ -797,8 +958,8 @@ watch(schemaOpen, (open) => {
 }
 
 .sync-checkbox-label {
-  font-size: 12px;
-  line-height: 16px;
+  padding-left: 4px;
+  font-size: 12.25px;
 }
 
 .protocol-setting {
@@ -947,15 +1108,11 @@ watch(schemaOpen, (open) => {
   flex-wrap: wrap;
 }
 
-.output-length-hint {
+.setting-hint {
   width: 100%;
   margin: 4px 0 0;
   color: var(--color-v3-text-var);
   font-size: 12px;
   line-height: 18px;
-}
-
-.number-input {
-  --ms-input-width: 80px;
 }
 </style>

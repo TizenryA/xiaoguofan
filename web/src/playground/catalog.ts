@@ -1,6 +1,41 @@
 import type { TranslationKey } from '@/i18n'
 import type { Model, ModelPrice, ThinkingLevel } from '@/types'
 
+// Capability 是官网模型目录 ListModels field 10 的主能力码，编号与服务端 internal/aistudio/models.go 的 capabilityNames 相同
+export const Capability = {
+  Chat: 1,
+  StructuredOutput: 6,
+  SystemInstruction: 8,
+  CodeExecution: 9,
+  FunctionDeclarations: 10,
+  GoogleSearch: 12,
+  URLContext: 13,
+  ImageGeneration: 19,
+  VideoRoute: 20,
+  ImageRoute: 21,
+  TopP: 23,
+  TopK: 24,
+  Thinking: 25,
+  LiveRoute: 26,
+  FixedTemperature: 27,
+  SafetySettings: 28,
+  ThinkingBudget: 35,
+  SpeechRoute: 37,
+  MediaResolution: 43,
+  SpeechTranslation: 46,
+  ThinkingLevel: 52,
+  MusicRoute: 53,
+  ImageSearch: 54,
+  GoogleMaps: 58,
+  Temperature: 62,
+  StopSequences: 63,
+  MaxOutputTokens: 64,
+  LiveMicrophone: 66,
+  LiveCamera: 67,
+  LiveScreen: 68,
+  InterimTranscription: 78,
+} as const
+
 // hasCode 返回模型是否带某个主能力码
 export function hasCode(model: Model | undefined, code: number): boolean {
   return model?.capabilities?.[`capability_code_${code}`] === true
@@ -13,7 +48,7 @@ export function hasCategory(model: Model, code: number): boolean {
 
 // isOmniModel 按官网规则判断 Omni 模型：属于分类 14 且带主能力码 1
 export function isOmniModel(model: Model | undefined): boolean {
-  return model !== undefined && hasCategory(model, 14) && hasCode(model, 1)
+  return model !== undefined && hasCategory(model, 14) && hasCode(model, Capability.Chat)
 }
 
 // ModelCategory 是模型选择面板的分类：Starred 为本机收藏，All 为全部，数字为官网分类码
@@ -61,13 +96,13 @@ export type Tool =
 
 // toolCodes 是各工具开关对应的模型能力码
 export const toolCodes: Record<Tool, number> = {
-  structured_output: 6,
-  code_execution: 9,
-  function_declarations: 10,
-  google_search: 12,
-  image_search: 54,
-  url_context: 13,
-  google_maps: 58,
+  structured_output: Capability.StructuredOutput,
+  code_execution: Capability.CodeExecution,
+  function_declarations: Capability.FunctionDeclarations,
+  google_search: Capability.GoogleSearch,
+  image_search: Capability.ImageSearch,
+  url_context: Capability.URLContext,
+  google_maps: Capability.GoogleMaps,
 }
 
 // toolCompatible 按官网规则判断工具能否在当前已开启工具旁开启：本身已开启，或已开启的每个工具都与它兼容；函数调用与结构化输出恒兼容
@@ -101,6 +136,13 @@ export const thinkingLevelTooltips: Partial<Record<ThinkingLevel, TranslationKey
   LOW: 'pg.thinkingLowTip',
   MEDIUM: 'pg.thinkingMediumTip',
   HIGH: 'pg.thinkingHighTip',
+}
+
+// modelMatches 返回地址中的模型 ID 是否为该模型的 ID 或目录别名
+export function modelMatches(model: Model, id: string | undefined): boolean {
+  return (
+    id !== undefined && (model.id === id || (model.capability_options?.aliases ?? []).includes(id))
+  )
 }
 
 // isChatModel 返回模型能否在 Playground 对话中使用，图片模型以图文输出参与对话
@@ -139,7 +181,7 @@ export function modelIcon(
   | 'modelAudio'
   | 'spark' {
   if (hasCategory(model, 3)) return 'modelGemma'
-  if (hasCode(model, 26)) return 'modelLive'
+  if (hasCode(model, Capability.LiveRoute)) return 'modelLive'
   if (hasCategory(model, 15)) return 'modelImage'
   if (hasCategory(model, 14)) return 'modelVideo'
   if (hasCategory(model, 16)) return 'modelMusic'
@@ -148,7 +190,7 @@ export function modelIcon(
 }
 
 // PriceLine 是模型卡片中的一行价格：tooltip 为分档价格的计价说明，link 为整句说明后的价格页链接
-export interface PriceLine {
+interface PriceLine {
   text: string
   tooltip?: string
   link?: string
@@ -174,16 +216,16 @@ function priceLabel(
   index: number,
   t: (key: TranslationKey) => string,
 ): string {
-  const row = pricing[index]
-  if (row?.label) return row.label
+  const row = pricing[index]!
+  if (row.label) return row.label
   if (pricing.length === 1) return t('pg.allContextLengths')
   if (pricing.some((item) => item.thinking))
-    return row?.thinking ? t('pg.priceThinking') : t('pg.priceNonThinking')
+    return row.thinking ? t('pg.priceThinking') : t('pg.priceNonThinking')
   const tokens = (value: number | undefined) =>
     t('pg.tokens').replace('{count}', compactTokens(value ?? 0))
-  if (index === 0) return `<=${tokens(row?.up_to)}`
-  const previous = tokens(pricing[index - 1]?.up_to)
-  return index === pricing.length - 1 ? `> ${previous}` : `> ${previous} <= ${tokens(row?.up_to)}`
+  if (index === 0) return `<=${tokens(row.up_to)}`
+  const previous = tokens(pricing[index - 1]!.up_to)
+  return index === pricing.length - 1 ? `> ${previous}` : `> ${previous} <= ${tokens(row.up_to)}`
 }
 
 // priceLines 按官网规则把模型价格整理为卡片中的价格说明
@@ -219,13 +261,12 @@ export function priceLines(model: Model, t: (key: TranslationKey) => string): Pr
 export function modelBadges(
   model: Model,
   category: ModelCategory,
-  now = Date.now(),
 ): ('Confidential' | 'New' | 'Paid')[] {
   const badges: ('Confidential' | 'New' | 'Paid')[] = []
   if (hasCategory(model, 5) && category !== 5) badges.push('Confidential')
   const released = model.details?.release_date
   if (released !== undefined) {
-    const days = (now - released * 1000) / 86_400_000
+    const days = (Date.now() - released * 1000) / 86_400_000
     if (days <= (hasCategory(model, 10) ? 60 : 10)) badges.push('New')
   }
   if (model.paid) badges.push('Paid')

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -140,6 +141,17 @@ type RequestAttempt struct {
 	Channel    string `json:"channel"`
 	Error      string `json:"error"`
 	DurationMS int64  `json:"duration_ms"`
+	// Hedge 表示首事件超时后发起的备用请求，Superseded 表示另一方先返回首事件后被取消
+	Hedge      bool `json:"hedge,omitempty"`
+	Superseded bool `json:"superseded,omitempty"`
+}
+
+// FirstEventLatency 是一个模型与通道近期原请求首事件等待的 p95 与样本数
+type FirstEventLatency struct {
+	Model   string `json:"model"`
+	Channel string `json:"channel"`
+	Samples int    `json:"samples"`
+	P95MS   int64  `json:"p95_ms"`
 }
 
 // UsageRecordQuery 选择请求记录的时间范围、筛选、状态码、关键字与分页位置
@@ -244,18 +256,12 @@ func autoUsageBucket(span time.Duration) time.Duration {
 }
 
 // parseUsageRange 读取 from 与 to，校验先后顺序与最长范围
-func parseUsageRange(values map[string][]string) (time.Time, time.Time, error) {
-	get := func(name string) string {
-		if list := values[name]; len(list) > 0 {
-			return list[0]
-		}
-		return ""
-	}
-	from, err := time.Parse(time.RFC3339, get("from"))
+func parseUsageRange(values url.Values) (time.Time, time.Time, error) {
+	from, err := time.Parse(time.RFC3339, values.Get("from"))
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("from 必须是 RFC 3339 时间")
 	}
-	to, err := time.Parse(time.RFC3339, get("to"))
+	to, err := time.Parse(time.RFC3339, values.Get("to"))
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("to 必须是 RFC 3339 时间")
 	}
@@ -463,11 +469,7 @@ func requestBodyMiddleware(ledger RequestLedger, next http.Handler) http.Handler
 		request, response := &bodyCapture{}, &bodyCapture{}
 		r.Body = &captureReader{ReadCloser: r.Body, capture: request}
 		next.ServeHTTP(&captureWriter{ResponseWriter: w, capture: response}, r)
-		metadata, ok := r.Context().Value(accessLogContextKey{}).(*accessLogMetadata)
-		if !ok {
-			return
-		}
-		body := RequestBody{ID: metadata.id(), Time: time.Now().UTC()}
+		body := RequestBody{ID: r.Context().Value(accessLogContextKey{}).(*accessLogMetadata).id(), Time: time.Now().UTC()}
 		body.Request, body.RequestSize = request.result()
 		body.Response, body.ResponseSize = response.result()
 		ledger.SaveBody(body)

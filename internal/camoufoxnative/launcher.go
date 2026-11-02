@@ -37,8 +37,10 @@ type browserProcess struct {
 	profile string
 	lock    *flock.Flock
 	tree    browserTree
-	mu      sync.Mutex
-	closed  bool
+	// cacheDirectory 为账户缓存目录，浏览器退出后把 profile 的启动缓存存回这里
+	cacheDirectory string
+	mu             sync.Mutex
+	closed         bool
 }
 
 // launchBrowser 启动 Camoufox 并返回原生 WebDriver BiDi 端点
@@ -46,8 +48,10 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 	if _, err := os.Stat(options.ExecutablePath); err != nil {
 		return nil, "", fmt.Errorf("Camoufox 不可用: %w", err)
 	}
+	config = maps.Clone(config)
+	// voices:blockIfNotDefined 为 true 时语音列表只含指纹中的语音，不加入主机语音
+	config["voices:blockIfNotDefined"] = true
 	if runtime.GOOS != "windows" {
-		config = maps.Clone(config)
 		config["AudioContext:maxChannelCount"] = windowsAudioChannels
 		config["AudioContext:sampleRate"] = windowsAudioSampleRate
 		fonts := fontList(config["fonts"])
@@ -86,6 +90,8 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 	}
 	if options.Headless && !options.liveView {
 		prefs["layout.frame_rate"] = headlessFrameRate
+		// gfx.webrender.enable-subpixel-aa 为 false 时 WebRender 把字形光栅化到单通道图集，不分配 RGBA 字形图集
+		prefs["gfx.webrender.enable-subpixel-aa"] = false
 	}
 	if options.CacheDirectory != "" {
 		for key, value := range cachePreferences(options.CacheDirectory) {
@@ -100,8 +106,17 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		maps.Copy(prefs, windowsFontData.Prefs)
 	}
 	if runtime.GOOS == "darwin" {
+		if err := addWindowsSubstituteNames(filepath.Join(filepath.Dir(filepath.Dir(options.ExecutablePath)), "Resources", "fonts")); err != nil {
+			_ = removeProfile(profile, profileLock)
+			return nil, "", err
+		}
 		// gfx.font_loader.delay 为 0 时 Firefox 同步加载本地化与带字重的字体族名
 		prefs["gfx.font_loader.delay"] = 0
+		if !options.Headless {
+			// layers.gpu-process.enabled 为 false 时由注册了随包字体的主进程绘制窗口，webgl.allow-in-parent 让 WebGL 随之在主进程运行
+			prefs["layers.gpu-process.enabled"] = false
+			prefs["webgl.allow-in-parent"] = true
+		}
 	}
 	if runtime.GOOS == "linux" {
 		fontconfig, err := windowsFontconfig(options.ExecutablePath, profile)
@@ -123,6 +138,15 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 	if err := writeUserJS(profile, prefs); err != nil {
 		_ = removeProfile(profile, profileLock)
 		return nil, "", err
+	}
+	// Camoufox 的临时目录指向自身 profile
+	environment = append(environment, "TMP="+profile, "TEMP="+profile, "TMPDIR="+profile)
+	if options.Headless && !options.liveView {
+		// MOZ_REMOTE_ALLOW_SYSTEM_ACCESS 让 WebDriver BiDi 访问浏览器界面层，Worker 由此停止标签页的图层绘制
+		environment = append(environment, "MOZ_REMOTE_ALLOW_SYSTEM_ACCESS=1")
+	}
+	if options.CacheDirectory != "" {
+		restoreStartupCache(options.CacheDirectory, profile)
 	}
 
 	arguments := []string{"--remote-debugging-port=0"}
@@ -157,11 +181,12 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		return nil, "", fmt.Errorf("绑定 Camoufox 进程: %w", err)
 	}
 	process := &browserProcess{
-		command: command,
-		done:    make(chan struct{}),
-		profile: profile,
-		lock:    profileLock,
-		tree:    tree,
+		command:        command,
+		done:           make(chan struct{}),
+		profile:        profile,
+		lock:           profileLock,
+		tree:           tree,
+		cacheDirectory: options.CacheDirectory,
 	}
 	launched = true
 	go func() {
@@ -178,8 +203,10 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		close(process.done)
 	}()
 	endpoints := make(chan string, 2)
-	go scanBrowserOutput(stdout, options.Log, endpoints)
-	go scanBrowserOutput(stderr, options.Log, endpoints)
+	output := &browserOutput{}
+	var scanned sync.WaitGroup
+	scanned.Go(func() { scanBrowserOutput(stdout, options.Log, endpoints, output) })
+	scanned.Go(func() { scanBrowserOutput(stderr, options.Log, endpoints, output) })
 	timeout := options.ReadyTimeout
 	if timeout <= 0 {
 		timeout = 45 * time.Second
@@ -194,10 +221,11 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		err := process.waitErr
 		process.mu.Unlock()
 		_ = process.Close()
+		scanned.Wait()
 		if err == nil {
 			err = errors.New("Camoufox 在报告 BiDi 端点前退出")
 		}
-		return nil, "", err
+		return nil, "", output.exitError(err)
 	case <-timer.C:
 		_ = process.Close()
 		return nil, "", fmt.Errorf("等待 Camoufox BiDi 端点超时: %s", timeout)
@@ -233,6 +261,9 @@ func (process *browserProcess) close(timeout time.Duration, terminate browserPro
 	case <-closeCtx.Done():
 		closeErr = errors.Join(closeErr, fmt.Errorf("等待 Camoufox 进程退出: %w", closeCtx.Err()))
 	}
+	if closeErr == nil && process.cacheDirectory != "" {
+		saveStartupCache(process.profile, process.cacheDirectory)
+	}
 	closeErr = errors.Join(closeErr, removeProfile(process.profile, process.lock))
 	if closeErr != nil {
 		return closeErr
@@ -244,11 +275,53 @@ func (process *browserProcess) close(timeout time.Duration, terminate browserPro
 	return nil
 }
 
-func scanBrowserOutput(reader io.Reader, mirror io.Writer, endpoints chan<- string) {
+// browserOutput 保存 Camoufox 最近输出的行，进程在报告 BiDi 端点前退出时写入错误
+type browserOutput struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+// browserOutputLines 是退出错误中保留的输出行数
+const browserOutputLines = 20
+
+// missingLibrary 匹配动态链接器报告缺少的共享库名
+var missingLibrary = regexp.MustCompile(`([^\s:]+\.so[^\s:]*): cannot open shared object file`)
+
+func (output *browserOutput) add(line string) {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	output.lines = append(output.lines, line)
+	if len(output.lines) > browserOutputLines {
+		output.lines = output.lines[1:]
+	}
+}
+
+// exitError 在 err 后附上 Camoufox 最近的输出，输出报告缺少系统运行库时写明库名
+func (output *browserOutput) exitError(err error) error {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	if len(output.lines) == 0 {
+		return err
+	}
+	text := strings.Join(output.lines, "\n")
+	var libraries []string
+	for _, match := range missingLibrary.FindAllStringSubmatch(text, -1) {
+		if !slices.Contains(libraries, match[1]) {
+			libraries = append(libraries, match[1])
+		}
+	}
+	if len(libraries) > 0 {
+		return fmt.Errorf("Camoufox 缺少系统运行库 %s，安装提供这些库的系统包后重试（%w）：%s", strings.Join(libraries, "、"), err, text)
+	}
+	return fmt.Errorf("Camoufox 在报告 BiDi 端点前退出（%w）：%s", err, text)
+}
+
+func scanBrowserOutput(reader io.Reader, mirror io.Writer, endpoints chan<- string, output *browserOutput) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
+		output.add(line)
 		if mirror != nil {
 			_, _ = fmt.Fprintln(mirror, line)
 		}
@@ -287,6 +360,12 @@ const windowsChromeHeight = 57
 
 // windowsStorageLimit 为使站点存储配额取 Firefox 上限 10 GiB 的全局存储上限，单位 KB
 const windowsStorageLimit = 50 << 20
+
+// hostChromeHeight 为 macOS 与 Linux 版 Camoufox 窗口中浏览器界面占用的高度
+const hostChromeHeight = 51
+
+// windowsWindowPosition 为 Windows 版按 browser.xhtml 的 screenX、screenY 放置主窗口的坐标
+const windowsWindowPosition = 4
 
 // windowsFontconfig 在 profile 中写入只加载 Camoufox 发行包 Windows 字体并带 Windows 字体替换表的 fontconfig 配置并返回其路径
 func windowsFontconfig(executablePath string, profile string) (string, error) {
@@ -370,6 +449,17 @@ func firefoxPreferences(proxyValue, bypass string) (map[string]any, error) {
 		"devtools.debugger.remote-enabled":  true,
 		"browser.shell.checkDefaultBrowser": false,
 		"webgl.force-enabled":               true,
+		// extensions.webextensions.remote 为 false 时内置扩展在主进程运行，不单独启动扩展进程
+		"extensions.webextensions.remote": false,
+		// network.process.enabled 为 false 时网络在主进程运行，不单独启动 socket 进程
+		"network.process.enabled": false,
+		// media.rdd-process.enabled 与 media.utility-process.enabled 为 false 时不单独启动 rdd 与媒体 utility 进程
+		"media.rdd-process.enabled":     false,
+		"media.utility-process.enabled": false,
+		// javascript.options.mem.nursery.max_kb 为 SpiderMonkey 新生代的上限
+		"javascript.options.mem.nursery.max_kb": 4096,
+		// gfx.webrender.max-shared-surface-size 为 WebRender 共享渲染目标的边长上限
+		"gfx.webrender.max-shared-surface-size": 512,
 	}
 	proxyValue = strings.TrimSpace(proxyValue)
 	if proxyValue == "" {

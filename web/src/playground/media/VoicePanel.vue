@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
 import {
   DropdownMenuContent,
   DropdownMenuItem,
@@ -10,16 +9,18 @@ import {
 import { computed, ref, watch } from 'vue'
 import { useI18n } from '@/i18n'
 import type { TranslationKey } from '@/i18n'
+import { readPreference, writePreference } from '@/preference'
 import type { VoiceDetail } from '@/types'
 import UiIcon from '@/playground/ui/UiIcon.vue'
 import UiSlidingPanel from '@/playground/ui/UiSlidingPanel.vue'
 import StyleDropdown from './StyleDropdown.vue'
 import { useSamplePlayer } from './sample'
 import { accentOptions, paceOptions, useSpeech, type StylePreset } from './speech'
+import { voiceTraits } from './speech-voices'
 
 const open = defineModel<boolean>('open', { required: true })
 const props = defineProps<{ speaker: number }>()
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const speech = useSpeech()
 const { state, voices, daikon, styles } = speech
 const { playingSample, loadingSample, toggleSample, stopSample } = useSamplePlayer()
@@ -45,16 +46,9 @@ const filters = ref<Record<FilterKey, string>>({
 })
 // drill 是展开查看全部的分组
 const drill = ref('')
-const favorites = ref(new Set<string>(loadFavorites()))
-
-// loadFavorites 读取本浏览器收藏的音色
-function loadFavorites(): string[] {
-  try {
-    return JSON.parse(localStorage.getItem('aistudio2api.voice-favorites') ?? '[]') as string[]
-  } catch {
-    return []
-  }
-}
+// favoritesKey 是本浏览器收藏音色的偏好键
+const favoritesKey = 'aistudio2api.voice-favorites'
+const favorites = ref(new Set(readPreference<string[]>(favoritesKey, [], Array.isArray)))
 
 // toggleFavorite 收藏或取消收藏音色
 function toggleFavorite(name: string): void {
@@ -62,20 +56,12 @@ function toggleFavorite(name: string): void {
   if (next.has(name)) next.delete(name)
   else next.add(name)
   favorites.value = next
-  try {
-    localStorage.setItem('aistudio2api.voice-favorites', JSON.stringify([...next]))
-  } catch {
-    // 浏览器禁用存储时收藏只在本页有效
-  }
+  writePreference(favoritesKey, [...next])
 }
 
-// languageName 返回语言区域的显示名称
-function languageName(locale: string): string {
-  try {
-    return new Intl.DisplayNames([navigator.language], { type: 'language' }).of(locale) ?? locale
-  } catch {
-    return locale
-  }
+// languageName 返回语言区域在界面语言下的显示名称
+function languageName(code: string): string {
+  return new Intl.DisplayNames([locale.value], { type: 'language' }).of(code) ?? code
 }
 
 // optionLabel 返回筛选值的显示文字
@@ -90,9 +76,7 @@ function filterOptions(key: FilterKey): string[] {
 
 // subtitle 与官网一致把描述与音高合为一行
 function subtitle(voice: VoiceDetail): string {
-  const items = [...(voice.descriptions ?? [])]
-  if (voice.pitch) items.push(`${voice.pitch} pitch`)
-  return items.join(' · ')
+  return voiceTraits(voice).join(' · ')
 }
 
 const filtering = computed(
@@ -133,7 +117,7 @@ const groups = computed(() => {
     result.push({
       id,
       title: key || t('pg.otherVoices'),
-      voices: drill.value === id || id === 'favorites' ? list : list.slice(0, 3),
+      voices: drill.value === id ? list : list.slice(0, 3),
       total: list.length,
     })
   }
@@ -192,9 +176,11 @@ watch(open, (value) => {
               >
                 <span class="chip-label">
                   {{
-                    (field === 'pace' ? paceOptions : accentOptions).find(
-                      (option) => option.value === current[field],
-                    )?.label ?? (field === 'pace' ? t('pg.pace') : t('pg.accent'))
+                    t(
+                      (field === 'pace' ? paceOptions : accentOptions).find(
+                        (option) => option.value === current[field],
+                      )?.label ?? (field === 'pace' ? 'pg.pace' : 'pg.accent'),
+                    )
                   }}
                 </span>
                 <UiIcon name="arrowDropDown" :size="18" />
@@ -208,16 +194,16 @@ watch(open, (value) => {
               >
                 <DropdownMenuItem
                   v-for="option in field === 'pace' ? paceOptions : accentOptions"
-                  :key="option.label"
+                  :key="option.value"
                   class="ms-menu-item attribute-menu-item"
                   :class="{ selected: current[field] === option.value }"
                   @select="chooseOption(field, option)"
                 >
-                  <span v-if="field === 'pace'" class="preset-option">
-                    <span class="preset-label">{{ option.label }}</span>
-                    <span class="preset-description">{{ option.value }}</span>
+                  <span v-if="option.description" class="preset-option">
+                    <span class="preset-label">{{ t(option.label) }}</span>
+                    <span class="preset-description">{{ t(option.description) }}</span>
                   </span>
-                  <template v-else>{{ option.label }}</template>
+                  <template v-else>{{ t(option.label) }}</template>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenuPortal>

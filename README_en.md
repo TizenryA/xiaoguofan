@@ -14,10 +14,10 @@
 </p>
 
 <p>
-  Playground + Build Dual Quota Channels &nbsp;•&nbsp;
+  Playground Generation Channel &nbsp;•&nbsp;
   Build Code Assistant Chat Channel &nbsp;•&nbsp;
   High-Concurrency Multi-Account<br>
-  Camoufox and Pure Go WAA Backends &nbsp;•&nbsp;
+  Camoufox and SpiderMonkey WAA Backends &nbsp;•&nbsp;
   Claude Code, Codex, and Other Agent Clients &nbsp;•&nbsp;
   Nano Banana, Veo, TTS, and Omni
 </p>
@@ -26,31 +26,55 @@
 
 <table>
   <tr>
-    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/accounts-dark.webp"><img src="docs/images/accounts-light.webp" alt="Accounts"></picture><br><b>Accounts</b>: Tier, egress and state of every account; add, sign in and refresh from here</td>
-    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/usage-dark.webp"><img src="docs/images/usage-light.webp" alt="Usage"></picture><br><b>Usage</b>: Requests, success rate, tokens, estimated cost and first-token latency, filtered by model, account or channel</td>
-    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/logs-dark.webp"><img src="docs/images/logs-light.webp" alt="Logs"></picture><br><b>Logs</b>: Model, account, tokens, speed and first-token time of every request</td>
+    <td width="33%" valign="top"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/accounts-dark.webp"><img src="docs/images/accounts-light.webp" alt="Accounts"></picture><br><b>Accounts</b><br>Tier, state</td>
+    <td width="33%" valign="top"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/usage-dark.webp"><img src="docs/images/usage-light.webp" alt="Usage"></picture><br><b>Usage</b><br>Cost, latency</td>
+    <td width="33%" valign="top"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/logs-dark.webp"><img src="docs/images/logs-light.webp" alt="Logs"></picture><br><b>Logs</b><br>Per request</td>
   </tr>
   <tr>
-    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/models-dark.webp"><img src="docs/images/models-light.webp" alt="Model catalog"></picture><br><b>Model catalog</b>: Models and capabilities merged from each account’s live catalog</td>
-    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/settings-dark.webp"><img src="docs/images/settings-light.webp" alt="Settings"></picture><br><b>Settings</b>: Every <code>.env</code> option can be changed in the UI</td>
-    <td width="33%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/image-dark.webp"><img src="docs/images/image-light.webp" alt="Image generation"></picture><br><b>Image generation</b>: Nano Banana text-to-image and editing with the same run settings as AI Studio</td>
+    <td width="33%" valign="top"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/models-dark.webp"><img src="docs/images/models-light.webp" alt="Models"></picture><br><b>Models</b><br>Live catalog</td>
+    <td width="33%" valign="top"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/settings-dark.webp"><img src="docs/images/settings-light.webp" alt="Settings"></picture><br><b>Settings</b><br>All options</td>
+    <td width="33%" valign="top"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/image-dark.webp"><img src="docs/images/image-light.webp" alt="Images"></picture><br><b>Images</b><br>Create, edit</td>
   </tr>
   <tr>
-    <td colspan="3"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/chat-dark.webp"><img src="docs/images/chat-light.webp" alt="API playground: chat with thinking, math tables and code blocks" width="100%"></picture><br><b>API playground</b>: The AI Studio chat page with thinking, math tables and code blocks</td>
+    <td colspan="3" valign="top"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/chat-dark.webp"><img src="docs/images/chat-light.webp" alt="API playground" width="100%"></picture><br><b>API playground</b><br>AI Studio chat with thinking and code</td>
   </tr>
 </table>
 
 **Get started in three steps**: download a [release](https://github.com/Mag1cFall/AIStudio2API/releases) and launch it → add a Google account on the Accounts page → click "Start service" and use `http://127.0.0.1:2048` as the Base URL of your OpenAI, Anthropic or Gemini client
 
+## 🧩 The Google proxy family
+
+The three projects connect to AI Studio, the Gemini web app and Antigravity, and serve their models through OpenAI, Anthropic and Gemini compatible APIs for Agent clients such as Claude Code and Codex and for chat front ends such as SillyTavern.
+
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <p align="center"><a href="https://github.com/Mag1cFall/AIStudio2API"><img src="build/appicon.png" width="72" alt="AIStudio2API"></a><br>
+      <a href="https://github.com/Mag1cFall/AIStudio2API"><b>AIStudio&shy;2API</b></a></p>
+      Camou&shy;fox or in-process Spider&shy;Monkey generates the official WAA proof, so accounts chat as on the website
+    </td>
+    <td width="33%" valign="top">
+      <p align="center"><a href="https://github.com/Mag1cFall/Gemini-Web2API"><img src="https://raw.githubusercontent.com/Mag1cFall/Gemini-Web2API/main/internal/desktop/icon.png" width="72" alt="Gemini-Web2API"></a><br>
+      <a href="https://github.com/Mag1cFall/Gemini-Web2API"><b>Gemini-Web&shy;2API</b></a></p>
+      Imports accounts from the local Chrome in one click and runs on plain HTTP, with a guest session when signed out
+    </td>
+    <td width="33%" valign="top">
+      <p align="center"><a href="https://github.com/Mag1cFall/Antigravity2API"><img src="https://raw.githubusercontent.com/Mag1cFall/Antigravity2API/main/internal/desktop/icon.png" width="72" alt="Antigravity2API"></a><br>
+      <a href="https://github.com/Mag1cFall/Antigravity2API"><b>Antigravity&shy;2API</b></a></p>
+      Emulates only the official Windows client, matching TLS, request envelope and companion requests field by field
+    </td>
+  </tr>
+</table>
+
 ---
 
 ## Core Capabilities
 
-- **Dual Quota Channels**: Every account has separate Playground and Build app proxy quotas, and `UPSTREAM_CHANNELS` enables either or both; when one channel hits its limit, the same account continues on the other
-- **Build Chat Models**: Every model selectable in the Build chat panel is also listed as `<model>-build` (for example `gemini-3.8-flash-build`), answered by the Build code assistant with its system prompt and billed to the Build chat quota (free requests or the Google AI subscription). ⚠️ Every request to these models carries the Build code assistant's own injected system prompt, which shapes the answer's style, format, and persona; evaluate whether that fits your use
+- **Dual Channels**: Every account generates through the Playground; the Build app proxy is the legacy channel whose generation upstream has disabled for accounts (`PROXY_GENERATION_DISABLED`), off by default and enabled in `UPSTREAM_CHANNELS`; once enabled, generation requests sent through Build return the upstream reason; on free accounts both channels share one daily request count per model
+- **Build Chat Models**: Every model selectable in the Build chat panel is also listed as `<model>-build` (for example `gemini-3.8-flash-build`), answered by the Build code assistant with its system prompt, with function calling, tool-result continuation, and Google Search, and billed to the Build chat quota (free requests or the Google AI subscription). ⚠️ Every request to these models carries the Build code assistant's own injected system prompt, which shapes the answer's style, format, and persona; evaluate whether that fits your use
 - **High-Concurrency Multi-Account**: Detects Free, Pro, Ultra, and Plus benefits and routes across accounts by the live model catalog with round-robin or fill-first
-- **Two WAA Backends**: Camoufox holds the official WAA lifecycle by default; with `WAA_BACKEND=go`, pure Go generates the official proof and no browser is downloaded or launched at runtime
-- **Four API Protocols**: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent; Responses supports context compaction through `/v1/responses/compact` and `compaction` and `compaction_trigger` input items
+- **Two WAA Backends**: Camoufox holds the official WAA lifecycle by default; with `WAA_BACKEND=spidermonkey`, SpiderMonkey (the Firefox JavaScript engine) generates the official proof inside the service process and no browser is downloaded or launched at runtime
+- **Four API Protocols**: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent; Responses supports context compaction through `/v1/responses/compact` and `compaction` and `compaction_trigger` input items, and Anthropic Messages supports `context_management` tool-result and thinking clearing and threshold compaction
 - **Mainstream Agent Clients**: Works with Claude Code, Codex, OpenCode, pi, omp, OpenClaw, and Hermes, including file read and write tool calls; native web search works in Claude Code, Codex, and omp
 
 ## Features
@@ -59,26 +83,27 @@
 - **Function Tools**: Tool calls, continuation, selection, and strict argument validation across all four protocols, including union types and open parameter schemas
 - **TTS Speech Generation**: Gemini TTS models for single-speaker and multi-speaker audio
 - **Image Generation**: Nano Banana image generation
-- **Video Generation**: Veo video generation and image-to-video; Gemini Omni accepts text, image, and video input and returns text and MP4 video through the four generation APIs
+- **Video Generation**: Veo video generation and image-to-video, with video tasks generated by Gemini Omni when the catalog has no Veo model; Gemini Omni accepts text, image, and video input and returns text and MP4 video through the four generation APIs
 - **Deep Research**: Pro and Ultra accounts can run Deep Research through the four generation APIs and the Interactions `agent` field, returning the research process, a cited report, and charts
-- **YouTube Input**: Paste a video URL to attach and read the external video
+- **YouTube Input**: YouTube video URLs are read as external video attachments; with `YOUTUBE_LINKS` enabled, YouTube links in message text are read as video too
+- **Video Understanding Controls**: Gemini and Interactions support per-video start/end offsets, sampling rates greater than 0 and up to 24 FPS, and static/agentic processing; agentic results preserve server-side processing steps and conversation history
 - **Smart Model Switching**: Discover models from AI Studio and route through the `model` field
 - **Google Tools**: Search, Image Search, URL Context, Code Execution, and Maps
 - **Files and Transcribe**: File upload, metadata, content, deletion, and audio transcription
 - **Live and Robotics**: WebSocket text, audio, JPEG images, media end, tool calls, resumption, and interruption
 - **Anti-Fingerprinting**: Camoufox holds the official WAA lifecycle with a stable browser fingerprint and network exit per account
-- **GUI Launcher**: Manage accounts, service controls, live logs, models, requests, usage statistics, and configuration in the web UI, with dark and light color themes
+- **GUI Launcher**: Manage accounts, service controls, live logs, models, requests, usage statistics, and configuration in the web UI, with dark and light color themes and seven languages: 简体中文, 繁體中文, English, 日本語, 한국어, Français, and Deutsch
 - **Desktop App**: Windows, macOS, and Linux desktop apps show the management UI in a window and keep running in the system tray after the window is closed
 - **Online Update**: The Version page shows the latest release and its notes; the Windows and macOS desktop apps and the Linux and macOS command-line builds download, verify, and restart into the new version in one click, while the Linux desktop app points to the new installer
 - **Modular Architecture**: Go handles protocols, scheduling, APIs, and management; Camoufox hosts WAA and isolated login
 
 ## System Requirements
 
-- **Windows Release Runtime**: Windows 10 or later; on systems without the WebView2 Runtime, the desktop app opens the management UI in the default browser
+- **Windows Release Runtime**: Windows 10 or later; on systems without the WebView2 Runtime, the desktop app asks whether to download it from Microsoft and installs it with the Microsoft installer showing its progress, then opens its window; if you cancel or the installation fails, it opens the management UI in the default browser
 - **macOS Desktop App**: macOS 12 or later, universal for Apple silicon and Intel
 - **Linux Desktop App**: GTK 4 and WebKitGTK 6.0, such as Ubuntu 24.04, Debian 13, or later; the deb installs these and the Camoufox libraries, while the AppImage also needs the Camoufox libraries listed on the next line
 - **Linux Release Runtime**: Extract `linux-amd64.tar.gz` and run `./aistudio2api`; Camoufox needs the Firefox system libraries, on Debian/Ubuntu run `sudo apt install libgtk-3-0 libasound2 libnss3 libdbus-glib-1-2 libxtst6 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxfixes3 xvfb`
-- **Source Build**: Go 1.26.0+, Node.js 22.18+, 24.11+, or 26+, and its bundled npm
+- **Source Build**: Go 1.27+, Node.js 22.18+, 24.11+, or 26+, and its bundled npm; a C/C++ compiler: the UCRT clang from [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases) on Windows, Xcode Command Line Tools on macOS, [Zig](https://ziglang.org/download/) 0.16 on Linux; the SpiderMonkey static library for the platform from [Mag1cFall/firefox Releases](https://github.com/Mag1cFall/firefox/releases)
 - **Operating System**: Windows, macOS, Linux
 - **Memory**: 2GB+ available memory for one account; each resident prewarmed account adds about 0.6GB
 - **Network**: Stable internet connection to Google AI Studio
@@ -90,7 +115,7 @@
 Download the `windows-amd64.zip` package from [Releases](https://github.com/Mag1cFall/AIStudio2API/releases), extract it, and double-click `aistudio2api.exe`:
 
 - The management UI opens in a desktop window; on first launch the window shows a startup screen until Camoufox finishes downloading
-- Closing the window keeps the app running in the system tray; the tray menu shows the window, opens the management UI in the browser, or quits
+- Closing the window keeps the app running in the system tray: double-click the tray icon to show the window and right-click it for the tray menu; the menu shows the window, opens the management UI in the browser, turns start at login on or off, or quits
 - Double-clicking `aistudio2api.exe` again brings back the running window
 
 To start from source:
@@ -103,9 +128,18 @@ cd web
 npm ci
 npm run build
 cd ..
+mkdir spidermonkey
+curl.exe -L -o spidermonkey\windows.tar.gz https://github.com/Mag1cFall/firefox/releases/download/v152.0.4-aistudio2api.1/spidermonkey-v152.0.4-aistudio2api.1-windows-amd64.tar.gz
+tar -xzf spidermonkey\windows.tar.gz -C spidermonkey
+$env:CC = "x86_64-w64-mingw32-clang"
+$env:CXX = "x86_64-w64-mingw32-clang++"
+$env:CGO_CXXFLAGS = "-I$PWD\spidermonkey\include"
+$env:CGO_LDFLAGS = "-L$PWD\spidermonkey\lib"
 go build -o aistudio2api.exe ./cmd/aistudio2api
 .\aistudio2api.exe
 ```
+
+`x86_64-w64-mingw32-clang` comes from the llvm-mingw `ucrt-x86_64` package; add its `bin` directory to `PATH` after extracting it.
 
 The first launch downloads Camoufox for the current platform to `runtime/camoufox/`:
 
@@ -140,8 +174,9 @@ Run `setup` and other commands with the desktop executable in a terminal, such a
 
 #### 1. Install Dependencies
 
-- Go 1.26.0 or later
+- Go 1.27 or later
 - Node.js 22.18+, 24.11+, or 26+, with its bundled npm
+- A C/C++ compiler: Xcode Command Line Tools on macOS, [Zig](https://ziglang.org/download/) 0.16 on Linux
 
 #### 2. Clone the Project
 
@@ -158,8 +193,17 @@ cd web
 npm ci
 npm run build
 cd ..
-go build -o aistudio2api ./cmd/aistudio2api
-chmod +x ./aistudio2api
+arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+platform=$([ "$(uname -s)" = Darwin ] && echo darwin || echo linux)
+mkdir -p spidermonkey
+curl -L https://github.com/Mag1cFall/firefox/releases/download/v152.0.4-aistudio2api.1/spidermonkey-v152.0.4-aistudio2api.1-$platform-$arch.tar.gz | tar -xz -C spidermonkey
+export CGO_CXXFLAGS="-I$PWD/spidermonkey/include" CGO_LDFLAGS="-L$PWD/spidermonkey/lib"
+if [ "$platform" = darwin ]; then
+  go build -o aistudio2api ./cmd/aistudio2api
+else
+  target=$(uname -m)-linux-musl
+  CC="zig cc -target $target" CXX="zig c++ -target $target" go build -tags netgo,osusergo -ldflags="-linkmode external -extldflags -static" -o aistudio2api ./cmd/aistudio2api
+fi
 ./aistudio2api
 ```
 
@@ -184,6 +228,7 @@ The image supports linux/amd64 and linux/arm64, and the service listens on `0.0.
 - Set `PROXY_API_KEY` when the port is reachable from other machines. Opening the console from outside the container requires `ADMIN_AUTH_ENABLED=true` and a console password; the default username is `admin`.
 - Add accounts: choose "Sign in with browser" in "Add account" on the console and sign in to Google in the sign-in window that opens in the console; you can also paste cookies, or copy `auth/<Google email>/` from a computer that can sign in to Google into `data/auth/`.
 - `PROXY` and account proxies are reached from inside the container; when the proxy runs on the host, use the host's LAN address and allow LAN connections on the proxy.
+- The container time zone is UTC. New accounts' fingerprint time zone, log timestamps, and daily usage totals follow the container time zone; add `environment: { TZ: <IANA time zone> }` to `docker-compose.yml` to use another one. Each account's time zone can also be set on the Accounts page.
 - Run `docker compose restart` after editing `data/.env`, `docker compose pull && docker compose up -d` to update the image, and `docker compose up -d --build` in the source directory to build from source.
 
 ## Quick Start
@@ -244,7 +289,7 @@ Account actions depend on state:
 3. "Stop service" cancels an in-progress launch or active requests and closes WAA workers while the management UI and Logs remain available
 4. Click "Start service" again to resume the APIs
 
-Starting again loads the latest data-plane settings from `.env`; the account selection strategy and worker capacity apply as soon as they are saved. Changes to `LISTEN_ADDR` or `PROXY_API_KEY` require restarting the management process.
+Starting again loads the latest data-plane settings from `.env`; the account selection strategy and worker capacity apply as soon as they are saved. Changes to `LISTEN_ADDR`, `PREVIEW_LISTEN_ADDR` or `PROXY_API_KEY` require restarting the management process.
 
 Closing the desktop window keeps the app running in the system tray; choose Quit in the tray menu to exit the manager. For the command-line build, press `Ctrl+C` in the launch window or close that window to exit the manager. Closing the browser tab does not stop the manager.
 
@@ -261,7 +306,7 @@ On Windows, run these commands for the desktop app as `cmd /c start /wait aistud
 - Without options it scans local Chrome accounts; `--email` or `--profile` selects a Chrome account
 - Isolated login: `aistudio2api setup --login`, which needs a graphical display; without one, start the service and sign in with "Sign in with browser" in the console
 - File import: `aistudio2api setup --storage-state <file>`
-- Cookie import: `aistudio2api setup --cookie-file <file>`, `aistudio2api setup --cookie "<Cookie request header>"`, or `aistudio2api setup --cdp <debugging address>`; the account email is detected from the cookies, and an account imported with `--cdp` keeps the language and time zone of that browser
+- Cookie import: `aistudio2api setup --cookie-file <file>`, `aistudio2api setup --cookie "<Cookie request header>"`, or `aistudio2api setup --cdp <debugging address>`; the account email is detected from the cookies, and an account imported with `--cdp` keeps the language and time zone of that browser; when the cookies come from a browser signed in to several Google accounts, `--authuser N` selects the account at `/u/N/` on the official site
 
 `aistudio2api setup --remote https://<remote-instance>`: Adds accounts to a remote instance. Click "Add remotely" on the remote instance's Accounts page to get a pairing token, then run the command on a computer that can sign in to Google and paste the token. It combines with options such as `--login`.
 
@@ -290,7 +335,7 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 | Anthropic Messages | `http://127.0.0.1:2048` | `PROXY_API_KEY` from `.env` |
 | Gemini | `http://127.0.0.1:2048` | `PROXY_API_KEY` from `.env` |
 
-Read model names from `GET /v1/models` or `GET /v1beta/models`. When `PROXY_API_KEY` is empty, only pages on this machine can call the API from a browser; web clients and some desktop clients need `PROXY_API_KEY` set. Separate several keys with commas; any of them is accepted.
+Read model names from `GET /v1/models` or `GET /v1beta/models`. When `PROXY_API_KEY` is empty, only pages on this machine can call the API from a browser; web clients and some desktop clients need `PROXY_API_KEY` set. Separate several keys with commas; any of them is accepted. On the Settings page you can tick which accounts handle each key's requests.
 
 For Cherry Studio:
 
@@ -352,9 +397,9 @@ Main endpoints:
 | OpenAI Responses | `POST /v1/responses`, `POST /v1/responses/input_tokens`, `POST /v1/responses/compact`, `GET`/`DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` |
 | Files | `POST /v1/files`, `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` (OpenAI and Anthropic formats); `POST /upload/v1beta/files`, `GET /v1beta/files`, `GET`/`DELETE /v1beta/files/{id}` |
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
-| Gemini | `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens` |
+| Gemini | `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens`; `POST`/`GET /v1beta/cachedContents`, `GET`/`PATCH`/`DELETE /v1beta/cachedContents/{id}` |
 | Embeddings | `POST /v1/embeddings`, `POST /v1beta/models/{model}:embedContent`, `:batchEmbedContents` |
-| Images | `POST /v1/images/generations`, `POST /v1/images/edits` |
+| Images | `POST /v1/images/generations`, `POST /v1/images/edits`, Imagen `POST /v1beta/models/{model}:predict` |
 | Speech | `POST /v1/audio/speech` |
 | Transcription and translation | `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
 | Music | Gemini `generateContent` with `responseModalities: ["AUDIO"]` |
@@ -364,9 +409,9 @@ Main endpoints:
 
 All four generation APIs can enable Search, Image Search, URL Context, Code Execution, and Maps through their protocol fields. Request and event formats for Files, Transcribe, Live, and Robotics are documented in the [Google AI Studio protocol specification](docs/protocol.md).
 
-Inline attachments in generation requests are preferentially uploaded as temporary Drive files and cleaned up when the request ends. If the account has not granted Drive access, the original inline data is sent instead. Images, audio, video, PDFs, and other inputs must be supported by the selected model. Upload reusable attachments once through the Files API and reuse their file IDs.
+Inline attachments in generation requests are preferentially uploaded to the generating account's Drive; later requests on the same account reference the uploaded file when the content is identical, and files idle for 1 hour are deleted. If the account has not granted Drive access, the original inline data is sent instead. Images, audio, video, PDFs, and other inputs must be supported by the selected model. Upload reusable attachments once through the Files API and reuse their file IDs.
 
-Gemini attachments and video image inputs accept `inlineData` / `inline_data`, `fileData` / `file_data`, `mimeType` / `mime_type`, and `fileUri` / `file_uri`. Base64 media data supports standard and URL-safe alphabets, padded and unpadded forms, and the `data:<MIME>;base64,` prefix. Markdown images in OpenAI assistant history also support URL-safe Base64 and CR/LF line breaks. Inline GIFs and GIFs uploaded through video multipart requests are converted to PNG using the first frame, preserving the logical canvas, frame position, and transparency.
+Gemini attachments and video image inputs accept `inlineData` / `inline_data`, `fileData` / `file_data`, `mimeType` / `mime_type`, and `fileUri` / `file_uri`. Base64 media data supports standard and URL-safe alphabets, padded and unpadded forms, and the `data:<MIME>;base64,` prefix. Markdown images in OpenAI assistant history also support URL-safe Base64 and CR/LF line breaks. Inline GIFs and GIFs uploaded through video multipart requests are converted to PNG using the first frame, preserving the logical canvas, frame position, and transparency; GIFs uploaded through the Files API are converted to JPEG on a white background using the first frame.
 
 ### TTS Speech Generation
 
@@ -453,68 +498,79 @@ curl http://127.0.0.1:2048/v1/videos \
   }'
 ```
 
-After creating the operation, poll `GET /v1/videos/{id}` and download the result from `GET /v1/videos/{id}/content`.
+After creating the operation, poll `GET /v1/videos/{id}` and download the result from `GET /v1/videos/{id}/content`. When the catalog has no Veo model, video-capable Omni models such as `gemini-omni-1.1-flash` and their `veo-*` aliases also create tasks through `/v1/videos` and `:predictLongRunning`.
 
 ## Models
 
-The model catalog follows AI Studio updates; clients read the current values from `/v1/models` or `/v1beta/models`. The table below is a catalog-shape example; runtime results are authoritative for model IDs, limits, and methods:
+The model catalog follows AI Studio updates; clients read the current values from `/v1/models` or `/v1beta/models`. The table below lists common catalog models; runtime results are authoritative for model IDs and limits:
 
-| Model ID | Display name | Input | Output | Methods |
-| --- | --- | ---: | ---: | --- |
-| `antigravity-preview-05-2026` | Antigravity Agent Preview | 131072 | 65536 | `countTokens, generateContent` |
-| `gemini-2.5-flash` | Gemini 2.5 Flash | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-2.5-flash-image` | Nano Banana | 32768 | 32768 | `batchGenerateContent, countTokens, generateContent` |
-| `gemini-2.5-flash-lite` | Gemini 2.5 Flash-Lite | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-2.5-flash-preview-tts` | Gemini 2.5 Flash Preview TTS | 8192 | 16384 | `countTokens, generateContent` |
-| `gemini-2.5-pro` | Gemini 2.5 Pro | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-2.5-pro-preview-tts` | Gemini 2.5 Pro Preview TTS | 8192 | 16384 | `batchGenerateContent, countTokens, generateContent` |
-| `gemini-3-flash-preview` | Gemini 3 Flash Preview | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-3-pro-image` | Nano Banana Pro | 131072 | 32768 | `batchGenerateContent, countTokens, generateContent` |
-| `gemini-3.1-flash-image` | Nano Banana 2 | 65536 | 65536 | `batchGenerateContent, countTokens, generateContent` |
-| `gemini-3.1-flash-lite` | Gemini 3.1 Flash Lite | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-3.1-flash-lite-image` | Nano Banana 2 Lite | 65536 | 65536 | `batchGenerateContent, countTokens, generateContent` |
-| `gemini-3.1-flash-tts-preview` | Gemini 3.1 Flash TTS Preview | 8192 | 16384 | `batchGenerateContent, countTokens, generateContent` |
-| `gemini-3.1-pro-preview` | Gemini 3.1 Pro Preview | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-3.5-flash` | Gemini 3.5 Flash | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-3.5-flash-lite` | Gemini 3.5 Flash Lite | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-3.6-flash` | Gemini 3.6 Flash | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-3.7-flash` | Gemini 3.7 Flash | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-flash-latest` | Gemini Flash Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-flash-lite-latest` | Gemini Flash-Lite Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-nano-banana-2.1` | Nano Banana 2.1 | 65536 | 65536 | `batchGenerateContent, countTokens, generateContent` |
-| `gemini-omni-flash-preview` | Gemini Omni Flash Preview | 131072 | 65536 | `countTokens, generateContent` |
-| `gemini-pro-latest` | Gemini Pro Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-robotics-er-1.6-preview` | Gemini Robotics-ER 1.6 Preview | 131072 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemini-robotics-er-2-preview` | Gemini Robotics-ER 2 Preview | 131072 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
-| `gemma-4-26b-a4b-it` | Gemma 4 26B A4B IT | 262144 | 32768 | `countTokens, generateContent` |
-| `gemma-4-31b-it` | Gemma 4 31B IT | 262144 | 32768 | `countTokens, generateContent` |
-| `lyria-3-clip-preview` | Lyria 3 Clip Preview | 1048576 | 65536 | `countTokens, generateContent` |
-| `lyria-3-pro-preview` | Lyria 3 Pro Preview | 1048576 | 65536 | `countTokens, generateContent` |
-| `veo-3.1-fast-generate-preview` | Veo 3.1 fast | 480 | 8192 | `predictLongRunning` |
-| `veo-3.1-generate-preview` | Veo 3.1 | 480 | 8192 | `predictLongRunning` |
-| `veo-3.1-lite-generate-preview` | Veo 3.1 lite | 480 | 8192 | `predictLongRunning` |
+| Model ID | Name | Type | Input | Output |
+| --- | --- | --- | ---: | ---: |
+| `gemini-4-argon` | Gemini 4 Argon | Text | 1048576 | 32768 |
+| `gemini-3.8-flash` | Gemini 3.8 Flash | Text | 1048576 | 65536 |
+| `gemini-3.6-flash` | Gemini 3.6 Flash | Text | 1048576 | 65536 |
+| `gemini-3.5-flash-lite` | Gemini 3.5 Flash Lite | Text | 1048576 | 65536 |
+| `gemini-3.1-pro-preview` | Gemini 3.1 Pro Preview | Text | 1048576 | 65536 |
+| `gemini-3.1-flash-lite` | Gemini 3.1 Flash Lite | Text | 1048576 | 65536 |
+| `gemma-4-31b-it` | Gemma 4 31B IT | Text | 262144 | 32768 |
+| `gemini-omni-1.1-flash` | Gemini Omni 1.1 Flash | Text and video | 131072 | 65536 |
+| `deep-research-preview-04-2026` | Deep Research Preview | Deep research | 131072 | 65536 |
+| `gemini-nano-banana-2.1` | Nano Banana 2.1 | Image | 65536 | 65536 |
+| `gemini-3.1-flash-image` | Nano Banana 2 | Image | 65536 | 65536 |
+| `gemini-3.1-flash-lite-image` | Nano Banana 2 Lite | Image | 65536 | 65536 |
+| `gemini-3-pro-image` | Nano Banana Pro | Image | 131072 | 32768 |
+| `gemini-3.8-flash-tts` | Gemini 3.8 Flash TTS | Speech | 8192 | 16384 |
+| `gemini-3.8-flash-lite-tts` | Gemini 3.8 Flash Lite TTS | Speech | 8192 | 16384 |
+| `gemini-3.5-transcribe` | Gemini 3.5 Transcribe | Transcription | 98304 | 32768 |
+| `lyria-3.5` | Lyria 3.5 | Music | 1048576 | 65536 |
+| `lyria-3-pro-preview` | Lyria 3 Pro Preview | Music | 1048576 | 65536 |
+| `gemini-3.8-live` | Gemini 3.8 Live | Live | 131072 | 65536 |
+| `gemini-3.5-live-translate-preview` | Gemini 3.5 Live Translate Preview | Live translation | 16384 | 32768 |
+
+The catalog also includes `-latest` aliases, Robotics-ER, earlier image and TTS models, and the Build channel's `-build` models.
 
 Public endpoints implement `generateContent`, `countTokens`, `embedContent`, `batchEmbedContents`, and `predictLongRunning`; `bidiGenerateContent` and `bidiGenerateMusic` models are called through `/v1/live`. `/v1/models` and `/v1beta/models` preserve the live upstream catalogs across accounts; scheduling uses explicit model ID, method, and capability fields plus current account runtime state.
 
-Models that no enabled account's subscription covers (such as models open only to Google AI Ultra) are still listed without `channels`, and calls return 403 naming the required subscription. Models with the `output_continuation` capability (such as Gemini 4 Argon) accept an output limit up to `input_token_limit`, as on the official site; beyond 32768 tokens the response continues automatically in multiple rounds and is returned as one response. Model names accept a thinking suffix such as `gemini-4-argon(low)`: the value in parentheses is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`, or a thinking budget in tokens, and it overrides thinking parameters in the request body. Model names fixed in a client can be mapped to catalog models with `MODEL_MAPPING`, for example `MODEL_MAPPING=claude-haiku-5-5:gemini-3.8-flash`; each alias is listed in the model catalog with the fields of its target.
+Models that no enabled account's subscription covers (such as models open only to Google AI Ultra) are still listed without `channels`, and calls return 403 naming the required subscription. Models with the `output_continuation` capability (such as Gemini 4 Argon) accept an output limit up to `input_token_limit`, as on the official site, and use `input_token_limit` when the request sets no output limit; beyond 32768 tokens the response continues automatically in multiple rounds and is returned as one response. Model names accept a thinking suffix such as `gemini-4-argon(low)`: the value in parentheses is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`, or a thinking budget in tokens, and it overrides thinking parameters in the request body. Model names fixed in a client can be mapped to catalog models with `MODEL_MAPPING`, for example `MODEL_MAPPING=claude-haiku-5-5:gemini-3.8-flash`; each alias is listed in the model catalog with the fields of its target.
 
 ## Project Architecture
 
 ```text
 AIStudio2API/
-├── cmd/aistudio2api/        # Thin entry point
-├── internal/app/            # Commands, management listener, data-plane lifecycle, and scheduling
-├── internal/setup/          # Account import and isolated-login CLI
-├── internal/aistudio/       # AI Studio protocol, authentication, models, and media
-├── internal/api/            # OpenAI, Responses, Anthropic, and Gemini adapters
-├── internal/chromeauth/     # Windows Chrome and DBSC import
-├── internal/camoufoxnative/ # Camoufox BiDi, login, and WAA workers
-├── internal/webui/          # Embedded frontend build
-├── internal/desktop/        # Desktop window and system tray
-├── web/                     # Vue 3 and TypeScript management UI
-├── docs/                    # Development guide and protocol specification
-└── build/                   # App icon and per-platform packaging configuration
+├── cmd/aistudio2api/        # Program entry point and Windows resources
+├── internal/
+│   ├── app/                 # Commands, management listener, data-plane lifecycle, and scheduling
+│   ├── config/              # Reading and validating .env settings
+│   ├── setup/               # Account import and isolated-login CLI
+│   ├── aistudio/            # AI Studio protocol, authentication, models, and media
+│   ├── api/                 # OpenAI, Responses, Anthropic, and Gemini adapters
+│   ├── waa/                 # SpiderMonkey WAA runtime
+│   ├── camoufoxnative/      # Camoufox BiDi, login, and WAA workers
+│   ├── chromeauth/          # Windows Chrome and DBSC import
+│   ├── proxydial/           # Dialing and relaying through global and per-account proxies
+│   ├── sqlitedb/            # Local SQLite database
+│   ├── requestdb/           # Request usage, rollups, and body ledger
+│   ├── promptdb/            # API playground conversation storage
+│   ├── pricing/             # Cost estimates on the usage page
+│   ├── i18n/                # Translating service text into the UI language
+│   ├── webui/               # Embedded frontend build
+│   └── desktop/             # Desktop window and system tray
+├── web/                     # Vue 3 and TypeScript frontend
+│   └── src/
+│       ├── playground/      # API playground
+│       ├── components/      # Management UI components
+│       └── locales/         # UI languages
+├── docs/                    # Build, development, protocol, logging, and WAA docs
+├── build/                   # App icon and per-platform packaging configuration
+├── .github/workflows/       # Checks, five-platform builds, and Release publishing
+├── .env.example             # Configuration template
+├── Dockerfile               # Docker image
+├── docker-compose.yml       # Docker Compose example
+├── go.mod                   # Go module and dependencies
+└── LICENSE
 ```
+
+At runtime the program directory holds `.env`, `auth/` (account credentials), and `runtime/` (Camoufox, local databases, logs, and media files).
 
 ## Configuration
 
@@ -526,12 +582,16 @@ Copy and edit the environment file:
 cp .env.example .env
 ```
 
+Process environment variables override the same keys in `.env`, and those settings cannot be changed on the settings page. Saving settings in the console writes only the values that differ from the defaults to `.env`. Settings with invalid values run with their defaults and are listed at the top of the console and in the log.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AISTUDIO_AUTH_STATES` | `auth` | Account file, directory, or comma-separated paths |
 | `LISTEN_ADDR` | `127.0.0.1:2048` | Management UI and API listen address |
+| `PREVIEW_LISTEN_ADDR` | `127.0.0.1:2050` | Listen address for HTML previews in the API playground, on a port different from `LISTEN_ADDR`; when it cannot be bound, a free port on the same host is used; the page opens previews at the current host name with the port in use |
 | `PROXY_API_KEY` | empty | Public API key |
-| `AUTO_START` | `false` | Start the generation service when the manager starts |
+| `API_KEY_ACCOUNTS` | empty | Accounts each key may use, written as `key:account\|account`; keys not listed can use every account. You can also tick accounts per key on the Settings page; takes effect when saved |
+| `AUTO_START` | `false` | Start the generation service when the manager starts; if startup fails for reasons such as the network, retry at intervals starting at 5 seconds and doubling up to 5 minutes, until the service is started or stopped manually |
 | `REQUEST_BODY_LOG` | `false` | Store public API request and response bodies, each truncated to 64 KiB, keeping the latest 1000 |
 | `LOG_FILE` | `true` | Also write service logs to `runtime/logs/`, rotating at 10 MB per file |
 | `LOG_MAX_TOTAL_MB` | `500` | Total size limit of the log directory; the oldest files are removed beyond it; at least 20 |
@@ -540,17 +600,26 @@ cp .env.example .env
 | `ADMIN_PASSWORD` | empty | Administrator password, required when login is enabled |
 | `PROXY` | empty | HTTP, HTTPS, or SOCKS5 proxy used by Chrome import, login, and accounts without an override; separate several proxies with commas to form a proxy pool; the system proxy is used when empty |
 | `INIT_TIMEOUT` | `2m` | Per-account WAA initialization timeout |
-| `REQUEST_TIMEOUT` | `30m` | Maximum request execution time, multiplied by the number of rounds for auto-continued requests |
+| `REQUEST_TIMEOUT` | `30m` | Maximum request execution time, restarted at the start of each auto-continuation round |
 | `WARM_WORKER_LIMIT` | `5` | Number of resident prewarmed accounts |
 | `MAX_ACTIVE_WORKERS` | `10` | Maximum workers active during peak load |
-| `WARM_STARTUP_CONCURRENCY` | `5` | Camoufox workers cold-started concurrently, shared by prewarming and on-demand scaling; unlimited with `WAA_BACKEND=go` |
+| `WARM_STARTUP_CONCURRENCY` | `5` | Camoufox workers cold-started concurrently, shared by prewarming and on-demand scaling; unlimited with `WAA_BACKEND=spidermonkey` |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | Concurrent requests allowed per account |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` rotates accounts; `fill-first` reuses the first available account |
-| `UPSTREAM_CHANNELS` | `playground,build` | Upstream channels for generation requests; either one can be used alone |
+| `UPSTREAM_CHANNELS` | `playground` | Upstream channels for generation requests, `playground` and `build` comma separated; `build` is the legacy channel whose generation upstream has disabled |
 | `MODEL_MAPPING` | empty | Client model names mapped to catalog models, each item `alias:model ID`, comma separated |
 | `MODEL_CHANNELS` | empty | Limit a model to one channel, each item `model ID:playground` or `model ID:build`; also selectable in model details on the Model catalog page, applied on save |
-| `BUILD_NATIVE_NONSTREAM` | `true` | Prefer native Build unary calls for non-streaming requests; log any fallback to stream collection |
-| `WAA_BACKEND` | `camoufox` | `camoufox` runs WAA in a Camoufox page; `go` runs WAA inside the service process and neither downloads nor starts Camoufox |
+| `BUILD_NATIVE_NONSTREAM` | `true` | With the Build channel enabled, prefer native Build unary calls for non-streaming requests; log any fallback to stream collection |
+| `NONSTREAM_KEEPALIVE` | `true` | When a non-streaming request waits longer than 10 seconds, return 200 first and write a newline every 10 seconds until the JSON body, so reverse proxies such as Cloudflare keep the connection open; errors after that point come back as the protocol error body |
+| `FAKE_STREAM` | `false` | Streaming requests get the full result as a non-streaming generation, retry on another account if it fails midway, then stream it in the protocol format; heartbeats continue while waiting |
+| `YOUTUBE_LINKS` | `false` | Send YouTube links in user message text to the model as video and remove them from the text |
+| `SEARCH_MODEL_ALIASES` | `true` | Offer `-search` variants of search-capable models; requests using these variants enable Google Search |
+| `GOOGLE_SEARCH` | `false` | Enable Google Search for OpenAI, Anthropic, Gemini, and Interactions generation requests, including ordinary model IDs and requests with function tools |
+| `CONTINUATION_REWRITE` | `true` | Rewrite requests ending with an assistant message as continuation requests on models without native continuation; when off, every model receives them unchanged and an upstream rejection is returned as is |
+| `CONTINUATION_PROMPT` | built-in English sentence | Prompt written into the system instruction together with the trailing assistant message when rewriting; when set empty, the trailing assistant message is sent as a user message |
+| `FIRST_EVENT_HEDGE` | `auto` | When a request has no first token for a while, send a backup request on an idle account (another account first, otherwise a free slot on the same account); the first to answer continues and the other is cancelled. `auto` waits for the p95 of each model and channel over the last 24 hours, and models with fewer than 20 requests are not hedged; a positive integer is the wait in seconds, and choosing Custom in settings fills in the recent p95 of the busiest model |
+| `FIRST_EVENT_HEDGE_MODELS` | `gemini-4-argon` | Comma-separated model IDs that get backup requests; backup requests also count against account quota |
+| `WAA_BACKEND` | `camoufox` | `camoufox` runs WAA in a Camoufox page; `spidermonkey` runs WAA in SpiderMonkey inside the service process and neither downloads nor starts Camoufox |
 | `TEMPORARY_CHAT` | `false` | Use Temporary Chat for the WAA prewarm page |
 | `MEDIA_OUTPUT` | `inline` | How Chat Completions and Messages include generated images and audio: `inline` embeds a data URI; `url` saves the file under `runtime/media/`, named by its content, and links to it at `/media/<file>` on this service, a path that does not check the API key |
 | `MEDIA_BASE_URL` | empty | Service address used in media URLs, such as `https://ai.example.com`; empty uses the address of each request and follows `X-Forwarded-Proto` behind a reverse proxy |
@@ -569,6 +638,8 @@ Public APIs use the separate `PROXY_API_KEY`.
 
 Use an HTTPS reverse proxy that preserves `Host` and sets `X-Forwarded-Proto: https`. Console login settings can also be saved from the settings page and take effect after restarting the process.
 
+HTML previews in the API playground run on a separate origin served at `PREVIEW_LISTEN_ADDR`, and the page opens them at the current host name with that port. When the console is opened from another computer, `PREVIEW_LISTEN_ADDR` listens on a reachable address like `LISTEN_ADDR`; behind a reverse proxy, also proxy the same port number on the same host name to `PREVIEW_LISTEN_ADDR`, for example `https://ai.example.com:2050` to local port `2050` when the console is `https://ai.example.com`.
+
 - **Management UI and APIs**: Default port `2048`
 - **Camoufox**: Local ports are allocated dynamically
 
@@ -578,7 +649,7 @@ Use an HTTPS reverse proxy that preserves `Host` and sets `X-Forwarded-Proto: ht
 
 HTTP, HTTPS, and SOCKS5 proxies are supported. For proxies that require authentication, include the credentials in the URL, for example `socks5://user:password@host:1080`:
 
-1. Set the global proxy under Service Configuration. When it is empty, the system proxy is used: the `HTTPS_PROXY` environment variable first, then the Windows system proxy setting. The egress the running generation service actually uses is shown below the proxy field
+1. Set the global proxy under Service Configuration. When it is empty, the system proxy is used: the `HTTPS_PROXY` environment variable first, then the Windows or macOS system proxy setting. The egress the running generation service actually uses is shown below the proxy field
 2. The global proxy accepts several comma-separated proxies that form a proxy pool: each account without its own proxy is bound to the available proxy with the fewest accounts, and the binding is stored in the account state and survives restarts. When a proxy has 3 consecutive network errors or fails the periodic check, its accounts move to another available proxy, and it takes part in assignment again once a check succeeds. Service Configuration lists each proxy with its status and account count, and each account card shows that account's egress
 3. Edit an account to set an account-specific proxy
 4. The account proxy is used for login, WAA, and business requests
@@ -593,7 +664,7 @@ Authentication files are stored in `auth/` by default:
 | `auth/<Google email>/account.json` | Account email, proxy, locale, timezone, and enabled state |
 | `auth/<Google email>/storage-state.json` | Google cookies and authentication renewal material |
 | `auth/<Google email>/runtime-state.json` | Benefit tier, model eligibility, cooldowns, and resource ownership |
-| `auth/<Google email>/camoufox-cache/` | Web cache of that account's browser; can be deleted while the service is stopped |
+| `auth/<Google email>/camoufox-cache/` | Web and startup cache of that account's browser; can be deleted while the service is stopped |
 | `auth/.leases/<Google email>.lock` | Cross-process lease for the account directory |
 | `[user cache]/AIStudio2API/runtime-leases/<Google email>.lock` | WAA Worker lease for that email on the current computer |
 
@@ -611,7 +682,6 @@ The lowercase Google email is the account directory, management UI identity, and
 
 - [Development and contribution](docs/development.md)
 - [Google AI Studio protocol specification](docs/protocol.md)
-- [WAA implementation](docs/waa.md)
 - [Build channel](docs/build.md)
 - [Runtime logging](docs/logging.md)
 - [Reusable reverse-engineering development guide](docs/reverse-engineering.md)
@@ -624,7 +694,7 @@ This project uses [Camoufox](https://camoufox.com/) to reduce automation detecti
 
 Go handles encoding, scheduling, streaming decode, and public protocols. WAA-protected `GenerateContent` requests are sent by the account's fingerprinted Camoufox page, preserving the native Firefox TLS/HTTP2 stack, headers, cookies, and page fingerprint.
 
-With `WAA_BACKEND=go`, WAA runs inside the service process, emulates the Firefox page environment from the account fingerprint, and sends requests with Firefox request headers; Camoufox is neither downloaded nor started at runtime. Browser login on the Accounts page still uses Camoufox and prepares it on first login.
+With `WAA_BACKEND=spidermonkey`, WAA runs in SpiderMonkey inside the service process, emulates the Firefox page environment from the account fingerprint, and sends requests with Firefox request headers; Camoufox is neither downloaded nor started at runtime. Browser login on the Accounts page still uses Camoufox and prepares it on first login.
 
 ### Limitations
 
@@ -633,60 +703,10 @@ With `WAA_BACKEND=go`, WAA runs inside the service process, emulates the Firefox
 - **Responses Sessions**: `previous_response_id` is stored only in the current process and is cleared on restart
 - **Authentication Expiry**: Chrome imports retain OAuth renewal material and renew on Windows; when a Chrome import on Linux, macOS, or Docker expires, copy it from Windows again. When another account expires and the local Chrome is signed in to the same email, the service renews it with that email's material from Chrome and renews it as a Chrome import from then on; otherwise log in again on the Accounts page
 
-## Troubleshooting
-
-### Windows Port Reserved by System
-
-If startup reports that the port configured by `LISTEN_ADDR` is unavailable while Task Manager shows no owning process, Hyper-V, WSL2, or Docker NAT may have reserved the port range.
-
-Run the following commands from an elevated PowerShell or CMD window.
-
-#### 1. Inspect Reserved Port Ranges
-
-```powershell
-netsh interface ipv4 show excludedportrange protocol=tcp
-```
-
-If `2048` falls inside a reserved range, change `LISTEN_ADDR`, or restart WinNAT and inspect the range again:
-
-```powershell
-net stop winnat
-net start winnat
-```
-
-When the port is free, it can be reserved persistently:
-
-```powershell
-netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1 store=persistent
-```
-
-Common runtime states:
-
-| State | Resolution |
-| --- | --- |
-| The page does not open automatically | Open the address configured by `LISTEN_ADDR` in `.env` |
-| `service_stopped` | Click "Start service" in the management UI |
-| `service_starting` | The generation service is starting; retry shortly |
-| No account is available | Add, enable, or log in to an account from Accounts |
-| Camoufox preparation fails | Check access to GitHub Releases or set `CAMOUFOX_PATH` |
-| Linux account warmup `exit status 255` | Install the Camoufox runtime libraries, see the apt command in “System Requirements” |
-| Account shows “AI Studio 不支持当前出口地区或账户” (region or account not supported) | Use a proxy that exits in an [AI Studio supported region](https://aistudio.google.com/docs/available-regions) for that account or globally |
-
 ## Contributing
 
 Issues and Pull Requests are welcome!
 
-## Development Roadmap
+## 📈 Star History
 
-- ✅ **TTS Support**: Adapted `gemini-2.5-flash/pro-preview-tts` speech generation models
-- ✅ **Media Generation**: Supports Imagen 3, Veo 2, Nano Banana image/video generation
-- ✅ **Documentation**: Update and optimize documentation in `docs/` directory
-- ✅ **Go Refactoring**: Migrate core proxy service to Go for improved concurrency and reduced resource usage
-- ✅ **Multi-Worker Load Balancing**: Support multi-Google account rotation pool for higher concurrency limits
-- ✅ **Desktop App**: Windows, macOS, and Linux desktop apps with a window, system tray, and online update
-- ✅ **API Playground**: chat, image, video, speech, music, and live pages with the same entry points and routes as AI Studio
-
-### Pure Go WAA Runtime
-
-- ✅ **Pure Go backend**: `WAA_BACKEND=go` runs the official interpreter and program inside the service process, emulating the Firefox page environment from each account fingerprint; it neither downloads nor starts Camoufox at runtime, while account login still uses Camoufox
-- ✅ **Firefox engine details**: implement `Intl` formatting, the global resolution timing of regular-expression literals, and the Symbol key order of `RegExp.prototype`
+[![Star History Chart](https://api.star-history.com/svg?repos=Mag1cFall/AIStudio2API&type=Date)](https://star-history.com/#Mag1cFall/AIStudio2API&Date)

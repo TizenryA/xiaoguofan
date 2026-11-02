@@ -41,10 +41,10 @@ func TestAuthRefreshWithoutExtension(t *testing.T) {
 		chromeHas: func(email string) bool { return email == account.ID },
 		importCurrent: func(_ context.Context, source aistudio.AuthSource, _ *aistudio.ChromeOAuthMaterial, _ string) (aistudio.StorageState, error) {
 			updated := aistudio.StorageState{Cookies: cookies}
-			err := updated.SetAuthExtension(aistudio.AuthExtension{
+			updated.SetAuthExtension(aistudio.AuthExtension{
 				Source: source, OAuth: &aistudio.ChromeOAuthMaterial{GaiaID: "gaia", RefreshToken: "token"},
 			})
-			return updated, err
+			return updated, nil
 		},
 		reset:          func(string) error { return nil },
 		prepareHeaders: func(string) (func(bool), error) { return func(bool) {}, nil },
@@ -53,7 +53,7 @@ func TestAuthRefreshWithoutExtension(t *testing.T) {
 	if !refresher.Available(ctx) {
 		t.Fatal("账户在 Chrome 中登录但被判定为不可续签")
 	}
-	if err := refresher.Refresh(ctx); err != nil {
+	if err := refresher.Refresh(ctx, lease.AuthGeneration()); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := aistudio.LoadStorageState(storage)

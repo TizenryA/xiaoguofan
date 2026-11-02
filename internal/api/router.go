@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sync"
@@ -26,6 +27,22 @@ type Config struct {
 	MediaDir string
 	// MediaLinks 返回媒体输出是否使用 URL 与设置的服务地址
 	MediaLinks func() (enabled bool, base string)
+	// ResponseModes 返回非流式保活与假流式设置
+	ResponseModes func() ResponseModes
+	// SearchSettings 返回当前生成服务的搜索型号与全模型搜索设置
+	SearchSettings func() (modelAliases, googleSearch bool)
+	// WaitLaunch 在生成服务启动期间等到启动结束，公开 API 请求经它等待后再处理
+	WaitLaunch func(context.Context)
+	// EgressProxy 返回服务连接外部 MCP 服务器所用的出口代理，空串为直连
+	EgressProxy func() string
+}
+
+// ResponseModes 是生成请求的响应方式设置
+type ResponseModes struct {
+	// NonstreamKeepalive 让非流式请求在等待结果期间定时写出换行
+	NonstreamKeepalive bool
+	// FakeStream 让流式请求收齐完整结果后再按流式输出
+	FakeStream bool
 }
 
 type server struct {
@@ -33,6 +50,7 @@ type server struct {
 	config            Config
 	responseStates    *responseStateStore
 	uploads           *geminiUploads
+	caches            *geminiCaches
 	thoughtSignatures *thoughtSignatureStore
 	pairing           *pairingTokens
 	loginViews        *loginViews
@@ -45,7 +63,7 @@ var idSequence atomic.Uint64
 // NewHandler 创建公开 API 路由
 func NewHandler(service aistudio.Service, config Config) http.Handler {
 	s := &server{
-		service: service, config: config, responseStates: newResponseStateStore(), uploads: newGeminiUploads(),
+		service: service, config: config, responseStates: newResponseStateStore(), uploads: newGeminiUploads(), caches: newGeminiCaches(),
 		thoughtSignatures: newThoughtSignatureStore(), pairing: &pairingTokens{}, loginViews: &loginViews{},
 	}
 	public := http.NewServeMux()
@@ -96,26 +114,24 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	public.HandleFunc("GET /v1beta/files/{file}", s.handleGeminiFileGet)
 	public.HandleFunc("GET /v1beta/files/{uri...}", s.handleGeminiFileURIGet)
 	public.HandleFunc("DELETE /v1beta/files/{file}", s.handleGeminiFileDelete)
+	public.HandleFunc("POST /v1beta/cachedContents", s.handleGeminiCacheCreate)
+	public.HandleFunc("GET /v1beta/cachedContents", s.handleGeminiCacheList)
+	public.HandleFunc("GET /v1beta/cachedContents/{cache}", s.handleGeminiCacheGet)
+	public.HandleFunc("PATCH /v1beta/cachedContents/{cache}", s.handleGeminiCacheUpdate)
+	public.HandleFunc("DELETE /v1beta/cachedContents/{cache}", s.handleGeminiCacheDelete)
+	public.HandleFunc("/", writeRouteNotFound)
 
 	control := http.NewServeMux()
 	control.HandleFunc("GET /api/status", s.handleStatus)
 	control.HandleFunc("GET /api/models", s.handleAdminModels)
-	if config.Admin != nil {
-		s.registerAdmin(control)
-	}
-	if config.Ledger != nil {
-		s.registerLedger(control)
-	}
-	if config.Prompts != nil {
-		s.registerPrompts(control)
-	}
-	if config.Updates != nil {
-		s.registerUpdates(control)
-	}
+	s.registerAdmin(control)
+	s.registerLedger(control)
+	s.registerPrompts(control)
+	s.registerUpdates(control)
 
 	root := http.NewServeMux()
 	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
-	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, requestBodyMiddleware(config.Ledger, public))))
+	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, apiKeyContextMiddleware(config.APIKey, requestBodyMiddleware(config.Ledger, waitLaunchMiddleware(config.WaitLaunch, public))))))
 	loggedHandler := requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler))
 	root.Handle("/v1/", loggedHandler)
 	root.Handle("/v1beta/", loggedHandler)
@@ -124,10 +140,19 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	if config.MediaDir != "" {
 		root.Handle("GET /media/{file}", corsMiddleware(http.HandlerFunc(s.handleMedia)))
 	}
-	if config.Admin != nil {
-		root.HandleFunc("POST /api/pairing/accounts", s.handlePairingAccount)
-	}
+	root.HandleFunc("POST /api/pairing/accounts", s.handlePairingAccount)
 	return root
+}
+
+// waitLaunchMiddleware 让请求在生成服务启动期间等到启动结束再处理，wait 为空时直接处理
+func waitLaunchMiddleware(wait func(context.Context), next http.Handler) http.Handler {
+	if wait == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wait(r.Context())
+		next.ServeHTTP(w, r)
+	})
 }
 
 func newID(prefix string) string {

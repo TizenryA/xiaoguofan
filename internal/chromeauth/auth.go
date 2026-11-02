@@ -13,10 +13,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 )
 
-const (
-	maxCookieAge = 400 * 24 * time.Hour
-	userAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-)
+const maxCookieAge = 400 * 24 * time.Hour
 
 // Account 描述本机 Chrome 中可发现的 Google 账号
 type Account struct {
@@ -46,16 +43,6 @@ type ImportResult struct {
 	Locale      string
 	CookieCount int
 	State       aistudio.StorageState
-}
-
-// DefaultChromeRoot 返回稳定版 Chrome User Data 目录
-func DefaultChromeRoot() (string, error) {
-	return defaultChromeRoot()
-}
-
-// Discover 只读列出本机 Chrome Google 账号
-func Discover(chromeRoot string) ([]Account, error) {
-	return discoverPlatform(chromeRoot)
 }
 
 // Import 用本机 Chrome 的 OAuth 续签材料生成 Playwright storage state
@@ -93,8 +80,8 @@ func Import(ctx context.Context, options ImportOptions) ([]ImportResult, error) 
 	return results, nil
 }
 
-// Refresh 使用保存的 OAuth 续签材料重新签发 Google Cookie
-func Refresh(ctx context.Context, material aistudio.ChromeOAuthMaterial, proxy string) ([]aistudio.StateCookie, error) {
+// Refresh 以导入来源 Chrome profile 的身份使用保存的 OAuth 续签材料重新签发 Google Cookie，来源未记录目录时使用稳定版 Chrome 目录
+func Refresh(ctx context.Context, source aistudio.AuthSource, material aistudio.ChromeOAuthMaterial, proxy string) ([]aistudio.StateCookie, error) {
 	if err := ensurePlatformImport(); err != nil {
 		return nil, err
 	}
@@ -102,7 +89,17 @@ func Refresh(ctx context.Context, material aistudio.ChromeOAuthMaterial, proxy s
 	if err != nil {
 		return nil, err
 	}
-	cookies, err := fetchGoogleCookies(ctx, material.GaiaID, material.RefreshToken, material.WrappedBindingKey, proxyURL)
+	root := source.Root
+	if root == "" {
+		if root, err = DefaultChromeRoot(); err != nil {
+			return nil, err
+		}
+	}
+	identity, err := readChromeIdentity(root, source.Profile)
+	if err != nil {
+		return nil, err
+	}
+	cookies, err := fetchGoogleCookies(ctx, identity, material.GaiaID, material.RefreshToken, material.WrappedBindingKey, proxyURL)
 	if err != nil {
 		return nil, err
 	}
@@ -118,20 +115,21 @@ func importAccount(ctx context.Context, chromeRoot string, proxy string, account
 	if err != nil {
 		return ImportResult{}, err
 	}
-	cookies, err := fetchGoogleCookies(ctx, gaiaID, token, wrappedKey, proxy)
+	identity, err := readChromeIdentity(chromeRoot, account.Profile)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	cookies, err := fetchGoogleCookies(ctx, identity, gaiaID, token, wrappedKey, proxy)
 	if err != nil {
 		return ImportResult{}, err
 	}
 	state := aistudio.StorageState{Cookies: toStorageCookies(cookies), Origins: []aistudio.StorageOrigin{}}
-	err = state.SetAuthExtension(aistudio.AuthExtension{
-		Source: aistudio.AuthSource{Browser: "chrome", Profile: account.Profile, Email: strings.ToLower(strings.TrimSpace(account.Email))},
+	state.SetAuthExtension(aistudio.AuthExtension{
+		Source: aistudio.AuthSource{Browser: "chrome", Root: chromeRoot, Profile: account.Profile, Email: strings.ToLower(strings.TrimSpace(account.Email))},
 		OAuth: &aistudio.ChromeOAuthMaterial{
 			GaiaID: gaiaID, RefreshToken: token, WrappedBindingKey: append([]byte(nil), wrappedKey...),
 		},
 	})
-	if err != nil {
-		return ImportResult{}, err
-	}
 	return ImportResult{
 		Profile: account.Profile, DisplayName: account.DisplayName,
 		Email: strings.ToLower(strings.TrimSpace(account.Email)), Locale: account.Locale,

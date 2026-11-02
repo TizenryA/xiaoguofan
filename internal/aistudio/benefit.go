@@ -66,10 +66,6 @@ func (tier BenefitTier) HeaderValue() string {
 
 // BenefitTierForAccount 读取并缓存指定账户的官网权益等级
 func (c *Client) BenefitTierForAccount(ctx context.Context, accountID string) (BenefitTier, error) {
-	accountID = strings.TrimSpace(accountID)
-	if accountID == "" {
-		return BenefitTierFree, fmt.Errorf("GetAiStudioBenefitTier 缺少账户 ID")
-	}
 	response, err := c.do(ctx, "GetAiStudioBenefitTier", accountID, "", []byte("[]"), false)
 	if err != nil {
 		return BenefitTierFree, err
@@ -83,10 +79,15 @@ func (c *Client) BenefitTierForAccount(ctx context.Context, accountID string) (B
 	if err != nil {
 		return BenefitTierFree, err
 	}
+	c.setBenefitTier(accountID, tier)
+	return tier, nil
+}
+
+// setBenefitTier 记录账户的权益等级
+func (c *Client) setBenefitTier(accountID string, tier BenefitTier) {
 	c.tierMu.Lock()
 	c.tiers[accountID] = tier
 	c.tierMu.Unlock()
-	return tier, nil
 }
 
 func decodeBenefitTier(raw []byte) (BenefitTier, error) {
@@ -118,9 +119,6 @@ func decodeBenefitTier(raw []byte) (BenefitTier, error) {
 }
 
 func (c *Client) applyBenefitTier(method string, accountID string, header http.Header) {
-	if header == nil {
-		return
-	}
 	if _, ok := tieredRPCMethods[method]; !ok {
 		return
 	}

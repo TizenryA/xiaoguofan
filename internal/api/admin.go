@@ -10,6 +10,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/chromeauth"
+	"github.com/Mag1cFall/AIStudio2API/internal/i18n"
 )
 
 // AdminService 定义管理端需要的权威状态能力
@@ -20,6 +21,7 @@ type AdminService interface {
 	CreateAccount(context.Context, AccountCreateInput, *camoufoxnative.LiveView) (AdminAccount, error)
 	ChromeImportProfiles(context.Context) ([]ChromeImportProfile, error)
 	CookieBrowsers(context.Context) ([]CookieBrowser, error)
+	DiscoverCookieAccounts(context.Context, CookieImportInput) ([]CookieBrowser, error)
 	ImportChromeAccounts(context.Context, ChromeImportInput) ([]AdminAccount, error)
 	ImportAccountState(context.Context, AccountStateInput) (AdminAccount, error)
 	UpdateAccount(context.Context, string, AccountInput) (AdminAccount, error)
@@ -36,6 +38,7 @@ type AdminService interface {
 	Requests(context.Context) ([]AdminRequest, error)
 	CancelRequest(context.Context, string) error
 	Events(context.Context) (<-chan AdminEvent, error)
+	FirstEventLatencies() []FirstEventLatency
 	RecordAccessStart(AccessLog)
 	RecordAccessLog(AccessLog)
 }
@@ -48,6 +51,20 @@ type AdminStatus struct {
 	Version        string             `json:"version"`
 	ActiveRequests int                `json:"active_requests"`
 	Accounts       AdminAccountCounts `json:"accounts"`
+	Camoufox       AdminCamoufox      `json:"camoufox"`
+}
+
+// InvalidConfigValue 表示加载时取值无效、按默认值生效的一个配置项
+type InvalidConfigValue struct {
+	Key    string `json:"key"`
+	Value  string `json:"value"`
+	Reason string `json:"reason"`
+}
+
+// AdminCamoufox 表示 Camoufox 是否就绪与正在进行的下载
+type AdminCamoufox struct {
+	Ready    bool                     `json:"ready"`
+	Download *camoufoxnative.Download `json:"download,omitempty"`
 }
 
 // AdminLog 表示管理页面展示的一条运行日志
@@ -64,6 +81,7 @@ type AdminLog struct {
 type RequestLog struct {
 	ID              string            `json:"id"`
 	State           string            `json:"state"`
+	StartedAt       time.Time         `json:"started_at,omitzero"`
 	Model           string            `json:"model,omitempty"`
 	Method          string            `json:"method,omitempty"`
 	Path            string            `json:"path,omitempty"`
@@ -196,6 +214,7 @@ type CookieImportInput struct {
 	Proxy    string `json:"proxy"`
 	Locale   string `json:"locale"`
 	Timezone string `json:"timezone"`
+	AuthUser int    `json:"auth_user"`
 }
 
 // ChromeImportProfile 表示可从本机 Chrome 导入的账号
@@ -212,6 +231,7 @@ type CookieBrowser struct {
 	Address   string `json:"address"`
 	Browser   string `json:"browser"`
 	Email     string `json:"email"`
+	AuthUser  int    `json:"auth_user"`
 	Locale    string `json:"locale"`
 	Timezone  string `json:"timezone"`
 	Imported  bool   `json:"imported"`
@@ -229,40 +249,55 @@ type ChromeImportInput struct {
 
 // RuntimeConfig 表示全局运行配置
 type RuntimeConfig struct {
-	AutoStart                 bool         `json:"auto_start"`
-	RequestBodyLog            bool         `json:"request_body_log"`
-	AdminAuthEnabled          bool         `json:"admin_auth_enabled"`
-	AdminUsername             string       `json:"admin_username"`
-	AdminPassword             *string      `json:"admin_password,omitempty"`
-	AdminPasswordSet          bool         `json:"admin_password_set"`
-	SavedAdminPassword        string       `json:"-"`
-	BuildNativeNonstream      bool         `json:"build_native_nonstream"`
-	LogFile                   bool         `json:"log_file"`
-	LogMaxTotalMB             int          `json:"log_max_total_mb"`
-	AuthStates                string       `json:"auth_states"`
-	ListenAddr                string       `json:"listen_addr"`
-	APIKey                    string       `json:"proxy_api_key"`
-	ActiveListenAddr          string       `json:"active_listen_addr"`
-	ActiveAPIKey              string       `json:"active_proxy_api_key"`
-	ManagementRestartRequired bool         `json:"management_restart_required"`
-	ServiceRestartRequired    bool         `json:"service_restart_required"`
-	Proxy                     string       `json:"proxy"`
-	ActiveProxy               string       `json:"active_proxy"`
-	ProxyPool                 []AdminProxy `json:"proxy_pool"`
-	InitTimeout               string       `json:"init_timeout"`
-	RequestTimeout            string       `json:"request_timeout"`
-	WarmWorkerLimit           int          `json:"warm_worker_limit"`
-	MaxActiveWorkers          int          `json:"max_active_workers"`
-	WarmStartupConcurrency    int          `json:"warm_startup_concurrency"`
-	PerAccountConcurrency     int          `json:"per_account_concurrency"`
-	RoutingStrategy           string       `json:"routing_strategy"`
-	UpstreamChannels          []string     `json:"upstream_channels"`
-	ModelMapping              string       `json:"model_mapping"`
-	ModelChannels             string       `json:"model_channels"`
-	TemporaryChat             bool         `json:"temporary_chat"`
-	WAABackend                string       `json:"waa_backend"`
-	MediaOutput               string       `json:"media_output"`
-	MediaBaseURL              string       `json:"media_base_url"`
+	AutoStart                 bool                 `json:"auto_start"`
+	RequestBodyLog            bool                 `json:"request_body_log"`
+	AdminAuthEnabled          bool                 `json:"admin_auth_enabled"`
+	AdminUsername             string               `json:"admin_username"`
+	AdminPassword             *string              `json:"admin_password,omitempty"`
+	AdminPasswordSet          bool                 `json:"admin_password_set"`
+	SavedAdminPassword        string               `json:"-"`
+	BuildNativeNonstream      bool                 `json:"build_native_nonstream"`
+	NonstreamKeepalive        bool                 `json:"nonstream_keepalive"`
+	FakeStream                bool                 `json:"fake_stream"`
+	YouTubeLinks              bool                 `json:"youtube_links"`
+	SearchModelAliases        bool                 `json:"search_model_aliases"`
+	GoogleSearch              bool                 `json:"google_search"`
+	FirstEventHedge           string               `json:"first_event_hedge"`
+	FirstEventHedgeModels     string               `json:"first_event_hedge_models"`
+	ContinuationRewrite       bool                 `json:"continuation_rewrite"`
+	ContinuationPrompt        string               `json:"continuation_prompt"`
+	LogFile                   bool                 `json:"log_file"`
+	LogMaxTotalMB             int                  `json:"log_max_total_mb"`
+	AuthStates                string               `json:"auth_states"`
+	ListenAddr                string               `json:"listen_addr"`
+	APIKey                    string               `json:"proxy_api_key"`
+	ActiveListenAddr          string               `json:"active_listen_addr"`
+	ReservedListenAddr        string               `json:"reserved_listen_addr"`
+	PreviewListenAddr         string               `json:"preview_listen_addr"`
+	ActivePreviewListenAddr   string               `json:"active_preview_listen_addr"`
+	ActiveAPIKey              string               `json:"active_proxy_api_key"`
+	ManagementRestartRequired bool                 `json:"management_restart_required"`
+	ServiceRestartRequired    bool                 `json:"service_restart_required"`
+	Proxy                     string               `json:"proxy"`
+	ActiveProxy               string               `json:"active_proxy"`
+	ProxyPool                 []AdminProxy         `json:"proxy_pool"`
+	InitTimeout               string               `json:"init_timeout"`
+	RequestTimeout            string               `json:"request_timeout"`
+	WarmWorkerLimit           int                  `json:"warm_worker_limit"`
+	MaxActiveWorkers          int                  `json:"max_active_workers"`
+	WarmStartupConcurrency    int                  `json:"warm_startup_concurrency"`
+	PerAccountConcurrency     int                  `json:"per_account_concurrency"`
+	RoutingStrategy           string               `json:"routing_strategy"`
+	UpstreamChannels          []string             `json:"upstream_channels"`
+	ModelMapping              string               `json:"model_mapping"`
+	ModelChannels             string               `json:"model_channels"`
+	APIKeyAccounts            string               `json:"api_key_accounts"`
+	TemporaryChat             bool                 `json:"temporary_chat"`
+	WAABackend                string               `json:"waa_backend"`
+	MediaOutput               string               `json:"media_output"`
+	MediaBaseURL              string               `json:"media_base_url"`
+	Environment               []string             `json:"environment"`
+	Invalid                   []InvalidConfigValue `json:"invalid"`
 }
 
 // AdminCooldown 表示账户模型冷却
@@ -294,11 +329,13 @@ type AdminEvent struct {
 }
 
 func (s *server) registerAdmin(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/i18n/{locale}", handleMessages)
 	mux.HandleFunc("GET /api/accounts", s.handleAccounts)
 	mux.HandleFunc("POST /api/accounts", s.handleCreateAccount)
 	mux.HandleFunc("GET /api/accounts/import/chrome", s.handleChromeImportProfiles)
 	mux.HandleFunc("POST /api/accounts/import/chrome", s.handleImportChromeAccounts)
 	mux.HandleFunc("GET /api/accounts/import/browsers", s.handleCookieBrowsers)
+	mux.HandleFunc("POST /api/accounts/import/cookies/discover", s.handleDiscoverCookieAccounts)
 	mux.HandleFunc("POST /api/accounts/import/cookies", s.handleImportCookieAccount)
 	mux.HandleFunc("POST /api/pairing", s.handleCreatePairing)
 	mux.HandleFunc("PUT /api/accounts/{id}", s.handleUpdateAccount)
@@ -311,6 +348,7 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/logs", s.handleClearLogs)
 	mux.HandleFunc("GET /api/config", s.handleRuntimeConfig)
 	mux.HandleFunc("PUT /api/config", s.handleUpdateRuntimeConfig)
+	mux.HandleFunc("GET /api/first-event-latency", s.handleFirstEventLatencies)
 	mux.HandleFunc("GET /api/cooldowns", s.handleCooldowns)
 	mux.HandleFunc("DELETE /api/accounts/{id}/cooldowns/{scope}", s.handleClearCooldown)
 	mux.HandleFunc("GET /api/requests", s.handleRequests)
@@ -323,20 +361,12 @@ func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if s.config.Admin != nil {
-		status, err := s.config.Admin.Status(r.Context())
-		if err != nil {
-			writeAdminUpstreamError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, status)
-		return
-	}
-	if _, err := s.service.Models(r.Context()); err != nil {
+	status, err := s.config.Admin.Status(r.Context())
+	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ready": true})
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *server) handleAdminModels(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +438,20 @@ func (s *server) handleCookieBrowsers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string][]CookieBrowser{"browsers": browsers})
 }
 
+func (s *server) handleDiscoverCookieAccounts(w http.ResponseWriter, r *http.Request) {
+	var input CookieImportInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	accounts, err := s.config.Admin.DiscoverCookieAccounts(r.Context(), input)
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string][]CookieBrowser{"accounts": accounts})
+}
+
 func (s *server) handleImportCookieAccount(w http.ResponseWriter, r *http.Request) {
 	var input CookieImportInput
 	if err := decodeJSON(r, &input); err != nil {
@@ -434,13 +478,30 @@ func (s *server) handleImportCookieAccount(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	account, err := s.config.Admin.ImportAccountState(r.Context(), AccountStateInput{
-		Label: input.Label, Proxy: input.Proxy, Locale: input.Locale, Timezone: input.Timezone, StorageState: state,
+		Label: input.Label, Proxy: input.Proxy, Locale: input.Locale, Timezone: input.Timezone,
+		AuthUser: input.AuthUser, StorageState: state,
 	})
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]AdminAccount{"account": account})
+}
+
+// handleMessages 返回界面语言的服务文案翻译表，简体中文为空表
+func handleMessages(w http.ResponseWriter, r *http.Request) {
+	locale := r.PathValue("locale")
+	if locale == i18n.Source {
+		writeJSON(w, http.StatusOK, map[string]string{})
+		return
+	}
+	data, ok := i18n.Messages(locale)
+	if !ok {
+		writeAdminError(w, http.StatusNotFound, "not_found", "unknown locale")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Write(data)
 }
 
 func (s *server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
@@ -527,6 +588,11 @@ func (s *server) handleRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, config)
+}
+
+// handleFirstEventLatencies 返回各模型与通道近期原请求首事件等待的 p95
+func (s *server) handleFirstEventLatencies(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string][]FirstEventLatency{"latencies": s.config.Admin.FirstEventLatencies()})
 }
 
 func (s *server) handleUpdateRuntimeConfig(w http.ResponseWriter, r *http.Request) {

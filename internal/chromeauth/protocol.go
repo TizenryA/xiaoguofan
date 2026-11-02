@@ -3,12 +3,10 @@ package chromeauth
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
-	"crypto/hmac"
+	"crypto/hpke"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -19,6 +17,9 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 
 	http "github.com/bogdanfinn/fhttp"
@@ -76,22 +77,104 @@ type deviceBindingKey interface {
 	Close()
 }
 
-// fetchGoogleCookies 用 refresh token 经 OAuthMultilogin 取得 Google Cookie，有设备绑定密钥时走 DBSC 挑战与 HPKE 解密，没有时一次 MultiBearer 请求取得明文 Cookie
-func fetchGoogleCookies(ctx context.Context, gaiaID string, token string, wrappedKey []byte, proxyURL string) ([]multiloginCookie, error) {
+// multiloginHeaderOrder 是 Chrome GaiaAuthFetcher 发出 OAuthMultilogin 的请求头顺序
+var multiloginHeaderOrder = []string{"content-length", "authorization", "content-type", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "user-agent", "accept-encoding", "accept-language", "priority"}
+
+// chromeIdentity 是本机 Chrome profile 发出 Gaia 请求时的 User-Agent 与 Accept-Language
+type chromeIdentity struct {
+	userAgent      string
+	acceptLanguage string
+}
+
+// readChromeIdentity 按 User Data 的 Last Version 与 profile 的语言设置生成 Chrome 的 User-Agent 与 Accept-Language
+func readChromeIdentity(chromeRoot string, profile string) (chromeIdentity, error) {
+	version, err := os.ReadFile(filepath.Join(chromeRoot, "Last Version"))
+	if err != nil {
+		return chromeIdentity{}, fmt.Errorf("读取 Chrome 版本: %w", err)
+	}
+	major, _, _ := strings.Cut(strings.TrimSpace(string(version)), ".")
+	return chromeIdentity{
+		userAgent:      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + major + ".0.0.0 Safari/537.36",
+		acceptLanguage: acceptLanguageHeader(profileLanguages(chromeRoot, profile)),
+	}, nil
+}
+
+// profileLanguages 返回 profile 的 intl.accept_languages，等于默认值未写入时返回 intl.selected_languages
+func profileLanguages(chromeRoot string, profile string) string {
+	data, err := os.ReadFile(filepath.Join(chromeRoot, profile, "Preferences"))
+	if err != nil {
+		return ""
+	}
+	var preferences struct {
+		Intl struct {
+			AcceptLanguages   string `json:"accept_languages"`
+			SelectedLanguages string `json:"selected_languages"`
+		} `json:"intl"`
+	}
+	if json.Unmarshal(data, &preferences) != nil {
+		return ""
+	}
+	if strings.TrimSpace(preferences.Intl.AcceptLanguages) != "" {
+		return preferences.Intl.AcceptLanguages
+	}
+	return preferences.Intl.SelectedLanguages
+}
+
+// acceptLanguageHeader 按 Chromium HttpUtil 的 ExpandLanguageList 与 GenerateAcceptLanguageHeader 把语言设置展开为 Accept-Language
+func acceptLanguageHeader(languages string) string {
+	items := strings.Split(languages, ",")
+	primary := func(language string) string {
+		base, _, _ := strings.Cut(language, "-")
+		return strings.TrimSpace(base)
+	}
+	var expanded []string
+	add := func(language string) {
+		if !slices.Contains(expanded, language) {
+			expanded = append(expanded, language)
+		}
+	}
+	for index, item := range items {
+		language := strings.TrimSpace(item)
+		add(language)
+		base := primary(language)
+		if base == "x" || base == "i" {
+			continue
+		}
+		if index+1 == len(items) || primary(items[index+1]) != base {
+			add(base)
+		}
+	}
+	var header strings.Builder
+	quality := 10
+	for index, language := range expanded {
+		if index == 0 {
+			header.WriteString(language)
+		} else {
+			fmt.Fprintf(&header, ",%s;q=0.%d", language, quality)
+		}
+		if quality > 1 {
+			quality--
+		}
+	}
+	return header.String()
+}
+
+// fetchGoogleCookies 用 refresh token 经 OAuthMultilogin 取得 Google Cookie，有设备绑定密钥时走 DBSC 挑战与 HPKE 解密
+func fetchGoogleCookies(ctx context.Context, identity chromeIdentity, gaiaID string, token string, wrappedKey []byte, proxyURL string) ([]multiloginCookie, error) {
 	client, err := newOAuthClient(proxyURL)
 	if err != nil {
 		return nil, err
 	}
 	defer client.CloseIdleConnections()
 	if len(wrappedKey) == 0 {
-		return fetchBearerCookies(ctx, client, gaiaID, token)
+		return fetchBearerCookies(ctx, client, identity, gaiaID, token)
 	}
-	return fetchBoundCookies(ctx, client, gaiaID, token, wrappedKey)
+	return fetchBoundCookies(ctx, client, identity, gaiaID, token, wrappedKey)
 }
 
 // fetchBearerCookies 为没有设备绑定的 token 请求一次 OAuthMultilogin，返回明文 Cookie
-func fetchBearerCookies(ctx context.Context, client tls_client.HttpClient, gaiaID string, token string) ([]multiloginCookie, error) {
-	status, response, err := requestMultilogin(ctx, client, gaiaID, token, "")
+func fetchBearerCookies(ctx context.Context, client tls_client.HttpClient, identity chromeIdentity, gaiaID string, token string) ([]multiloginCookie, error) {
+	status, response, err := requestMultilogin(ctx, client, identity, gaiaID, token, "")
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +188,7 @@ func fetchBearerCookies(ctx context.Context, client tls_client.HttpClient, gaiaI
 }
 
 // fetchBoundCookies 为设备绑定的 token 取得 DBSC challenge、以设备密钥签发 assertion，再解密服务端返回的 Cookie
-func fetchBoundCookies(ctx context.Context, client tls_client.HttpClient, gaiaID string, token string, wrappedKey []byte) ([]multiloginCookie, error) {
+func fetchBoundCookies(ctx context.Context, client tls_client.HttpClient, identity chromeIdentity, gaiaID string, token string, wrappedKey []byte) ([]multiloginCookie, error) {
 	bindingKey, err := openDeviceBindingKey(wrappedKey)
 	if err != nil {
 		return nil, err
@@ -116,7 +199,7 @@ func fetchBoundCookies(ctx context.Context, client tls_client.HttpClient, gaiaID
 		return nil, err
 	}
 
-	firstStatus, first, err := requestMultilogin(ctx, client, gaiaID, token, assertionSentinel)
+	firstStatus, first, err := requestMultilogin(ctx, client, identity, gaiaID, token, assertionSentinel)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +216,7 @@ func fetchBoundCookies(ctx context.Context, client tls_client.HttpClient, gaiaID
 	if err != nil {
 		return nil, err
 	}
-	secondStatus, second, err := requestMultilogin(ctx, client, gaiaID, token, assertion)
+	secondStatus, second, err := requestMultilogin(ctx, client, identity, gaiaID, token, assertion)
 	if err != nil {
 		return nil, err
 	}
@@ -194,8 +277,8 @@ func newOAuthClient(proxyURL string) (tls_client.HttpClient, error) {
 	return client, nil
 }
 
-// requestMultilogin 发送一次 OAuthMultilogin：带 assertion 时用 MultiOAuth 头，没有设备绑定的 token 用 MultiBearer 头
-func requestMultilogin(ctx context.Context, client tls_client.HttpClient, gaiaID string, token string, assertion string) (int, multiloginResponse, error) {
+// requestMultilogin 按 Chrome 的请求头发送一次 OAuthMultilogin：带 assertion 时用 MultiOAuth 头，没有设备绑定的 token 用 MultiBearer 头
+func requestMultilogin(ctx context.Context, client tls_client.HttpClient, identity chromeIdentity, gaiaID string, token string, assertion string) (int, multiloginResponse, error) {
 	authorization := "MultiBearer " + token + ":" + gaiaID
 	if assertion != "" {
 		authorization = "MultiOAuth " + encodeMultiOAuthHeader(gaiaID, token, assertion)
@@ -206,7 +289,14 @@ func requestMultilogin(ctx context.Context, client tls_client.HttpClient, gaiaID
 	}
 	request.Header.Set("Authorization", authorization)
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	request.Header.Set("User-Agent", userAgent)
+	request.Header.Set("Sec-Fetch-Site", "none")
+	request.Header.Set("Sec-Fetch-Mode", "no-cors")
+	request.Header.Set("Sec-Fetch-Dest", "empty")
+	request.Header.Set("User-Agent", identity.userAgent)
+	request.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	request.Header.Set("Accept-Language", identity.acceptLanguage)
+	request.Header.Set("Priority", "u=4, i")
+	request.Header[http.HeaderOrderKey] = multiloginHeaderOrder
 	response, err := client.Do(request)
 	if err != nil {
 		return 0, multiloginResponse{}, fmt.Errorf("OAuthMultilogin 请求失败: %w", err)
@@ -309,82 +399,18 @@ func createAssertion(bindingKey deviceBindingKey, publicKey *ecdsa.PublicKey, sp
 
 func hpkeOpen(privateKey *ecdh.PrivateKey, encodedValue string) (string, error) {
 	encrypted, err := base64.RawURLEncoding.DecodeString(encodedValue)
-	if err != nil || len(encrypted) <= 48 {
+	if err != nil {
 		return "", fmt.Errorf("OAuthMultilogin Cookie 密文格式异常")
 	}
-	encapsulatedKey := encrypted[:32]
-	senderPublicKey, err := ecdh.X25519().NewPublicKey(encapsulatedKey)
+	recipientKey, err := hpke.NewDHKEMPrivateKey(privateKey)
 	if err != nil {
-		return "", fmt.Errorf("解析 HPKE 封装密钥: %w", err)
+		return "", fmt.Errorf("创建 HPKE 接收密钥: %w", err)
 	}
-	sharedDH, err := privateKey.ECDH(senderPublicKey)
-	if err != nil {
-		return "", fmt.Errorf("计算 HPKE 共享密钥: %w", err)
-	}
-	kemSuite := append([]byte("KEM"), 0, 0x20)
-	hpkeSuite := append([]byte("HPKE"), 0, 0x20, 0, 1, 0, 1)
-	eaePRK := labeledExtract(nil, kemSuite, []byte("eae_prk"), sharedDH)
-	kemContext := append(append([]byte{}, encapsulatedKey...), privateKey.PublicKey().Bytes()...)
-	sharedSecret := labeledExpand(eaePRK, kemSuite, []byte("shared_secret"), kemContext, 32)
-	pskIDHash := labeledExtract(nil, hpkeSuite, []byte("psk_id_hash"), nil)
-	infoHash := labeledExtract(nil, hpkeSuite, []byte("info_hash"), nil)
-	keyScheduleContext := append(append([]byte{0}, pskIDHash...), infoHash...)
-	secret := labeledExtract(sharedSecret, hpkeSuite, []byte("secret"), nil)
-	key := labeledExpand(secret, hpkeSuite, []byte("key"), keyScheduleContext, 16)
-	nonce := labeledExpand(secret, hpkeSuite, []byte("base_nonce"), keyScheduleContext, 12)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", fmt.Errorf("创建 HPKE AES 解密器: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", fmt.Errorf("创建 HPKE GCM 解密器: %w", err)
-	}
-	plaintext, err := gcm.Open(nil, nonce, encrypted[32:], []byte{})
+	plaintext, err := hpke.Open(recipientKey, hpke.HKDFSHA256(), hpke.AES128GCM(), nil, encrypted)
 	if err != nil {
 		return "", fmt.Errorf("OAuthMultilogin Cookie 解密失败")
 	}
 	return string(plaintext), nil
-}
-
-func labeledExtract(salt []byte, suite []byte, label []byte, input []byte) []byte {
-	material := append([]byte("HPKE-v1"), suite...)
-	material = append(material, label...)
-	material = append(material, input...)
-	return hkdfExtract(salt, material)
-}
-
-func labeledExpand(key []byte, suite []byte, label []byte, info []byte, length int) []byte {
-	labeledInfo := make([]byte, 2)
-	binary.BigEndian.PutUint16(labeledInfo, uint16(length))
-	labeledInfo = append(labeledInfo, []byte("HPKE-v1")...)
-	labeledInfo = append(labeledInfo, suite...)
-	labeledInfo = append(labeledInfo, label...)
-	labeledInfo = append(labeledInfo, info...)
-	return hkdfExpand(key, labeledInfo, length)
-}
-
-func hkdfExtract(salt []byte, input []byte) []byte {
-	if len(salt) == 0 {
-		salt = make([]byte, sha256.Size)
-	}
-	hash := hmac.New(sha256.New, salt)
-	hash.Write(input)
-	return hash.Sum(nil)
-}
-
-func hkdfExpand(key []byte, info []byte, length int) []byte {
-	result := make([]byte, 0, length)
-	block := []byte(nil)
-	for counter := byte(1); len(result) < length; counter++ {
-		hash := hmac.New(sha256.New, key)
-		hash.Write(block)
-		hash.Write(info)
-		hash.Write([]byte{counter})
-		block = hash.Sum(nil)
-		result = append(result, block...)
-	}
-	return result[:length]
 }
 
 func appendBytesField(output []byte, number int, value []byte) []byte {

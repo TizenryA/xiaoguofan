@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
 import { ref } from 'vue'
 import {
   DropdownMenuContent,
@@ -17,11 +16,12 @@ withDefaults(
   defineProps<{
     icon: IconName
     label: string
+    tooltip?: string | undefined
     chip?: boolean
     disabled?: boolean
     multiple?: boolean
   }>(),
-  { chip: false, disabled: false, multiple: false },
+  { tooltip: undefined, chip: false, disabled: false, multiple: false },
 )
 const emit = defineEmits<{ images: [images: File[]] }>()
 const { t } = useI18n()
@@ -30,8 +30,8 @@ const camera = ref<InstanceType<typeof CameraDialog>>()
 
 // onChange 读取选择的图片文件
 function onChange(): void {
-  const files = [...(input.value?.files ?? [])].filter((file) => file.type.startsWith('image/'))
-  if (input.value) input.value.value = ''
+  const files = [...input.value!.files!].filter((file) => file.type.startsWith('image/'))
+  input.value!.value = ''
   if (files.length > 0) emit('images', files)
 }
 
@@ -47,7 +47,7 @@ function onCapture(photo: Blob): void {
   <DropdownMenuRoot>
     <DropdownMenuTrigger as-child :disabled="disabled">
       <button
-        v-tooltip.below="label"
+        v-tooltip.below="tooltip ?? label"
         type="button"
         ms-button
         :class="

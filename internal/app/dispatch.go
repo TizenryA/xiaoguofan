@@ -35,7 +35,7 @@ func dispatchKey(selection aistudio.AccountSelection) string {
 	}, "\x00")
 }
 
-// join 把请求排到同条件队列末尾，队列原本非空时唤醒队首以复查空闲槽位
+// join 把请求排到同条件队列末尾，队列原本非空时唤醒队首
 func (queue *dispatchQueue) join(key string) *dispatchWaiter {
 	waiter := &dispatchWaiter{key: key, wake: make(chan struct{}, 1)}
 	queue.mu.Lock()
@@ -54,9 +54,6 @@ func (queue *dispatchQueue) leave(waiter *dispatchWaiter) {
 	defer queue.mu.Unlock()
 	waiters := queue.queues[waiter.key]
 	index := slices.Index(waiters, waiter)
-	if index < 0 {
-		return
-	}
 	waiters = slices.Delete(waiters, index, index+1)
 	if len(waiters) == 0 {
 		delete(queue.queues, waiter.key)

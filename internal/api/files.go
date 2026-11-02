@@ -2,9 +2,13 @@ package api
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/draw"
+	"image/jpeg"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -112,7 +116,7 @@ func (s *server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		writeFileError(w, r, statusFromError(err), openAIErrorCode(err), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, fileResponse(r, metadata))
+	writeJSON(w, http.StatusOK, officialOrder(fileProtocol(r), fileResponse(r, metadata)))
 }
 
 func readOpenAIFileParts(reader *multipart.Reader) (string, *multipart.Part, string, string, error) {
@@ -242,7 +246,7 @@ func (s *server) handleFileGet(w http.ResponseWriter, r *http.Request) {
 		writeFileRequestError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, fileResponse(r, metadata))
+	writeJSON(w, http.StatusOK, officialOrder(fileProtocol(r), fileResponse(r, metadata)))
 }
 
 // handleFileContent 返回上传文件内容
@@ -263,28 +267,25 @@ func (s *server) handleFileContent(w http.ResponseWriter, r *http.Request) {
 		writeFileRequestError(w, r, err)
 		return
 	}
-	mimeType := strings.TrimSpace(media.MIME)
-	if mimeType == "" {
-		mimeType = metadata.MIME
-	}
-	filename := strings.TrimSpace(media.Name)
-	if filename == "" {
-		filename = metadata.Name
-	}
 	size := media.Size
 	if size < 0 {
 		size = metadata.Size
 	}
-	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Content-Type", cmp.Or(strings.TrimSpace(media.MIME), metadata.MIME))
+	filename := cmp.Or(strings.TrimSpace(media.Name), metadata.Name)
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
+	writeMediaStream(w, r, media.Body, size)
+}
+
+// writeMediaStream 写出 200 与文件内容，size 非负时带 Content-Length，复制或关闭出错时记入访问日志
+func writeMediaStream(w http.ResponseWriter, r *http.Request, body io.ReadCloser, size int64) {
 	if size >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	}
 	w.WriteHeader(http.StatusOK)
-	_, copyErr := io.Copy(w, media.Body)
-	closeErr := media.Body.Close()
-	if requestErr := errors.Join(copyErr, closeErr); requestErr != nil {
-		SetAccessLogError(r.Context(), requestErr)
+	_, copyErr := io.Copy(w, body)
+	if err := errors.Join(copyErr, body.Close()); err != nil {
+		SetAccessLogError(r.Context(), err)
 	}
 }
 
@@ -301,10 +302,10 @@ func (s *server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if anthropicFilesRequest(r) {
-		writeJSON(w, http.StatusOK, map[string]any{"id": fileID, "type": "file_deleted"})
+		writeJSON(w, http.StatusOK, officialOrder("anthropic", map[string]any{"id": fileID, "type": "file_deleted"}))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"id": fileID, "object": "file", "deleted": true})
+	writeJSON(w, http.StatusOK, officialOrder("openai", map[string]any{"id": fileID, "object": "file", "deleted": true}))
 }
 
 // handleFileList 列出上传文件，Anthropic 请求返回 Files API 列表，其余按 OpenAI 的 after、limit、order 与 purpose 分页过滤
@@ -340,13 +341,13 @@ func (s *server) handleFileList(w http.ResponseWriter, r *http.Request) {
 	if len(listed) > 0 {
 		body["first_id"], body["last_id"] = listed[0].ID, listed[len(listed)-1].ID
 	}
-	writeJSON(w, http.StatusOK, body)
+	writeJSON(w, http.StatusOK, officialOrder("openai", body))
 }
 
 // anthropicFilePagePrefix 是 Files API next_page 游标的前缀，游标其余部分为上一页最后一个文件的 ID
 const anthropicFilePagePrefix = "page_"
 
-// writeAnthropicFileList 按 Files API 的 ids、scope_id、limit 与 page 游标返回一页文件，同时接受 after_id 与 before_id，响应带 next_page 以及 first_id、last_id、has_more
+// writeAnthropicFileList 按 Files API 的 ids、scope_id、limit 与 page 游标返回一页文件，响应带 next_page、first_id、last_id 与 has_more
 func writeAnthropicFileList(w http.ResponseWriter, r *http.Request, files []aistudio.FileMetadata) {
 	query := r.URL.Query()
 	if query.Get("scope_id") != "" {
@@ -378,7 +379,7 @@ func writeAnthropicFileList(w http.ResponseWriter, r *http.Request, files []aist
 	if hasMore && query.Get("before_id") == "" {
 		body["next_page"] = anthropicFilePagePrefix + listed[len(listed)-1].ID
 	}
-	writeJSON(w, http.StatusOK, body)
+	writeJSON(w, http.StatusOK, officialOrder("anthropic", body))
 }
 
 func multipartStreamMIME(file io.Reader, value string, filename string) (string, io.Reader, error) {
@@ -391,10 +392,31 @@ func multipartStreamMIME(file io.Reader, value string, filename string) (string,
 		return "", nil, errors.New("file must not be empty")
 	}
 	stream := io.MultiReader(bytes.NewReader(probe[:count]), file)
-	if mediaType := declaredMediaType(value); mediaType != "" {
+	mediaType := declaredMediaType(value)
+	if mediaType == "" {
+		mediaType = detectMediaType(filename, probe[:count])
+	}
+	if mediaType != "image/gif" {
 		return mediaType, stream, nil
 	}
-	return detectMediaType(filename, probe[:count]), stream, nil
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		return "", nil, err
+	}
+	if frame, config, ok := decodeGIFFrame(data); ok {
+		data, mediaType = gifJPEG(frame, config), "image/jpeg"
+	}
+	return mediaType, bytes.NewReader(data), nil
+}
+
+// gifJPEG 与官网上传 GIF 时一样把首帧画在同尺寸白底上，编码为质量 92 的 JPEG
+func gifJPEG(frame *image.Paletted, config image.Config) []byte {
+	canvas := image.NewRGBA(image.Rect(0, 0, config.Width, config.Height))
+	draw.Draw(canvas, canvas.Bounds(), image.White, image.Point{}, draw.Src)
+	draw.Draw(canvas, frame.Bounds(), frame, frame.Bounds().Min, draw.Over)
+	var buf bytes.Buffer
+	_ = jpeg.Encode(&buf, canvas, &jpeg.Options{Quality: 92})
+	return buf.Bytes()
 }
 
 func multipartFileMIME(file io.ReadSeeker, value string, filename string) (string, error) {
@@ -448,6 +470,14 @@ func fileResponse(r *http.Request, metadata aistudio.FileMetadata) any {
 		"id": metadata.ID, "type": "file", "filename": metadata.Name, "mime_type": metadata.MIME,
 		"size_bytes": metadata.Size, "created_at": metadata.CreatedAt.UTC().Format(time.RFC3339), "downloadable": true,
 	}
+}
+
+// fileProtocol 返回文件请求所属协议的字段顺序名
+func fileProtocol(r *http.Request) string {
+	if anthropicFilesRequest(r) {
+		return "anthropic"
+	}
+	return "openai"
 }
 
 // writeFileError 按文件请求的协议写入错误

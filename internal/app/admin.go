@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -35,39 +35,6 @@ type runtimeAdmin struct {
 	config      config.Config
 	proxies     *aistudio.ProxyPool
 	globalProxy string
-}
-
-// requestRegistry 保存活动请求与事件订阅
-type requestRegistry struct {
-	mu          sync.Mutex
-	active      map[string]trackedRequest
-	logs        []api.AdminLog
-	subscribers map[*eventSubscriber]struct{}
-	console     chan api.AdminLog
-}
-
-type eventSubscriber struct {
-	ctx             context.Context
-	mu              sync.Mutex
-	events          chan api.AdminEvent
-	wake            chan struct{}
-	pending         []api.AdminEvent
-	pendingLogs     int
-	pendingRequests int
-}
-
-const (
-	adminLogRetain             = 2000
-	adminLogCompactAt          = 2200
-	adminLogInitialEvents      = 200
-	adminRequestRetain         = 512
-	adminRequestCompactAt      = 640
-	adminRequestRefreshLatency = 50 * time.Millisecond
-)
-
-type trackedRequest struct {
-	request api.AdminRequest
-	cancel  context.CancelFunc
 }
 
 type adminOperationError struct {
@@ -112,18 +79,6 @@ func newRuntimeAdmin(
 	}
 }
 
-// newRequestRegistry 创建活动请求注册表
-func newRequestRegistry(ctx context.Context) *requestRegistry {
-	registry := &requestRegistry{
-		active:      make(map[string]trackedRequest),
-		logs:        make([]api.AdminLog, 0, 128),
-		subscribers: make(map[*eventSubscriber]struct{}),
-		console:     make(chan api.AdminLog, 256),
-	}
-	go registry.writeConsole(ctx)
-	return registry
-}
-
 func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 	counts := api.AdminAccountCounts{}
 	for _, account := range admin.pool.Status() {
@@ -141,14 +96,19 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 	}
 	state := admin.service.State()
 	running := state == "RUNNING"
-	return api.AdminStatus{
+	status := api.AdminStatus{
 		State:          state,
 		Running:        running,
 		Ready:          running && counts.Ready+counts.Busy > 0,
 		Version:        buildVersion(),
 		ActiveRequests: admin.requests.count(),
 		Accounts:       counts,
-	}, nil
+		Camoufox:       api.AdminCamoufox{Ready: camoufoxnative.Installed()},
+	}
+	if download, ok := camoufoxnative.DownloadProgress(); ok {
+		status.Camoufox.Download = &download
+	}
+	return status, nil
 }
 
 func (admin *runtimeAdmin) Accounts(context.Context) ([]api.AdminAccount, error) {
@@ -180,7 +140,7 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 	startedAt := time.Now()
 	admin.requests.log("auth", "INFO", "账户添加 | 1/2 | 等待隔离登录")
 	result, err := admin.login.Login(ctx, aistudio.IsolatedLoginRequest{
-		AccountID: "new", Directory: directory, Proxy: admin.effectiveProxy(accountConfig.Proxy),
+		Directory: directory, Proxy: admin.effectiveProxy(accountConfig.Proxy),
 		Locale: accountConfig.Locale, Timezone: accountConfig.Timezone, View: view,
 	})
 	if err != nil {
@@ -197,7 +157,7 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 		admin.requests.log("auth", "WARN", "账户添加 | 关闭 Camoufox 失败 | 错误="+result.CloseError)
 	}
 	admin.requests.log("auth", "INFO", "账户添加 | 2/2 | 保存认证状态")
-	if _, err := aistudio.NewSigner().Sign(result.StorageState); err != nil {
+	if _, err := aistudio.NewSigner().Authorization(result.StorageState); err != nil {
 		return api.AdminAccount{}, fmt.Errorf("认证状态无法用于 AI Studio: %w", err)
 	}
 	accountConfig.Label = result.Email
@@ -224,10 +184,7 @@ func (admin *runtimeAdmin) ChromeImportProfiles(context.Context) ([]api.ChromeIm
 	if err != nil {
 		return nil, err
 	}
-	existing := make(map[string]struct{})
-	for _, status := range admin.pool.Status() {
-		existing[strings.ToLower(strings.TrimSpace(status.ID))] = struct{}{}
-	}
+	existing := admin.accountIDs()
 	profiles := make([]api.ChromeImportProfile, 0, len(accounts))
 	for _, account := range accounts {
 		email := strings.ToLower(strings.TrimSpace(account.Email))
@@ -245,17 +202,14 @@ func (admin *runtimeAdmin) ChromeImportProfiles(context.Context) ([]api.ChromeIm
 	return profiles, nil
 }
 
-// CookieBrowsers 列出本机开启远程调试的浏览器，读取其 Cookie 并识别其中登录 AI Studio 的账户
+// CookieBrowsers 列出本机开启远程调试的浏览器，读取其 Cookie 并识别其中各会话登录 AI Studio 的账户，每个账户一项
 func (admin *runtimeAdmin) CookieBrowsers(ctx context.Context) ([]api.CookieBrowser, error) {
 	addresses, err := chromeauth.DebugAddresses(ctx)
 	if err != nil {
 		return nil, err
 	}
-	existing := make(map[string]struct{})
-	for _, status := range admin.pool.Status() {
-		existing[strings.ToLower(strings.TrimSpace(status.ID))] = struct{}{}
-	}
-	browsers := make([]api.CookieBrowser, len(addresses))
+	existing := admin.accountIDs()
+	browsers := make([][]api.CookieBrowser, len(addresses))
 	var group sync.WaitGroup
 	for index, address := range addresses {
 		group.Go(func() {
@@ -263,40 +217,77 @@ func (admin *runtimeAdmin) CookieBrowsers(ctx context.Context) ([]api.CookieBrow
 			name, err := chromeauth.DebugBrowserName(ctx, address)
 			if err != nil {
 				browser.Error = err.Error()
-				browsers[index] = browser
+				browsers[index] = []api.CookieBrowser{browser}
 				return
 			}
 			browser.Browser = name
-			err = admin.readCookieBrowser(ctx, &browser)
+			accounts, err := admin.readCookieBrowser(ctx, &browser)
 			browser.SignedOut = errors.Is(err, chromeauth.ErrSignedOut) || errors.Is(err, aistudio.ErrLoginCookieMissing)
 			if err != nil && !browser.SignedOut {
 				browser.Error = err.Error()
 			}
-			_, browser.Imported = existing[strings.ToLower(browser.Email)]
-			browsers[index] = browser
+			browsers[index] = cookieAccountEntries(browser, accounts, existing)
 		})
 	}
 	group.Wait()
-	return browsers, nil
+	return append([]api.CookieBrowser{}, slices.Concat(browsers...)...), nil
 }
 
-// readCookieBrowser 读取调试浏览器的语言、时区与 Cookie，填入其中登录 AI Studio 的账户邮箱
-func (admin *runtimeAdmin) readCookieBrowser(ctx context.Context, browser *api.CookieBrowser) error {
+// readCookieBrowser 读取调试浏览器的语言、时区与 Cookie，返回其中各会话登录 AI Studio 的账户
+func (admin *runtimeAdmin) readCookieBrowser(ctx context.Context, browser *api.CookieBrowser) ([]chromeauth.CookieAccount, error) {
 	source, err := chromeauth.ReadCDPBrowser(ctx, browser.Address)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	browser.Locale, browser.Timezone = source.Locale, source.Timezone
 	state, err := aistudio.ParseCookieText(source.Cookies)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	verification, err := chromeauth.Verify(ctx, &state, admin.effectiveProxy(""))
+	return chromeauth.DiscoverCookieAccounts(ctx, &state, admin.effectiveProxy(""))
+}
+
+// DiscoverCookieAccounts 解析粘贴的 Cookie，返回其中各会话登录 AI Studio 的账户
+func (admin *runtimeAdmin) DiscoverCookieAccounts(ctx context.Context, input api.CookieImportInput) ([]api.CookieBrowser, error) {
+	state, err := aistudio.ParseCookieText(input.Cookies)
 	if err != nil {
-		return err
+		return nil, &adminOperationError{status: http.StatusBadRequest, code: "invalid_cookies", message: err.Error()}
 	}
-	browser.Email = strings.ToLower(verification.Email)
-	return nil
+	if err := state.Validate(); err != nil {
+		return nil, invalidAccount(err)
+	}
+	accounts, err := chromeauth.DiscoverCookieAccounts(ctx, &state, admin.effectiveProxy(input.Proxy))
+	if errors.Is(err, chromeauth.ErrSignedOut) {
+		return nil, &adminOperationError{status: http.StatusBadRequest, code: "signed_out", message: err.Error()}
+	}
+	if err != nil {
+		return nil, invalidAccount(err)
+	}
+	return cookieAccountEntries(api.CookieBrowser{}, accounts, admin.accountIDs()), nil
+}
+
+// cookieAccountEntries 以 template 为模板为每个会话账户生成一项并标记已导入的账户，没有账户时只返回 template
+func cookieAccountEntries(template api.CookieBrowser, accounts []chromeauth.CookieAccount, existing map[string]struct{}) []api.CookieBrowser {
+	if len(accounts) == 0 {
+		return []api.CookieBrowser{template}
+	}
+	entries := make([]api.CookieBrowser, len(accounts))
+	for index, account := range accounts {
+		entry := template
+		entry.Email, entry.AuthUser = account.Email, account.AuthUser
+		_, entry.Imported = existing[account.Email]
+		entries[index] = entry
+	}
+	return entries
+}
+
+// accountIDs 返回已导入账户的小写 ID
+func (admin *runtimeAdmin) accountIDs() map[string]struct{} {
+	existing := make(map[string]struct{})
+	for _, status := range admin.pool.Status() {
+		existing[strings.ToLower(strings.TrimSpace(status.ID))] = struct{}{}
+	}
+	return existing
 }
 
 func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.ChromeImportInput) ([]api.AdminAccount, error) {
@@ -335,7 +326,7 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 		if err := accountConfig.Validate(); err != nil {
 			return nil, invalidAccount(err)
 		}
-		if _, err := aistudio.NewSigner().Sign(result.State); err != nil {
+		if _, err := aistudio.NewSigner().Authorization(result.State); err != nil {
 			return nil, fmt.Errorf("认证状态无法用于 AI Studio: %w", err)
 		}
 		configs[index] = accountConfig
@@ -352,11 +343,11 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 	return accounts, nil
 }
 
-// ImportAccountState 导入远程配对上传或 Cookie 导入的认证状态与 Camoufox 指纹，未给标签时以 Cookie 登录的账户邮箱为标签
+// ImportAccountState 导入远程配对上传或 Cookie 导入的认证状态与 Camoufox 指纹，未给标签时以 Cookie 中第 auth_user 个会话登录的账户邮箱为标签
 func (admin *runtimeAdmin) ImportAccountState(ctx context.Context, input api.AccountStateInput) (api.AdminAccount, error) {
 	label := strings.TrimSpace(input.Label)
 	if label == "" {
-		verification, err := chromeauth.Verify(ctx, &input.StorageState, admin.effectiveProxy(input.Proxy))
+		verification, err := chromeauth.VerifyAuthUser(ctx, &input.StorageState, admin.effectiveProxy(input.Proxy), input.AuthUser)
 		if errors.Is(err, chromeauth.ErrSignedOut) {
 			return api.AdminAccount{}, &adminOperationError{status: http.StatusBadRequest, code: "signed_out", message: err.Error()}
 		}
@@ -366,6 +357,7 @@ func (admin *runtimeAdmin) ImportAccountState(ctx context.Context, input api.Acc
 		label = strings.ToLower(verification.Email)
 	}
 	accountConfig := aistudio.DefaultAccountConfig(label)
+	accountConfig.AuthUser = input.AuthUser
 	accountConfig.Proxy = strings.TrimSpace(input.Proxy)
 	if locale := strings.TrimSpace(input.Locale); locale != "" {
 		accountConfig.Locale = locale
@@ -379,7 +371,7 @@ func (admin *runtimeAdmin) ImportAccountState(ctx context.Context, input api.Acc
 	if err := input.StorageState.Validate(); err != nil {
 		return api.AdminAccount{}, invalidAccount(err)
 	}
-	if _, err := aistudio.NewSigner().Sign(input.StorageState); err != nil {
+	if _, err := aistudio.NewSigner().Authorization(input.StorageState); err != nil {
 		return api.AdminAccount{}, invalidAccount(fmt.Errorf("认证状态无法用于 AI Studio: %w", err))
 	}
 	email := accountConfig.Label
@@ -479,6 +471,7 @@ func (admin *runtimeAdmin) UpdateAccount(ctx context.Context, accountID string, 
 		return api.AdminAccount{}, accountOperationError(err)
 	}
 	account := lease.Account()
+	accountConfig.AuthUser = account.Config.AuthUser
 	enabling := accountConfig.Enabled && !account.Config.Enabled
 	if accountConfig.Proxy == "" && !admin.proxies.Available(account.PoolProxy("")) {
 		account.SetPoolProxy(admin.proxies.Next())
@@ -582,7 +575,7 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string, v
 		admin.requests.log(account.Config.Label, "WARN", "账户登录 | 关闭 Camoufox 失败 | 错误="+result.CloseError)
 	}
 	admin.requests.log(account.Config.Label, "INFO", "账户登录 | 2/2 | 保存认证状态")
-	if _, err := aistudio.NewSigner().Sign(result.StorageState); err != nil {
+	if _, err := aistudio.NewSigner().Authorization(result.StorageState); err != nil {
 		return api.AdminAccount{}, errors.Join(fmt.Errorf("认证状态无法用于 AI Studio: %w", err), lease.Release())
 	}
 	if err := camoufoxnative.PersistAccountFingerprint(directory, account.Directory); err != nil {
@@ -593,6 +586,9 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string, v
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
 	if err := lease.SaveStorageState(state); err != nil {
+		return api.AdminAccount{}, errors.Join(err, lease.Release())
+	}
+	if err := resetCookieAuthUser(lease, admin.workers.prepareUpdate); err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
 	if err := admin.service.changeModels(func() error {
@@ -615,6 +611,26 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string, v
 	return admin.account(account.ID)
 }
 
+// resetCookieAuthUser 在账户认证状态换成单账号 Cookie 后把会话序号归零并同步到 Worker
+func resetCookieAuthUser(lease *aistudio.AccountLease, prepare func(*aistudio.Account, aistudio.AccountConfig) (*accountWorkerUpdate, error)) error {
+	account := lease.Account()
+	if account.Config.AuthUser == 0 {
+		return nil
+	}
+	accountConfig := account.Config
+	accountConfig.AuthUser = 0
+	workerUpdate, err := prepare(account, accountConfig)
+	if err != nil {
+		return err
+	}
+	if err := lease.SaveConfig(accountConfig); err != nil {
+		workerUpdate.Discard()
+		return err
+	}
+	workerUpdate.Commit()
+	return nil
+}
+
 // keepAuthExtension 在新登录状态缺少续签材料时沿用账户已有的 Chrome 来源与 OAuth 材料
 func keepAuthExtension(next *aistudio.StorageState, current aistudio.StorageState) error {
 	if _, exists, err := next.AuthExtension(); err != nil || exists {
@@ -624,7 +640,8 @@ func keepAuthExtension(next *aistudio.StorageState, current aistudio.StorageStat
 	if err != nil || !exists {
 		return err
 	}
-	return next.SetAuthExtension(extension)
+	next.SetAuthExtension(extension)
+	return nil
 }
 
 // RefreshAccount 在服务生命周期中立即读取账户权益与模型目录，管理页断开不中止
@@ -647,25 +664,21 @@ func (admin *runtimeAdmin) RefreshAccount(_ context.Context, accountID string) (
 func (admin *runtimeAdmin) StartService(ctx context.Context) (api.AdminStatus, error) {
 	startedAt := time.Now()
 	models, started, err := admin.service.Start(ctx, func() {
-		status, statusErr := admin.Status(ctx)
-		if statusErr == nil {
-			admin.publishRuntimeSnapshot(ctx, status)
-		}
+		status, _ := admin.Status(ctx)
+		admin.publishRuntimeSnapshot(ctx, status)
 	})
 	if errors.Is(err, errServiceTransitioning) {
 		return admin.Status(ctx)
 	}
 	if err != nil {
-		status, statusErr := admin.Status(ctx)
-		if statusErr == nil {
-			admin.publishRuntimeSnapshot(ctx, status)
-		}
+		status, _ := admin.Status(ctx)
+		admin.publishRuntimeSnapshot(ctx, status)
 		if errors.Is(err, context.Canceled) && admin.service.State() == "STOPPED" {
 			admin.requests.log("service", "INFO", fmt.Sprintf(
 				"生成服务启动已取消 | 耗时=%s",
 				time.Since(startedAt).Round(time.Millisecond),
 			))
-			return status, statusErr
+			return status, nil
 		}
 		admin.requests.log("service", "ERROR", fmt.Sprintf(
 			"生成服务启动失败 | 耗时=%s | 错误=%s",
@@ -699,11 +712,9 @@ func (admin *runtimeAdmin) StartService(ctx context.Context) (api.AdminStatus, e
 			len(models), len(admin.workers.WarmAccountIDs()), admin.workers.PrewarmTarget(),
 		))
 	}
-	status, err := admin.Status(ctx)
-	if err == nil {
-		admin.publishRuntimeSnapshot(ctx, status)
-	}
-	return status, err
+	status, _ := admin.Status(ctx)
+	admin.publishRuntimeSnapshot(ctx, status)
+	return status, nil
 }
 
 func (admin *runtimeAdmin) StopService(ctx context.Context) (api.AdminStatus, error) {
@@ -728,26 +739,17 @@ func (admin *runtimeAdmin) StopService(ctx context.Context) (api.AdminStatus, er
 	} else {
 		admin.requests.log("service", "INFO", "生成服务已处于停止状态")
 	}
-	status, err := admin.Status(ctx)
-	if err == nil {
-		admin.publishRuntimeSnapshot(ctx, status)
-	}
-	return status, err
-}
-
-func (admin *runtimeAdmin) ClearLogs(context.Context) error {
-	admin.requests.clearLogs()
-	return nil
+	status, _ := admin.Status(ctx)
+	admin.publishRuntimeSnapshot(ctx, status)
+	return status, nil
 }
 
 // syncModelCache 在账户写入后刷新权威快照
 func (admin *runtimeAdmin) syncModelCache() {
 	ctx := admin.lifecycle
 	_ = admin.service.SyncModels(ctx)
-	status, err := admin.Status(ctx)
-	if err == nil {
-		admin.publishRuntimeSnapshot(ctx, status)
-	}
+	status, _ := admin.Status(ctx)
+	admin.publishRuntimeSnapshot(ctx, status)
 }
 
 func (admin *runtimeAdmin) syncAccountModelCatalog(ctx context.Context, account *aistudio.Account) {
@@ -764,14 +766,8 @@ func (admin *runtimeAdmin) syncAccountModelCatalog(ctx context.Context, account 
 
 // publishRuntimeSnapshot 推送管理页权威运行状态
 func (admin *runtimeAdmin) publishRuntimeSnapshot(ctx context.Context, status api.AdminStatus) {
-	models, err := admin.CatalogModels(ctx)
-	if err != nil {
-		return
-	}
-	accounts, err := admin.Accounts(ctx)
-	if err != nil {
-		return
-	}
+	models, _ := admin.CatalogModels(ctx)
+	accounts, _ := admin.Accounts(ctx)
 	admin.requests.publish(api.AdminEvent{Type: "status", Data: status})
 	admin.requests.publish(api.AdminEvent{Type: "models", Data: map[string]any{"models": models}})
 	admin.requests.publish(api.AdminEvent{Type: "accounts", Data: map[string]any{"accounts": accounts}})
@@ -809,18 +805,16 @@ func (admin *runtimeAdmin) effectiveProxy(accountProxy string) string {
 
 func (admin *runtimeAdmin) loginRequest(account *aistudio.Account, directory string) aistudio.IsolatedLoginRequest {
 	return aistudio.IsolatedLoginRequest{
-		AccountID: account.ID, Directory: directory, Proxy: account.EffectiveProxy(admin.globalProxy),
+		Directory: directory, Proxy: account.EffectiveProxy(admin.globalProxy),
 		Locale: account.Config.Locale, Timezone: account.Config.Timezone,
 	}
 }
 
 func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
-	models := make([]string, len(status.Models))
-	copy(models, status.Models)
 	return api.AdminAccount{
 		ID: status.ID, Label: status.Label, Enabled: status.Enabled, State: string(status.State),
 		Proxy: status.Proxy, Egress: status.Egress, Locale: status.Locale, Timezone: status.Timezone,
-		Models: models, BenefitTier: status.BenefitTier, Message: status.Message,
+		Models: status.Models, BenefitTier: status.BenefitTier, Message: status.Message,
 	}
 }
 
@@ -879,8 +873,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		LogFile:        value.LogFile, LogMaxTotalMB: value.LogMaxTotalMB,
 		AdminAuthEnabled: value.AdminAuthEnabled, AdminUsername: strings.TrimSpace(value.AdminUsername), AdminPassword: password,
 		BuildNativeNonstream: value.BuildNativeNonstream,
-		AuthStates:           value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: value.APIKey,
-		Proxy: value.Proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout,
+		NonstreamKeepalive:   value.NonstreamKeepalive, FakeStream: value.FakeStream, YouTubeLinks: value.YouTubeLinks,
+		SearchModelAliases: value.SearchModelAliases, GoogleSearch: value.GoogleSearch,
+		ContinuationRewrite: value.ContinuationRewrite, ContinuationPrompt: strings.TrimSpace(value.ContinuationPrompt),
+		FirstEventHedge: strings.ToLower(strings.TrimSpace(value.FirstEventHedge)), FirstEventHedgeModels: strings.TrimSpace(value.FirstEventHedgeModels), AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, PreviewListenAddr: value.PreviewListenAddr,
+		ProxyAPIKey: value.APIKey, Proxy: value.Proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
@@ -888,11 +885,12 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		UpstreamChannels:       value.UpstreamChannels,
 		ModelMapping:           strings.TrimSpace(value.ModelMapping),
 		ModelChannels:          strings.TrimSpace(value.ModelChannels),
+		APIKeyAccounts:         strings.TrimSpace(value.APIKeyAccounts),
 		TemporaryChat:          value.TemporaryChat,
 		WAABackend:             value.WAABackend,
 		MediaOutput:            strings.ToLower(strings.TrimSpace(value.MediaOutput)),
 		MediaBaseURL:           strings.TrimSpace(value.MediaBaseURL),
-	}
+	}.KeepEnvironment(saved)
 	if err := cfg.Validate(); err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(err)
 	}
@@ -902,9 +900,8 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	admin.pool.SetRoutingStrategy(cfg.RoutingStrategy)
 	admin.pool.SetModelChannels(modelChannels(cfg.ModelChannels))
 	admin.requests.log("service", "INFO", "服务配置已保存")
-	if models, err := admin.CatalogModels(context.Background()); err == nil {
-		admin.requests.publish(api.AdminEvent{Type: "models", Data: map[string]any{"models": models}})
-	}
+	models, _ := admin.CatalogModels(context.Background())
+	admin.requests.publish(api.AdminEvent{Type: "models", Data: map[string]any{"models": models}})
 	value = runtimeConfigDTO(cfg)
 	value.ActiveProxy = admin.config.Proxy
 	value.ProxyPool = admin.proxyPoolStatus()
@@ -974,12 +971,10 @@ func (admin *runtimeAdmin) ClearCooldown(ctx context.Context, accountID string, 
 		return err
 	}
 	admin.requests.log(account.Label, "INFO", "冷却已手动清除 | 范围="+scope)
-	if cooldowns, err := admin.Cooldowns(ctx); err == nil {
-		admin.requests.publish(api.AdminEvent{Type: "cooldowns", Data: cooldowns})
-	}
-	if accounts, err := admin.Accounts(ctx); err == nil {
-		admin.requests.publish(api.AdminEvent{Type: "accounts", Data: map[string]any{"accounts": accounts}})
-	}
+	cooldowns, _ := admin.Cooldowns(ctx)
+	admin.requests.publish(api.AdminEvent{Type: "cooldowns", Data: cooldowns})
+	accounts, _ := admin.Accounts(ctx)
+	admin.requests.publish(api.AdminEvent{Type: "accounts", Data: map[string]any{"accounts": accounts}})
 	return nil
 }
 
@@ -1002,10 +997,6 @@ type adminEventSource interface {
 // CatalogModels 返回当前运行时完整目录与各模型可用通道
 func (admin *runtimeAdmin) CatalogModels(ctx context.Context) ([]aistudio.Model, error) {
 	return admin.service.catalogModels(), nil
-}
-
-func (admin *runtimeAdmin) Events(ctx context.Context) (<-chan api.AdminEvent, error) {
-	return openAdminEvents(ctx, admin.lifecycle, admin.requests, admin)
 }
 
 // openAdminEvents 创建绑定进程生命周期的管理事件流
@@ -1155,345 +1146,7 @@ func adminRequestStateUpdates(
 	return updates, nil
 }
 
-func (registry *requestRegistry) start(request aistudio.GenerateRequest, cancel context.CancelFunc) {
-	tracked := trackedRequest{
-		request: api.AdminRequest{
-			ID: request.ID, Model: request.Model, AccountID: request.AccountID,
-			State: "queued", StartedAt: time.Now().UTC(),
-		},
-		cancel: cancel,
-	}
-	registry.mu.Lock()
-	registry.active[request.ID] = tracked
-	registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
-	registry.mu.Unlock()
-}
-
-func (registry *requestRegistry) markRunning(id string, accountID string, accountLabel string) {
-	registry.mu.Lock()
-	tracked, exists := registry.active[id]
-	if exists {
-		tracked.request.AccountID = accountID
-		tracked.request.AccountLabel = accountLabel
-		tracked.request.State = "running"
-		registry.active[id] = tracked
-		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
-	}
-	registry.mu.Unlock()
-}
-
-// markChannel 记录请求本次尝试使用的上游通道
-func (registry *requestRegistry) markChannel(id string, channel string) {
-	registry.mu.Lock()
-	if tracked, exists := registry.active[id]; exists {
-		tracked.request.Channel = channel
-		registry.active[id] = tracked
-		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
-	}
-	registry.mu.Unlock()
-}
-
-func (registry *requestRegistry) finish(id string, state string, requestErr error) {
-	registry.mu.Lock()
-	tracked, exists := registry.active[id]
-	if exists {
-		delete(registry.active, id)
-		tracked.request.State = state
-		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
-	}
-	registry.mu.Unlock()
-}
-
-func (registry *requestRegistry) list() []api.AdminRequest {
-	registry.mu.Lock()
-	requests := make([]api.AdminRequest, 0, len(registry.active))
-	for _, tracked := range registry.active {
-		requests = append(requests, tracked.request)
-	}
-	registry.mu.Unlock()
-	sort.Slice(requests, func(left int, right int) bool {
-		return requests[left].StartedAt.Before(requests[right].StartedAt)
-	})
-	return requests
-}
-
-func (registry *requestRegistry) count() int {
-	registry.mu.Lock()
-	count := len(registry.active)
-	registry.mu.Unlock()
-	return count
-}
-
-func (registry *requestRegistry) cancel(id string) error {
-	registry.mu.Lock()
-	tracked, exists := registry.active[id]
-	registry.mu.Unlock()
-	if !exists {
-		return &adminOperationError{
-			status: http.StatusNotFound, code: "request_not_found",
-			message: fmt.Sprintf("活动请求不存在: %s", id),
-		}
-	}
-	tracked.cancel()
-	return nil
-}
-
-func (registry *requestRegistry) cancelAll() {
-	registry.mu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(registry.active))
-	for _, tracked := range registry.active {
-		cancels = append(cancels, tracked.cancel)
-	}
-	registry.mu.Unlock()
-	for _, cancel := range cancels {
-		cancel()
-	}
-}
-
-func (registry *requestRegistry) log(source string, level string, message string) {
-	registry.recordLog(api.AdminLog{Source: source, Level: level, Message: message, Event: "runtime.message"})
-}
-
-// recordLog 将同一结构化事件发布到管理页面与控制台
-func (registry *requestRegistry) recordLog(entry api.AdminLog) {
-	entry.Time = time.Now().UTC()
-	registry.mu.Lock()
-	registry.logs = append(registry.logs, entry)
-	if len(registry.logs) >= adminLogCompactAt {
-		copy(registry.logs, registry.logs[len(registry.logs)-adminLogRetain:])
-		registry.logs = registry.logs[:adminLogRetain]
-	}
-	registry.publishLocked(api.AdminEvent{Type: "log", Data: entry})
-	registry.mu.Unlock()
-	select {
-	case registry.console <- entry:
-	default:
-	}
-}
-
-func (registry *requestRegistry) writeConsole(ctx context.Context) {
-	for {
-		select {
-		case entry := <-registry.console:
-			level := slog.LevelInfo
-			switch strings.ToUpper(entry.Level) {
-			case "ERROR":
-				level = slog.LevelError
-			case "WARN":
-				level = slog.LevelWarn
-			}
-			record := slog.NewRecord(entry.Time, level, entry.Message, 0)
-			record.AddAttrs(slog.String("event", entry.Event), slog.String("source", entry.Source))
-			if entry.Request != nil {
-				record.AddAttrs(slog.Any("request", entry.Request))
-			}
-			_ = slog.Default().Handler().Handle(ctx, record)
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func (registry *requestRegistry) clearLogs() {
-	registry.mu.Lock()
-	registry.logs = registry.logs[:0]
-	registry.mu.Unlock()
-}
-
-// newEventSubscriber 创建管理页有界事件队列
-func newEventSubscriber(ctx context.Context) *eventSubscriber {
-	return &eventSubscriber{
-		ctx: ctx, events: make(chan api.AdminEvent, 16), wake: make(chan struct{}, 1),
-		pending: make([]api.AdminEvent, 0, 256),
-	}
-}
-
-func (subscriber *eventSubscriber) enqueue(event api.AdminEvent) {
-	subscriber.mu.Lock()
-	subscriber.enqueueLocked(event)
-	subscriber.mu.Unlock()
-	subscriber.notify()
-}
-
-func (subscriber *eventSubscriber) enqueueLocked(event api.AdminEvent) {
-	switch event.Type {
-	case "status", "models", "accounts", "cooldowns":
-		for index := len(subscriber.pending) - 1; index >= 0; index-- {
-			if subscriber.pending[index].Type == event.Type {
-				subscriber.pending[index] = event
-				return
-			}
-		}
-	case "request":
-		request := event.Data.(api.AdminRequest)
-		for index := len(subscriber.pending) - 1; index >= 0; index-- {
-			pending := subscriber.pending[index]
-			if pending.Type == "request" && pending.Data.(api.AdminRequest).ID == request.ID {
-				subscriber.pending[index] = event
-				return
-			}
-		}
-		subscriber.pendingRequests++
-	case "log":
-		subscriber.pendingLogs++
-	}
-	subscriber.pending = append(subscriber.pending, event)
-	if subscriber.pendingLogs >= adminLogCompactAt {
-		subscriber.trimPendingLocked("log", adminLogRetain)
-	}
-	if subscriber.pendingRequests >= adminRequestCompactAt {
-		subscriber.trimPendingLocked("request", adminRequestRetain)
-	}
-}
-
-func (subscriber *eventSubscriber) trimPendingLocked(eventType string, retain int) {
-	count := subscriber.pendingLogs
-	if eventType == "request" {
-		count = subscriber.pendingRequests
-	}
-	drop := count - retain
-	compacted := subscriber.pending[:0]
-	for _, event := range subscriber.pending {
-		if event.Type == eventType && drop > 0 {
-			drop--
-			continue
-		}
-		compacted = append(compacted, event)
-	}
-	subscriber.pending = compacted
-	if eventType == "request" {
-		subscriber.pendingRequests = retain
-	} else {
-		subscriber.pendingLogs = retain
-	}
-}
-
-func (subscriber *eventSubscriber) activate(initial []api.AdminEvent) {
-	subscriber.mu.Lock()
-	buffered := append([]api.AdminEvent(nil), subscriber.pending...)
-	subscriber.pending = subscriber.pending[:0]
-	subscriber.pendingLogs = 0
-	subscriber.pendingRequests = 0
-	for _, event := range initial {
-		subscriber.enqueueLocked(event)
-	}
-	for _, event := range buffered {
-		if event.Type != "log" {
-			subscriber.enqueueLocked(event)
-		}
-	}
-	subscriber.mu.Unlock()
-	subscriber.notify()
-}
-
-func (subscriber *eventSubscriber) notify() {
-	select {
-	case subscriber.wake <- struct{}{}:
-	default:
-	}
-}
-
-func (subscriber *eventSubscriber) next() (api.AdminEvent, bool) {
-	subscriber.mu.Lock()
-	defer subscriber.mu.Unlock()
-	if len(subscriber.pending) == 0 {
-		return api.AdminEvent{}, false
-	}
-	event := subscriber.pending[0]
-	subscriber.pending[0] = api.AdminEvent{}
-	subscriber.pending = subscriber.pending[1:]
-	if event.Type == "log" {
-		subscriber.pendingLogs--
-	}
-	if event.Type == "request" {
-		subscriber.pendingRequests--
-	}
-	if len(subscriber.pending) == 0 {
-		subscriber.pending = nil
-	}
-	return event, true
-}
-
-func (subscriber *eventSubscriber) run() {
-	defer close(subscriber.events)
-	for {
-		if event, ok := subscriber.next(); ok {
-			select {
-			case subscriber.events <- event:
-				continue
-			case <-subscriber.ctx.Done():
-				return
-			}
-		}
-		select {
-		case <-subscriber.wake:
-		case <-subscriber.ctx.Done():
-			return
-		}
-	}
-}
-
-func (registry *requestRegistry) subscribe(ctx context.Context) *eventSubscriber {
-	subscriber := newEventSubscriber(ctx)
-	registry.mu.Lock()
-	registry.subscribers[subscriber] = struct{}{}
-	registry.mu.Unlock()
-	go func() {
-		<-ctx.Done()
-		registry.mu.Lock()
-		delete(registry.subscribers, subscriber)
-		registry.mu.Unlock()
-	}()
-	return subscriber
-}
-
-// activateSubscriber 原子衔接日志请求快照与实时事件
-func (registry *requestRegistry) activateSubscriber(
-	subscriber *eventSubscriber,
-	prefix []api.AdminEvent,
-	suffix []api.AdminEvent,
-) <-chan api.AdminEvent {
-	registry.mu.Lock()
-	initialLogs := registry.logs
-	if len(initialLogs) > adminLogInitialEvents {
-		initialLogs = initialLogs[len(initialLogs)-adminLogInitialEvents:]
-	}
-	initial := make([]api.AdminEvent, 0, len(prefix)+len(initialLogs)+len(suffix)+len(registry.active))
-	initial = append(initial, prefix...)
-	for _, entry := range initialLogs {
-		initial = append(initial, api.AdminEvent{Type: "log", Data: entry})
-	}
-	initial = append(initial, suffix...)
-	requests := make([]api.AdminRequest, 0, len(registry.active))
-	for _, tracked := range registry.active {
-		requests = append(requests, tracked.request)
-	}
-	sort.Slice(requests, func(left int, right int) bool {
-		return requests[left].StartedAt.Before(requests[right].StartedAt)
-	})
-	for _, request := range requests {
-		initial = append(initial, api.AdminEvent{Type: "request", Data: request})
-	}
-	subscriber.activate(initial)
-	registry.mu.Unlock()
-	go subscriber.run()
-	return subscriber.events
-}
-
-func (registry *requestRegistry) publishLocked(event api.AdminEvent) {
-	for subscriber := range registry.subscribers {
-		subscriber.enqueue(event)
-	}
-}
-
-// publish 向管理页订阅者发布增量事件
-func (registry *requestRegistry) publish(event api.AdminEvent) {
-	registry.mu.Lock()
-	registry.publishLocked(event)
-	registry.mu.Unlock()
-}
-
-// version 是分发方编译时以 -ldflags "-X github.com/Mag1cFall/AIStudio2API/internal/app.version=<版本>" 写入的版本号
+// version 是编译时写入的版本号
 var version string
 
 // managedBy 是分发方编译时以 -ldflags "-X github.com/Mag1cFall/AIStudio2API/internal/app.managedBy=<分发方>" 写入的更新管理方，非空时在线更新由该分发方负责
@@ -1519,8 +1172,12 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		AdminAuthEnabled: cfg.AdminAuthEnabled, AdminUsername: cfg.AdminUsername,
 		AdminPasswordSet: cfg.AdminPassword != "", SavedAdminPassword: cfg.AdminPassword,
 		BuildNativeNonstream: cfg.BuildNativeNonstream,
-		AuthStates:           cfg.AuthStates, ListenAddr: cfg.ListenAddr, APIKey: cfg.ProxyAPIKey,
+		NonstreamKeepalive:   cfg.NonstreamKeepalive, FakeStream: cfg.FakeStream, YouTubeLinks: cfg.YouTubeLinks,
+		SearchModelAliases: cfg.SearchModelAliases, GoogleSearch: cfg.GoogleSearch,
+		ContinuationRewrite: cfg.ContinuationRewrite, ContinuationPrompt: cfg.ContinuationPrompt,
+		FirstEventHedge: cfg.FirstEventHedge, FirstEventHedgeModels: cfg.FirstEventHedgeModels, AuthStates: cfg.AuthStates, ListenAddr: cfg.ListenAddr, APIKey: cfg.ProxyAPIKey,
 		ActiveListenAddr: cfg.ListenAddr, ActiveAPIKey: cfg.ProxyAPIKey,
+		PreviewListenAddr: cfg.PreviewListenAddr, ActivePreviewListenAddr: cfg.PreviewListenAddr,
 		Proxy: cfg.Proxy, InitTimeout: cfg.InitTimeout.String(), RequestTimeout: cfg.RequestTimeout.String(),
 		WarmWorkerLimit: cfg.WarmWorkerLimit, MaxActiveWorkers: cfg.MaxActiveWorkers,
 		WarmStartupConcurrency: cfg.WarmStartupConcurrency,
@@ -1529,11 +1186,23 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		UpstreamChannels:       cfg.UpstreamChannels,
 		ModelMapping:           cfg.ModelMapping,
 		ModelChannels:          cfg.ModelChannels,
+		APIKeyAccounts:         cfg.APIKeyAccounts,
 		TemporaryChat:          cfg.TemporaryChat,
 		WAABackend:             cfg.WAABackend,
 		MediaOutput:            cfg.MediaOutput,
 		MediaBaseURL:           cfg.MediaBaseURL,
+		Environment:            append([]string{}, cfg.Environment...),
+		Invalid:                invalidConfigDTO(cfg.Invalid),
 	}
 }
 
-var _ api.AdminService = (*runtimeAdmin)(nil)
+// invalidConfigDTO 把加载时无效的配置项转为管理接口的表示
+func invalidConfigDTO(values []config.InvalidValue) []api.InvalidConfigValue {
+	result := make([]api.InvalidConfigValue, 0, len(values))
+	for _, value := range values {
+		result = append(result, api.InvalidConfigValue{Key: value.Key, Value: value.Value, Reason: value.Reason})
+	}
+	return result
+}
+
+var _ generationAdmin = (*runtimeAdmin)(nil)

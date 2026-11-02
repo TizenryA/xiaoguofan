@@ -1,6 +1,7 @@
+import { jsonBody } from '@/api'
 import { useConsole } from '@/console'
 import type { Model } from '@/types'
-import { hasCode, toolCodes, type Tool } from './catalog'
+import { Capability, hasCode, toolCodes, type Tool } from './catalog'
 import type { Part, RunSettings, Source, Support, Turn } from './types'
 
 // GenerateRequest 是一次 Gemini API 生成请求的正文
@@ -21,7 +22,7 @@ const toolPayloads: Partial<Record<Tool, Record<string, unknown>>> = {
 }
 
 // parseJSON 解析编辑器中的 JSON 文本，空文本或无效 JSON 返回 undefined
-export function parseJSON(text: string): unknown {
+function parseJSON(text: string): unknown {
   if (text.trim() === '') return undefined
   try {
     return JSON.parse(text) as unknown
@@ -30,48 +31,54 @@ export function parseJSON(text: string): unknown {
   }
 }
 
-// requestContents 把对话轮次写为 contents：去掉思考正文与出错的空轮次
-export function requestContents(turns: readonly Turn[]): GenerateRequest['contents'] {
+// requestContents 把对话轮次写为 contents：去掉思考正文、出错的空轮次与附件的显示字段
+function requestContents(turns: readonly Turn[]): GenerateRequest['contents'] {
   return turns
     .map((turn) => ({
       role: turn.role,
-      parts: turn.parts.filter(
-        (part) => !(part.thought && part.text !== undefined && !part.thoughtSignature),
-      ),
+      parts: turn.parts
+        .filter((part) => !(part.thought && part.text !== undefined && !part.thoughtSignature))
+        .map(apiPart),
     }))
     .filter((turn) => turn.parts.length > 0)
 }
 
-// buildRequest 按模型能力把运行设置写为 Gemini API 请求，模型不支持的设置不发送
+// apiPart 返回去掉试用页显示字段的片段，内联附件的文件名写为 inlineData.displayName
+export function apiPart({ fileName, tokenCount: _tokenCount, ...part }: Part): Part {
+  if (fileName === undefined || part.inlineData === undefined) return part
+  return { ...part, inlineData: { ...part.inlineData, displayName: fileName } }
+}
+
+// buildRequest 按模型能力把运行设置写为 Gemini API 请求，模型不支持的设置不发送，采样参数按所设值发送
 export function buildRequest(
   settings: RunSettings,
   model: Model | undefined,
   turns: readonly Turn[],
 ): GenerateRequest {
   const config: Record<string, unknown> = {}
-  if (hasCode(model, 62) && settings.temperature !== null) config.temperature = settings.temperature
-  if (hasCode(model, 23) && settings.topP !== null) config.topP = settings.topP
-  if (hasCode(model, 24) && settings.topK !== null) config.topK = settings.topK
-  if (hasCode(model, 64) && settings.maxOutputTokens !== null)
+  if (settings.temperature !== null) config.temperature = settings.temperature
+  if (settings.topP !== null) config.topP = settings.topP
+  if (settings.topK !== null) config.topK = settings.topK
+  if (hasCode(model, Capability.MaxOutputTokens) && settings.maxOutputTokens !== null)
     config.maxOutputTokens = settings.maxOutputTokens
-  if (hasCode(model, 63) && settings.stopSequences.length > 0)
+  if (hasCode(model, Capability.StopSequences) && settings.stopSequences.length > 0)
     config.stopSequences = settings.stopSequences
-  if (hasCode(model, 43) && settings.mediaResolution !== '')
+  if (hasCode(model, Capability.MediaResolution) && settings.mediaResolution !== '')
     config.mediaResolution = settings.mediaResolution
-  if (hasCode(model, 52)) {
+  if (hasCode(model, Capability.ThinkingLevel)) {
     config.thinkingConfig = {
       includeThoughts: true,
       ...(settings.thinkingLevel === null ? {} : { thinkingLevel: settings.thinkingLevel }),
     }
-  } else if (hasCode(model, 35)) {
+  } else if (hasCode(model, Capability.ThinkingBudget)) {
     config.thinkingConfig = {
       includeThoughts: true,
       ...(settings.thinkingBudget === -1 ? {} : { thinkingBudget: settings.thinkingBudget }),
     }
-  } else if (hasCode(model, 25)) {
+  } else if (hasCode(model, Capability.Thinking)) {
     config.thinkingConfig = { includeThoughts: true }
   }
-  if (hasCode(model, 21)) {
+  if (hasCode(model, Capability.ImageRoute)) {
     config.responseModalities = settings.imageOutput === 'IMAGE' ? ['IMAGE'] : ['IMAGE', 'TEXT']
     const imageConfig: Record<string, string> = {}
     if (model?.capabilities?.aspect_ratio && settings.aspectRatio !== '')
@@ -114,10 +121,10 @@ export function buildRequest(
       tools.push({ functionDeclarations: declarations })
   }
   const request: GenerateRequest = { contents: requestContents(turns), generationConfig: config }
-  if (settings.systemInstruction.trim() !== '' && hasCode(model, 8)) {
+  if (settings.systemInstruction.trim() !== '' && hasCode(model, Capability.SystemInstruction)) {
     request.systemInstruction = { parts: [{ text: settings.systemInstruction }] }
   }
-  if (hasCode(model, 28)) {
+  if (hasCode(model, Capability.SafetySettings)) {
     request.safetySettings = Object.entries(settings.safety).map(([category, threshold]) => ({
       category,
       threshold,
@@ -139,20 +146,15 @@ export interface StreamUpdate {
   searchQueries?: string[]
 }
 
-// StreamError 是请求或流中返回的错误
-export class StreamError extends Error {
-  status: number
-
-  constructor(message: string, status: number) {
-    super(message)
-    this.name = 'StreamError'
-    this.status = status
-  }
+// failureText 返回请求失败的说明：未能连接服务时为 unreachable，其余为 failed，其中的 {detail} 换成错误原文
+export function failureText(error: unknown, unreachable: string, failed = '{detail}'): string {
+  const detail = error instanceof Error ? error.message : String(error)
+  return (error instanceof TypeError ? unreachable : failed).replace('{detail}', detail)
 }
 
 // apiKey 返回 Playground 请求使用的本服务 API key
 export function apiKey(): string {
-  return (useConsole().config.value?.proxy_api_key ?? '').split(',')[0]?.trim() ?? ''
+  return (useConsole().config.value?.proxy_api_key ?? '').split(',')[0]!.trim()
 }
 
 // errorMessage 读取 Gemini API 错误正文中的说明
@@ -254,11 +256,11 @@ export async function countTokens(
     method: 'POST',
     headers,
     signal,
-    body: JSON.stringify({
+    body: jsonBody({
       generateContentRequest: { model: `models/${modelID}`, ...request },
     }),
   })
-  if (!response.ok) throw new StreamError(await errorMessage(response), response.status)
+  if (!response.ok) throw new Error(await errorMessage(response))
   const value = (await response.json()) as { totalTokens?: number }
   return value.totalTokens ?? 0
 }

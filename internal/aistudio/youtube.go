@@ -43,6 +43,15 @@ func ExternalMediaForURL(raw string) (*ExternalMedia, bool) {
 	return &ExternalMedia{MIME: "video/*", URL: "https://www.youtube.com/watch?v=" + url.QueryEscape(videoID)}, true
 }
 
+// attachYouTubeLinks 返回把各 user content 文本中的 YouTube 链接转为视频外部媒体后的 contents
+func attachYouTubeLinks(contents []Content) []Content {
+	converted := make([]Content, len(contents))
+	for index, content := range contents {
+		converted[index] = attachYouTubeMedia(content)
+	}
+	return converted
+}
+
 func attachYouTubeMedia(content Content) Content {
 	if content.Role != RoleUser {
 		return content
@@ -56,20 +65,17 @@ func attachYouTubeMedia(content Content) Content {
 	parts := make([]Part, 0, len(content.Parts)+1)
 	for _, part := range content.Parts {
 		if part.Text != "" {
-			matches := youtubeURLPattern.FindAllString(part.Text, -1)
 			original := part.Text
-			if len(matches) > 0 {
-				for _, raw := range matches {
-					media, ok := ExternalMediaForURL(raw)
-					if !ok {
-						continue
-					}
-					if _, duplicate := existing[media.URL]; !duplicate {
-						existing[media.URL] = struct{}{}
-						parts = append(parts, Part{ExternalMedia: media})
-					}
-					part.Text = strings.ReplaceAll(part.Text, raw, "")
+			for _, raw := range youtubeURLPattern.FindAllString(part.Text, -1) {
+				media, ok := ExternalMediaForURL(raw)
+				if !ok {
+					continue
 				}
+				if _, duplicate := existing[media.URL]; !duplicate {
+					existing[media.URL] = struct{}{}
+					parts = append(parts, Part{ExternalMedia: media})
+				}
+				part.Text = strings.ReplaceAll(part.Text, raw, "")
 			}
 			if part.Text != original {
 				part.Text = strings.TrimSpace(part.Text)

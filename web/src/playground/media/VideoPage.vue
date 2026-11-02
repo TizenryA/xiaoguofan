@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   DropdownMenuContent,
   DropdownMenuItem,
@@ -15,94 +14,92 @@ import UiDialog from '@/playground/ui/UiDialog.vue'
 import UiIcon from '@/playground/ui/UiIcon.vue'
 import AddImageButton from './AddImageButton.vue'
 import FrameButton from './FrameButton.vue'
+import ApiKeyButton from '../ApiKeyButton.vue'
 import CodeDialog from '../CodeDialog.vue'
+import SavePromptDialog from '../SavePromptDialog.vue'
 import MediaLayout from './MediaLayout.vue'
 import MediaPromptBox from './MediaPromptBox.vue'
-import ModelEmptyState, { type Example, type Starter } from './ModelEmptyState.vue'
+import PaidUsageZeroState, { type Suggestion } from './PaidUsageZeroState.vue'
 import VideoSettings from './VideoSettings.vue'
 import VideoResult from './VideoResult.vue'
 import { readImage } from './api'
+import { useRunningClock } from '../clock'
+import { dataURL } from '../protocols'
 import { mediaCodeOptions, videoCode, type MediaCodeLanguage } from './code'
 import { maxReferences, useVideo, type VideoData, type VideoFrame } from './video'
 import { useMediaQuery } from '../media-query'
+import perfumePreview from './assets/perfume_animated_v2_opt_288x162.webp'
+import leopardPreview from './assets/snow_leopard_animated_opt_288x162.webp'
+import vegetablesPreview from './assets/stir_fry_vegetables_animated_opt_288x162.webp'
 
 const props = defineProps<{
   promptId?: string
-  prompt?: { title: string; data: VideoData } | undefined
+  prompt?: { title: string; description: string; data: VideoData } | undefined
 }>()
 const route = useRoute()
 const router = useRouter()
-const { t } = useI18n()
+const { t, logText } = useI18n()
 const store = useConsole()
 const video = useVideo()
 const { state, currentModel } = video
 const codeOpen = ref(false)
 const editing = ref(false)
-const titleDraft = ref('')
 const confirmDelete = ref(false)
 // handset 与官网一致，768 px 及以下 Tools 只显示图标
 const handset = useMediaQuery('(max-width: 768px)')
 
-// zero 是官网视频页空态的示例
-const zero = {
-  starters: [
-    {
-      title: 'Direct a match-cut journey ("The Chocolate Echo")',
-      prompt:
-        'Starting from this Mayan temple cacao altar frame on ARRI Alexa with vintage anamorphic lenses: a priestess tastes cacao and closes her eyes in bliss, then match-cut on the eye-close to a candle-lit 17th-century Paris salon and a 2099 neon Tokyo apartment.',
-      thumb: 'https://www.gstatic.com/aistudio/zero-state/veo-chocolate-frame.webp',
-    },
-    {
-      title: 'Animate a macro botanical starting frame',
-      prompt:
-        'Starting from this clover leaf frame, rack focus to the suspended dewdrop on the leaf tip as a soft morning breeze sways the stem and golden sunlight flares through the water bead.',
-      thumb: 'https://www.gstatic.com/aistudio/zero-state/veo_3_1_clover_dewdrop.webp',
-    },
-    {
-      title: 'Capture a 120fps tabletop espresso pour',
-      prompt:
-        'Starting from this bottomless portafilter pour frame, animate a 120fps Phantom Flex macro shot as rich golden-brown espresso ribbons swirl into thick tiger-stripe crema with rising steam.',
-      thumb: 'https://www.gstatic.com/aistudio/zero-state/veo-espresso-frame.webp',
-    },
-  ] satisfies Starter[],
-  examples: [
-    {
-      title: 'Snow leopard in winter forest',
-      prompt:
-        'Cinematic 85mm telephoto tracking shot of a snow leopard with thick frost-dusted fur walking softly through a quiet winter cedar forest during gentle snowfall, shallow depth of field.',
-      preview: 'https://www.gstatic.com/aistudio/zero-state/veo_3_1_snow_leopard.webp',
-      video: 'https://www.gstatic.com/aistudio/zero-state/veo_3_1_snow_leopard.mp4',
-    },
-    {
-      title: 'Macro raindrop on clover leaf',
-      prompt:
-        'A cinematic macro video in ultra-slow motion of a vibrant green clover leaf after a rainstorm. A single dewdrop at the tip reflects the inverted forest canopy before detaching and landing on a glistening spiderweb below.',
-      preview: 'https://www.gstatic.com/aistudio/zero-state/veo_3_1_clover_dewdrop.webp',
-      video: 'https://www.gstatic.com/aistudio/zero-state/clover_leaf.mp4',
-    },
-  ] satisfies Example[],
-}
+// zeroState 是官网空态示例图片所在目录
+const zeroState = 'https://www.gstatic.com/aistudio/zero-state/'
+
+// suggestions 是当前界面语言的官网视频页空态三张示例卡片，reference 为作为起始图发送的图片
+const suggestions = computed<Suggestion[]>(() => [
+  {
+    label: t('zero.video.example1'),
+    caption: t('zero.video.example1'),
+    prompt: '',
+    image: perfumePreview,
+    reference: `${zeroState}perfume_v2.png`,
+  },
+  {
+    label: t('zero.video.example2'),
+    caption: t('zero.video.example2'),
+    prompt: t('zero.video.example2Prompt'),
+    image: leopardPreview,
+    reference: `${zeroState}snow_leopard.png`,
+  },
+  {
+    label: t('zero.video.example3'),
+    caption: t('zero.video.example3'),
+    prompt: t('zero.video.example3Prompt'),
+    image: vegetablesPreview,
+  },
+])
 
 // hasImages 表示输入中有图片，官网此时提示 Veo 不支持含儿童的图片
 const hasImages = computed(
   () => state.start !== undefined || state.last !== undefined || state.references.length > 0,
 )
-const canRun = computed(
-  () => currentModel.value !== undefined && state.draft.trim() !== '' && !video.openAIFrames.value,
+// referenceInputs 表示模型接受参考图，参考图最多 3 张且与首尾帧互斥
+const referenceInputs = computed(() => video.videoInputs.value.references)
+// frameInputs 表示显示帧按钮：模型接受尾帧，或同时接受起始图与参考图，且没有参考图
+const frameInputs = computed(
+  () =>
+    (video.videoInputs.value.last || (video.videoInputs.value.start && referenceInputs.value)) &&
+    state.references.length === 0,
+)
+// imageDisabled 表示不能再加图片：没有模型或模型不接受图片，或参考图已满或已有帧
+const imageDisabled = computed(
+  () =>
+    currentModel.value === undefined ||
+    (!referenceInputs.value && !video.videoInputs.value.start) ||
+    (referenceInputs.value &&
+      (state.references.length >= maxReferences ||
+        state.start !== undefined ||
+        state.last !== undefined)),
 )
 
 // now 在生成期间每 100 ms 刷新，用于显示已用时间
-const now = ref(performance.now())
-let ticker = 0
-watch(
-  () => state.running,
-  (running) => {
-    window.clearInterval(ticker)
-    if (running) ticker = window.setInterval(() => (now.value = performance.now()), 100)
-  },
-  { immediate: true },
-)
-onUnmounted(() => window.clearInterval(ticker))
+const now = useRunningClock(() => state.running)
 
 // elapsed 返回模型轮次的耗时文字
 function elapsed(index: number, duration: number | undefined): string {
@@ -126,25 +123,35 @@ async function setLastFrame(file: File): Promise<void> {
   video.setLast(await toFrame(file, file.name))
 }
 
-// addReferences 加入参考图，最多 3 张
-async function addReferences(files: File[]): Promise<void> {
+// addImages 按模型能力加入图片：接受参考图时加为参考图，否则第一张作为起始图
+async function addImages(files: File[]): Promise<void> {
+  if (imageDisabled.value) return
+  if (!referenceInputs.value) {
+    await setStart(files[0]!)
+    return
+  }
   for (const file of files.slice(0, maxReferences - state.references.length))
     state.references.push(await toFrame(file, file.name))
 }
 
-// useStarter 填入示例提示词，带起始帧的示例下载帧图片后直接运行
-async function useStarter(item: Starter): Promise<void> {
-  state.draft = item.prompt
-  if (item.thumb) {
-    const response = await fetch(item.thumb)
-    state.start = await toFrame(await response.blob(), item.thumb.split('/').at(-1) ?? 'frame')
-  }
-  void video.run()
-}
+// suggestionPick 是最近一次点击示例的序号
+let suggestionPick = 0
 
-// useExample 填入示例提示词并运行
-function useExample(item: Example): void {
+// useSuggestion 与官网一样以示例的提示词与图片直接生成，图片作为起始图；没有模型时提示生成失败，示例图片读取完成前又点了其他示例时放弃这次点击
+async function useSuggestion(item: Suggestion): Promise<void> {
+  const pick = ++suggestionPick
+  if (currentModel.value === undefined) {
+    store.showNotice(t('pg.videoFailed').replace('{error}', t('pg.selectModel')), 'error')
+    return
+  }
+  const start = item.reference
+    ? await toFrame(await (await fetch(item.reference)).blob(), item.reference.split('/').at(-1)!)
+    : undefined
+  if (pick !== suggestionPick) return
   state.draft = item.prompt
+  state.references = []
+  video.setLast(undefined)
+  state.start = start
   void video.run()
 }
 
@@ -169,18 +176,6 @@ function newChat(): void {
   void router.push('/prompts/new_video')
 }
 
-// openRename 打开标题编辑框
-function openRename(): void {
-  titleDraft.value = state.title
-  editing.value = true
-}
-
-// saveTitle 保存编辑后的标题
-function saveTitle(): void {
-  editing.value = false
-  void video.rename(titleDraft.value)
-}
-
 // removePrompt 删除当前视频会话并回到新会话
 async function removePrompt(): Promise<void> {
   confirmDelete.value = false
@@ -191,7 +186,7 @@ async function removePrompt(): Promise<void> {
 watch(
   () => [props.promptId, props.prompt] as const,
   ([id, prompt]) => {
-    if (id && prompt) video.load(id, prompt.title, prompt.data)
+    if (id && prompt) video.load(id, prompt)
     else if (!id && state.id !== null) video.newSession()
   },
   { immediate: true },
@@ -218,7 +213,7 @@ watch(
         ms-button
         class="ms-button-borderless ms-button-icon ms-button-small"
         :aria-label="t('pg.editTitle')"
-        @click="openRename"
+        @click="editing = true"
       >
         <UiIcon name="edit" :size="18" />
       </button>
@@ -246,6 +241,22 @@ watch(
         </DropdownMenuTrigger>
         <DropdownMenuPortal>
           <DropdownMenuContent align="end" :side-offset="4" class="ms-menu-panel">
+            <DropdownMenuItem v-if="handset" class="ms-menu-item" disabled>
+              <UiIcon name="share" :size="18" />
+              <span class="ms-menu-item-text">{{ t('pg.share') }}</span>
+            </DropdownMenuItem>
+            <DropdownMenuItem class="ms-menu-item" disabled>
+              <UiIcon name="incognito" :size="18" />
+              <span class="ms-menu-item-text">{{ t('pg.temporaryChat') }}</span>
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              class="ms-menu-item"
+              :disabled="state.running"
+              @select="video.save(true)"
+            >
+              <UiIcon name="save" :size="18" />
+              <span class="ms-menu-item-text">{{ t('pg.savePrompt') }}</span>
+            </DropdownMenuItem>
             <DropdownMenuItem
               class="ms-menu-item"
               :disabled="state.id === null || state.running"
@@ -259,21 +270,15 @@ watch(
       </DropdownMenuRoot>
     </template>
 
-    <div v-if="state.loadError === 'not_found'" class="load-error">
-      <h2>{{ t('pg.notFoundTitle') }}</h2>
-      <p>{{ t('pg.notFoundBody') }}</p>
-    </div>
-    <div v-else-if="state.turns.length === 0" class="zero-state-container">
-      <ModelEmptyState
-        kind="video"
-        :title="t('pg.videoEmptyTitle').replace('{model}', currentModel?.name ?? 'Veo')"
-        :description="t('pg.videoEmptyDescription')"
-        :starters="zero.starters"
-        :examples="zero.examples"
-        @starter="useStarter"
-        @example="useExample"
-      />
-    </div>
+    <PaidUsageZeroState
+      v-if="state.turns.length === 0"
+      :title="t('pg.videoEmptyTitle').replace('{model}', currentModel?.name ?? 'Veo')"
+      :subtitle="t('pg.videoEmptyDescription')"
+      layout="single-row"
+      icon="modelVideo"
+      :suggestions="suggestions"
+      @select="useSuggestion"
+    />
     <div v-else class="video-panel">
       <div class="scroller">
         <div class="turns-container">
@@ -290,20 +295,21 @@ watch(
                   ].filter(Boolean)"
                   :key="frameIndex"
                   class="loaded-image"
-                  :src="`data:${frame!.mimeType};base64,${frame!.data}`"
+                  :src="dataURL(frame!)"
                   :alt="frame!.name"
                 />
               </div>
             </template>
             <template v-else>
               <span class="turn-role">{{ turn.model }} • {{ elapsed(index, turn.duration) }}</span>
-              <p v-if="turn.error" class="turn-error">{{ turn.error }}</p>
+              <p v-if="turn.stopped" class="turn-error">{{ t('pg.generationStopped') }}</p>
+              <p v-else-if="turn.error" class="turn-error">{{ logText(turn.error) }}</p>
               <div v-else class="gallery-container">
                 <VideoResult
                   v-for="(path, videoIndex) in turn.videos ?? ['']"
                   :key="videoIndex"
                   :path="path"
-                  :aspect-ratio="turn.aspectRatio ?? '16:9'"
+                  :aspect-ratio="turn.aspectRatio!"
                 />
               </div>
               <div v-if="index < state.turns.length - 1" class="turn-separator"></div>
@@ -319,34 +325,47 @@ watch(
         :placeholder="t('pg.describeVideo')"
         :label="t('pg.videoPromptLabel')"
         :running="state.running"
-        :can-run="canRun"
+        :can-run="video.canRun.value"
         :run-tooltip="video.openAIFrames.value ? t('pg.openAIVideoStartOnly') : ''"
         @run="video.run()"
         @stop="video.stop()"
-        @files="addReferences"
+        @files="addImages"
       >
-        <template #top>
+        <template v-if="frameInputs" #top>
           <FrameButton
             :frame="state.start"
             :label="t('pg.startFrame')"
             @add="setStart"
             @remove="state.start = undefined"
           />
-          <span class="augmentation-separator"><UiIcon name="swapHoriz" :size="24" /></span>
-          <FrameButton
-            :frame="state.last"
-            :label="t('pg.lastFrame')"
-            @add="setLastFrame"
-            @remove="video.setLast(undefined)"
-          />
-        </template>
-        <template v-if="state.references.length" #media>
-          <div v-for="(frame, index) in state.references" :key="index" class="reference">
-            <img
-              class="reference-image"
-              :src="`data:${frame.mimeType};base64,${frame.data}`"
-              :alt="frame.name"
+          <template v-if="video.videoInputs.value.last">
+            <span class="augmentation-separator"><UiIcon name="swapHoriz" :size="24" /></span>
+            <FrameButton
+              :frame="state.last"
+              :label="t('pg.lastFrame')"
+              @add="setLastFrame"
+              @remove="video.setLast(undefined)"
             />
+          </template>
+        </template>
+        <template v-if="!frameInputs && state.start" #media>
+          <div class="reference">
+            <img class="reference-image" :src="dataURL(state.start)" :alt="state.start.name" />
+            <span class="reference-name">{{ state.start.name }}</span>
+            <button
+              type="button"
+              ms-button
+              class="ms-button-borderless ms-button-icon ms-button-small"
+              :aria-label="t('pg.removeMedia')"
+              @click="state.start = undefined"
+            >
+              <UiIcon name="close" :size="16" />
+            </button>
+          </div>
+        </template>
+        <template v-else-if="state.references.length" #media>
+          <div v-for="(frame, index) in state.references" :key="index" class="reference">
+            <img class="reference-image" :src="dataURL(frame)" :alt="frame.name" />
             <span class="reference-name">{{ frame.name }}</span>
             <button
               type="button"
@@ -363,11 +382,13 @@ watch(
           <AddImageButton
             icon="addCircle"
             chip
-            multiple
-            :label="t('pg.addReferenceImages')"
-            :disabled="state.references.length >= maxReferences"
-            @images="addReferences"
+            :multiple="referenceInputs"
+            :label="referenceInputs ? t('pg.addReferenceImages') : t('pg.addImageToPrompt')"
+            :tooltip="currentModel === undefined ? t('pg.imagesCannotBeAdded') : undefined"
+            :disabled="imageDisabled"
+            @images="addImages"
           />
+          <ApiKeyButton />
           <button
             type="button"
             ms-button
@@ -389,26 +410,18 @@ watch(
     </template>
   </MediaLayout>
   <CodeDialog v-model:open="codeOpen" :options="mediaCodeOptions" :code="code" />
-  <UiDialog v-model:open="editing" :title="t('pg.editTitle')" width="480px">
-    <label class="field-label" for="video-title">{{ t('pg.title') }}</label>
-    <input
-      id="video-title"
-      v-model="titleDraft"
-      ms-input
-      class="title-input"
-      maxlength="120"
-      @keydown.enter.prevent="saveTitle"
-    />
-    <template #actions>
-      <button type="button" ms-button class="ms-button-borderless" @click="editing = false">
-        {{ t('common.cancel') }}
-      </button>
-      <button type="button" ms-button class="ms-button-primary" @click="saveTitle">
-        {{ t('common.save') }}
-      </button>
-    </template>
-  </UiDialog>
-  <UiDialog v-model:open="confirmDelete" :title="t('pg.deleteTitle')" width="420px">
+  <SavePromptDialog
+    v-model:open="editing"
+    :title="state.title"
+    :description="state.description"
+    @save="(title, description) => video.rename(title, description)"
+  />
+  <UiDialog
+    v-model:open="confirmDelete"
+    :title="t('pg.deleteTitle')"
+    width="500px"
+    :closable="false"
+  >
     <p class="confirm-text">{{ t('pg.deleteBody') }}</p>
     <template #actions>
       <button type="button" ms-button class="ms-button-borderless" @click="confirmDelete = false">
@@ -422,37 +435,9 @@ watch(
 </template>
 
 <style scoped>
-.field-label {
-  display: block;
-  margin-bottom: 8px;
-  font-weight: 500;
-}
-
-.title-input {
-  width: 100%;
-}
-
 .confirm-text {
   margin: 0;
-  color: var(--color-v3-text-var);
-}
-
-.zero-state-container {
-  display: flex;
-  flex-direction: column;
-  flex-grow: 1;
-  align-items: center;
-  justify-content: center;
-  min-height: 0;
-  padding: 20px;
-  overflow-y: auto;
-}
-
-@media screen and (max-width: 600px) {
-  .zero-state-container {
-    justify-content: flex-start;
-    padding: 16px;
-  }
+  line-height: 21px;
 }
 
 .video-panel {
@@ -526,7 +511,7 @@ watch(
   margin-top: 12px;
   margin-right: 140px;
   margin-left: 8px;
-  border-top: 1px solid var(--turn-separator-color, var(--color-v3-outline));
+  border-top: 1px solid var(--color-v3-outline);
 }
 
 .image-container {
@@ -608,16 +593,5 @@ watch(
   font-size: 12px;
   font-weight: 400;
   line-height: 18px;
-}
-
-.load-error {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  padding: 24px;
-  text-align: center;
 }
 </style>

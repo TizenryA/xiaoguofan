@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"strings"
@@ -33,7 +32,6 @@ type geminiEmbedContentRequest struct {
 
 // openAIEmbeddingInputs 把 input 的字符串或字符串数组转换为 embedding 输入
 func openAIEmbeddingInputs(raw json.RawMessage) ([]string, error) {
-	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil, fmt.Errorf("input is required")
 	}
@@ -107,10 +105,10 @@ func (s *server) handleOpenAIEmbeddings(w http.ResponseWriter, r *http.Request) 
 		}
 		data = append(data, item)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, http.StatusOK, officialOrder("openai", map[string]any{
 		"object": "list", "data": data, "model": strings.TrimPrefix(model, "models/"),
 		"usage": map[string]int64{"prompt_tokens": result.TokenCount, "total_tokens": result.TokenCount},
-	})
+	}))
 }
 
 // embeddingBase64 按 OpenAI base64 编码把向量写成小端 float32 字节
@@ -124,21 +122,16 @@ func embeddingBase64(values []float64) string {
 
 // handleGeminiEmbed 处理 Gemini embedContent 与 batchEmbedContents，两者都以 batchEmbedContents 经 Build 通道发送
 func (s *server) handleGeminiEmbed(w http.ResponseWriter, r *http.Request, model string, batch bool) {
-	body, err := io.ReadAll(r.Body)
-	if err == nil {
-		body, _, err = geminiCamelKeys(body)
-	}
 	var single geminiEmbedContentRequest
 	var multiple struct {
 		Requests []geminiEmbedContentRequest `json:"requests"`
 	}
-	if err == nil {
-		if batch {
-			err = json.Unmarshal(body, &multiple)
-		} else {
-			err = json.Unmarshal(body, &single)
-			multiple.Requests = []geminiEmbedContentRequest{single}
-		}
+	var err error
+	if batch {
+		err = decodeGeminiJSON(r, &multiple)
+	} else {
+		err = decodeGeminiJSON(r, &single)
+		multiple.Requests = []geminiEmbedContentRequest{single}
 	}
 	if err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
@@ -180,10 +173,10 @@ func (s *server) handleGeminiEmbed(w http.ResponseWriter, r *http.Request, model
 		embeddings = append(embeddings, map[string]any{"values": values})
 	}
 	if !batch {
-		writeJSON(w, http.StatusOK, map[string]any{"embedding": embeddings[0]})
+		writeJSON(w, http.StatusOK, officialOrder("gemini", map[string]any{"embedding": embeddings[0]}))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"embeddings": embeddings})
+	writeJSON(w, http.StatusOK, officialOrder("gemini", map[string]any{"embeddings": embeddings}))
 }
 
 // embed 调用支持 embedding 的服务

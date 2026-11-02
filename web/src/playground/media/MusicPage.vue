@@ -1,9 +1,8 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useConsole } from '@/console'
-import { useI18n } from '@/i18n'
+import { useI18n, type TranslationKey } from '@/i18n'
 import { useMediaQuery } from '../media-query'
 import type { IconName } from '@/playground/ui/icons'
 import UiIcon from '@/playground/ui/UiIcon.vue'
@@ -27,11 +26,12 @@ import {
   realtimeMusicCode,
   type MusicCodeLanguage,
 } from './music-code'
+import { dataURL } from '../protocols'
 import { useRealtimeMusic } from './realtime-music'
 import { useMusic, type MusicView } from './music'
 
 const route = useRoute()
-const { t } = useI18n()
+const { t, logText } = useI18n()
 const store = useConsole()
 const music = useMusic()
 const { state, currentModel } = music
@@ -51,135 +51,70 @@ interface MusicExample extends Example {
   audio: string
 }
 
-// zero 是官网音乐页空态的示例
-const zero = {
+// zero 是当前界面语言的官网音乐页空态示例
+const zero = computed(() => ({
   starters: [
     {
-      title: 'Compose a cinematic orchestral hybrid score',
-      prompt:
-        'Born for This Moment: [0:00-0:20] Lone close-mic cello and distant heartbeat timpani in D minor. [0:20-0:50] Spiccato string ostinatos and low French horn warning calls build momentum. [0:50-1:30] Thunderous taiko drums, brass fanfare, and soaring strings erupt in a triumphant major key.',
+      title: t('zero.music.starter1'),
+      prompt: t('zero.music.starter1Prompt'),
       audio: 'https://www.gstatic.com/aistudio/lyria/zero-state/born-for-this-moment.wav',
     },
     {
-      title: 'Produce a 90s indie alt-rock anthem with vocals',
-      prompt:
-        'Smiling Through the Static: Bright jangly 90s alternative rock at 124 BPM with dual chorus-infused electric guitars, mahogany acoustic strumming, tambourine backbeat, fuzzy walking bass, and a soulful female alto belting an anthemic chorus.',
+      title: t('zero.music.starter2'),
+      prompt: t('zero.music.starter2Prompt'),
       audio: 'https://www.gstatic.com/aistudio/lyria/zero-state/smiling-through-the-static.wav',
     },
     {
-      title: 'Build a peak-time big-room EDM festival drop',
-      prompt:
-        'Again and Again: Driving 128 BPM club track anchored by a punchy four-on-the-floor kick, resonant low-pass filter sweep on a metallic synth pluck, side-chained sub-bass, and an euphoric supersaw chorus.',
+      title: t('zero.music.starter3'),
+      prompt: t('zero.music.starter3Prompt'),
       audio: 'https://www.gstatic.com/aistudio/lyria/zero-state/again-and-again.wav',
     },
   ] satisfies MusicStarter[],
   examples: [
     {
-      title: 'Make a wake-up track',
-      prompt:
-        'Create a gentle wake-up track with warm analog synth pads, plucked harp harmonics, and a sunlit melody that gradually brightens over 30 seconds at 108 BPM. No vocals.',
+      title: t('zero.music.example1'),
+      prompt: t('zero.music.example1Prompt'),
       preview: 'https://www.gstatic.com/aistudio/zero-state/lyria_3_orchestra_cover.webp',
       audio: 'https://www.gstatic.com/aistudio/lyria/zero-state/lyria-song-4.mp3',
     },
     {
-      title: 'Score a rhythm game',
-      prompt:
-        'Create an energetic rhythm-game soundtrack with crisp punchy drums, side-chained FM bass, and a driving 124 BPM arcade synth lead. No vocals.',
+      title: t('zero.music.example2'),
+      prompt: t('zero.music.example2Prompt'),
       preview: 'https://www.gstatic.com/aistudio/zero-state/lyria_3_synthwave_cover.webp',
       audio: 'https://www.gstatic.com/aistudio/lyria/zero-state/again-and-again.wav',
     },
   ] satisfies MusicExample[],
-}
-
-// TipSegment 是提示卡片中的一段文字，quote 为引号中的示例
-interface TipSegment {
-  text: string
-  quote?: boolean
-}
+}))
 
 // tips 是官网音乐编辑器的两组提示，每次打开编辑器各随机取一条
-const tips: { title: string; icon: IconName; items: TipSegment[][] }[] = [
+const tips: { title: TranslationKey; icon: IconName; items: TranslationKey[] }[] = [
   {
-    title: 'Pro tip: Structure',
+    title: 'pg.musicTipStructure',
     icon: 'modeSpeech',
     items: [
-      [
-        { text: 'Use ' },
-        { text: '[mm:ss – mm:ss]', quote: true },
-        { text: ' to define segments like Intro, Build, or Chorus.' },
-      ],
-      [
-        { text: 'Outline flow with arrows: ' },
-        { text: '[Intro] -> [Verse] -> [Chorus] -> [Bridge] -> [Outro]', quote: true },
-        { text: '.' },
-      ],
-      [
-        {
-          text: 'Build tension in the pre-chorus, then drop to silence before an explosive chorus.',
-        },
-      ],
-      [
-        {
-          text: 'Start with a quiet piano intro, build into a loud verse, then explode into the chorus.',
-        },
-      ],
-      [
-        {
-          text: 'Add a gradual crescendo, layering one instrument at a time until a wall of sound.',
-        },
-      ],
+      'pg.musicTipStructure1',
+      'pg.musicTipStructure2',
+      'pg.musicTipStructure3',
+      'pg.musicTipStructure4',
+      'pg.musicTipStructure5',
     ],
   },
   {
-    title: 'Pro tip: Details',
+    title: 'pg.musicTipDetails',
     icon: 'modeMusic',
     items: [
-      [
-        { text: 'Specify ' },
-        { text: 'A major', quote: true },
-        { text: ' or ' },
-        { text: '120 BPM', quote: true },
-        { text: ' for technical precision.' },
-      ],
-      [
-        { text: 'Lead your prompt with a genre — try ' },
-        { text: 'early 90s hip-hop', quote: true },
-        { text: ' or ' },
-        { text: '80s synth-pop', quote: true },
-        { text: '.' },
-      ],
-      [
-        { text: 'Mix genres for unique sounds, like ' },
-        { text: 'a fusion of metal and rap', quote: true },
-        { text: '.' },
-      ],
-      [
-        { text: 'Describe specific instruments: ' },
-        { text: 'warm analog synth pads under a dry acoustic guitar', quote: true },
-        { text: '.' },
-      ],
-      [
-        { text: 'Use ' },
-        { text: '3/4 waltz time', quote: true },
-        { text: ' or ' },
-        { text: '6/8 blues shuffle', quote: true },
-        { text: ' for a specific rhythmic feel.' },
-      ],
-      [
-        { text: 'Add vocal details: ' },
-        { text: 'female soprano with a clear, crystalline timbre', quote: true },
-        { text: '.' },
-      ],
-      [
-        { text: 'Describe the lyric theme: ' },
-        { text: 'lyrics about lost love and the pain of heartbreak', quote: true },
-        { text: '.' },
-      ],
+      'pg.musicTipDetails1',
+      'pg.musicTipDetails2',
+      'pg.musicTipDetails3',
+      'pg.musicTipDetails4',
+      'pg.musicTipDetails5',
+      'pg.musicTipDetails6',
+      'pg.musicTipDetails7',
     ],
   },
 ]
 const tipIndex = ref(tips.map((tip) => Math.floor(Math.random() * tip.items.length)))
-const viewOptions: { value: MusicView; icon: IconName; label: string }[] = [
+const viewOptions: { value: MusicView; icon: IconName; label: TranslationKey }[] = [
   { value: 'text', icon: 'editNote', label: 'pg.musicText' },
   { value: 'composer', icon: 'layout', label: 'pg.musicComposer' },
 ]
@@ -215,7 +150,7 @@ function openEditor(prompt = '', audio?: string): void {
   tipIndex.value = tips.map((tip) => Math.floor(Math.random() * tip.items.length))
   music.edit(
     prompt,
-    audio ? { url: audio, name: audio.split('/').at(-1) ?? 'music.wav', sample: true } : undefined,
+    audio ? { url: audio, name: audio.split('/').at(-1)!, sample: true } : undefined,
   )
 }
 
@@ -242,9 +177,7 @@ async function addImages(files: File[]): Promise<void> {
 // onDrop 接收拖入的图片
 function onDrop(event: DragEvent): void {
   dragging.value = false
-  const files = [...(event.dataTransfer?.files ?? [])].filter((file) =>
-    file.type.startsWith('image/'),
-  )
+  const files = [...event.dataTransfer!.files].filter((file) => file.type.startsWith('image/'))
   void addImages(files)
 }
 
@@ -267,8 +200,8 @@ function code(language: MusicCodeLanguage): string {
     return realtimeMusicCode(language, {
       baseURL: window.location.origin,
       model: state.model,
-      prompts: realtimeMusic.state.prompts,
-      config: realtimeMusic.state.config,
+      prompts: realtimeMusic.activePrompts(),
+      config: realtimeMusic.configFrame(),
     })
   return musicCode(language, {
     baseURL: window.location.origin,
@@ -291,7 +224,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <MediaLayout>
+  <MediaLayout fade-title>
     <template #actions>
       <div
         v-if="state.editing && !realtime"
@@ -310,7 +243,7 @@ onUnmounted(() => {
         <button
           v-for="option in viewOptions"
           :key="option.value"
-          v-tooltip.below="handset ? t(option.label as 'pg.musicText') : undefined"
+          v-tooltip.below="handset ? t(option.label) : undefined"
           type="button"
           ms-button
           role="radio"
@@ -321,7 +254,7 @@ onUnmounted(() => {
           @click="music.setView(option.value)"
         >
           <UiIcon :name="option.icon" :size="18" />
-          <span class="toggle-label">{{ t(option.label as 'pg.musicText') }}</span>
+          <span class="toggle-label">{{ t(option.label) }}</span>
         </button>
       </div>
       <CopyPromptButton
@@ -382,7 +315,7 @@ onUnmounted(() => {
         <div class="prompt-media-container">
           <div class="prompt-media-list">
             <div v-for="(image, index) in state.images" :key="index" class="media-item">
-              <img :src="`data:${image.mimeType};base64,${image.data}`" :alt="image.name" />
+              <img :src="dataURL(image)" :alt="image.name" />
               <button
                 type="button"
                 ms-button
@@ -410,21 +343,14 @@ onUnmounted(() => {
         <div v-for="(tip, index) in tips" :key="tip.title" class="pro-tip-card">
           <div class="pro-tip-header">
             <UiIcon :name="tip.icon" :size="16" />
-            <span class="pro-tip-title">{{ tip.title }}</span>
+            <span class="pro-tip-title">{{ t(tip.title) }}</span>
           </div>
-          <div class="pro-tip-content">
-            <template
-              v-for="(segment, segmentIndex) in tip.items[tipIndex[index]!]"
-              :key="segmentIndex"
-            >
-              {{ segment.quote ? `"${segment.text}"` : segment.text }}
-            </template>
-          </div>
+          <div class="pro-tip-content">{{ t(tip.items[tipIndex[index]!]!) }}</div>
         </div>
       </div>
     </div>
 
-    <p v-if="state.error" role="alert" class="music-error">{{ state.error }}</p>
+    <p v-if="state.error" role="alert" class="music-error">{{ logText(state.error) }}</p>
     <AudioFooter
       v-if="state.editing && !realtime"
       :audio="state.audio?.url ?? ''"
@@ -557,14 +483,15 @@ onUnmounted(() => {
   justify-content: center;
   width: 100%;
   min-height: 0;
+  padding-inline: 20px;
   padding-bottom: 150px;
   overflow-y: auto;
-  animation: fade-in 0.3s ease-in-out;
 }
 
 @media screen and (max-width: 600px) {
   .usage-zero-state-container {
     justify-content: flex-start;
+    padding-inline: 0;
     padding-bottom: 0;
   }
 }

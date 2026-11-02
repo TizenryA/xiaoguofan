@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,10 +18,6 @@ import (
 
 type httpStatusError interface {
 	HTTPStatus() int
-}
-
-type statusCodeError interface {
-	StatusCode() int
 }
 
 type errorCodeProvider interface {
@@ -106,10 +103,7 @@ func statusFromError(err error) int {
 	if errors.As(err, &notReady) {
 		return http.StatusServiceUnavailable
 	}
-	if errors.Is(err, aistudio.ErrNoEligibleAccount) {
-		return http.StatusBadRequest
-	}
-	if errors.Is(err, aistudio.ErrInvalidArgument) {
+	if errors.Is(err, aistudio.ErrNoEligibleAccount) || errors.Is(err, aistudio.ErrInvalidArgument) {
 		return http.StatusBadRequest
 	}
 	if errors.Is(err, aistudio.ErrModelNotFound) {
@@ -125,10 +119,6 @@ func statusFromError(err error) int {
 	var statusErr httpStatusError
 	if errors.As(err, &statusErr) {
 		return validHTTPStatus(statusErr.HTTPStatus())
-	}
-	var codeErr statusCodeError
-	if errors.As(err, &codeErr) {
-		return validHTTPStatus(codeErr.StatusCode())
 	}
 	return http.StatusBadGateway
 }
@@ -158,30 +148,96 @@ func codeFromError(err error, defaultCode string) string {
 	return defaultCode
 }
 
+// requestProtocol 返回请求路径与请求头所属的公开协议：gemini、anthropic 或 openai
+func requestProtocol(r *http.Request) string {
+	switch {
+	case strings.HasPrefix(r.URL.Path, "/v1beta/"), strings.HasPrefix(r.URL.Path, "/upload/"), interactionsPath(r.URL.Path):
+		return "gemini"
+	case strings.HasPrefix(r.URL.Path, "/v1/messages"), r.Header.Get("Anthropic-Version") != "":
+		return "anthropic"
+	}
+	return "openai"
+}
+
+// writeAuthError 按请求所属协议写入 API key 错误，OpenAI 与 Anthropic 为 401
 func writeAuthError(w http.ResponseWriter, r *http.Request) {
-	switch protocolForRequest(r) {
+	switch requestProtocol(r) {
+	case "gemini":
+		writeGeminiAuthError(w, r)
 	case "anthropic":
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API Key")
-	case "gemini":
-		writeGeminiError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Invalid API Key")
-	case "admin":
-		writeAdminError(w, http.StatusUnauthorized, "invalid_api_key", "Invalid API Key")
 	default:
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "Invalid API Key")
 	}
 }
 
-func protocolForRequest(r *http.Request) string {
-	switch {
-	case strings.HasPrefix(r.URL.Path, "/v1beta/"), r.URL.Path == "/v1/interactions":
-		return "gemini"
-	case strings.HasPrefix(r.URL.Path, "/v1/messages"), r.Header.Get("Anthropic-Version") != "":
-		return "anthropic"
-	case strings.HasPrefix(r.URL.Path, "/api/"):
-		return "admin"
+// writeRouteNotFound 以请求所属协议的错误体返回 404，消息含请求的方法与路径
+func writeRouteNotFound(w http.ResponseWriter, r *http.Request) {
+	message := fmt.Sprintf("Invalid URL (%s %s)", r.Method, r.URL.Path)
+	switch requestProtocol(r) {
+	case "gemini":
+		writeGeminiError(w, http.StatusNotFound, "NOT_FOUND", message)
+	case "anthropic":
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", message)
 	default:
-		return "openai"
+		writeOpenAIError(w, http.StatusNotFound, "not_found", message)
 	}
+}
+
+// geminiInvalidKeyMessage 是 Gemini API 对无效 API key 的错误信息
+const geminiInvalidKeyMessage = "API key not valid. Please pass a valid API key."
+
+// geminiAuthFailure 是 Gemini API 认证错误的 error 对象
+type geminiAuthFailure struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Status  string `json:"status"`
+	Details []any  `json:"details,omitempty"`
+}
+
+// geminiErrorInfo 是 Gemini 错误 details 中的 google.rpc.ErrorInfo
+type geminiErrorInfo struct {
+	Type     string            `json:"@type"`
+	Reason   string            `json:"reason"`
+	Domain   string            `json:"domain"`
+	Metadata map[string]string `json:"metadata"`
+}
+
+// geminiLocalizedMessage 是 Gemini 错误 details 中的 google.rpc.LocalizedMessage
+type geminiLocalizedMessage struct {
+	Type    string `json:"@type"`
+	Locale  string `json:"locale"`
+	Message string `json:"message"`
+}
+
+// writeGeminiAuthError 按 Gemini API 写入 API key 错误：给出的 key 无效时为 400 INVALID_ARGUMENT 带 ErrorInfo 与 LocalizedMessage，没有 key 时为 403 PERMISSION_DENIED；Interactions 与非 SSE 的 streamGenerateContent 外层为数组
+func writeGeminiAuthError(w http.ResponseWriter, r *http.Request) {
+	failure := geminiAuthFailure{
+		Code: http.StatusForbidden, Status: "PERMISSION_DENIED",
+		Message: "Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API consumer identity to call this API.",
+	}
+	if slices.ContainsFunc(apiKeyCandidates(r), func(key string) bool { return key != "" }) {
+		failure = geminiAuthFailure{Code: http.StatusBadRequest, Message: geminiInvalidKeyMessage, Status: "INVALID_ARGUMENT", Details: []any{
+			geminiErrorInfo{Type: "type.googleapis.com/google.rpc.ErrorInfo", Reason: "API_KEY_INVALID", Domain: "googleapis.com", Metadata: map[string]string{"service": "generativelanguage.googleapis.com"}},
+			geminiLocalizedMessage{Type: "type.googleapis.com/google.rpc.LocalizedMessage", Locale: "en-US", Message: geminiInvalidKeyMessage},
+		}}
+	}
+	setAccessLogResponseError(w, failure.Message)
+	var payload any = map[string]geminiAuthFailure{"error": failure}
+	if interactionsPath(r.URL.Path) || strings.HasSuffix(r.URL.Path, ":streamGenerateContent") && r.URL.Query().Get("alt") != "sse" {
+		payload = []any{payload}
+	}
+	writeJSON(w, failure.Code, payload)
+}
+
+// interactionsPath 判断路径是否为 v1 或 v1beta 的 Interactions 资源
+func interactionsPath(path string) bool {
+	for _, prefix := range []string{"/v1/interactions", "/v1beta/interactions"} {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // serverErrorPrefix 返回 5xx 状态对应的官方英文错误开头，其余状态返回空
@@ -210,16 +266,19 @@ func publicErrorMessage(status int, message string) string {
 func writeOpenAIError(w http.ResponseWriter, status int, code string, message string) {
 	message = publicErrorMessage(status, message)
 	setAccessLogResponseError(w, message)
-	writeJSON(w, status, map[string]any{"error": map[string]any{
-		"message": message,
-		"type":    openAIErrorType(status, code),
-		"param":   nil,
-		"code":    code,
-	}})
+	writeJSON(w, status, map[string]any{"error": openAIErrorBody{Message: message, Type: openAIErrorType(status, code), Code: code}})
+}
+
+// openAIErrorBody 是 OpenAI 错误对象，字段顺序与官方相同
+type openAIErrorBody struct {
+	Message string  `json:"message"`
+	Type    string  `json:"type"`
+	Param   *string `json:"param"`
+	Code    string  `json:"code"`
 }
 
 func openAIErrorType(status int, code string) string {
-	if status == http.StatusBadRequest || status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || code == "invalid_request" || code == "invalid_api_key" || code == "model_not_found" {
+	if status == http.StatusBadRequest || status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
 		return "invalid_request_error"
 	}
 	if code == "rate_limit_exceeded" {
@@ -231,22 +290,28 @@ func openAIErrorType(status int, code string) string {
 func writeAnthropicError(w http.ResponseWriter, status int, errorType string, message string) {
 	message = publicErrorMessage(status, message)
 	setAccessLogResponseError(w, message)
-	writeJSON(w, status, map[string]any{
-		"type": "error",
-		"error": map[string]string{
-			"type":    errorType,
-			"message": message,
-		},
-	})
+	writeJSON(w, status, anthropicErrorResponse{Type: "error", Error: anthropicErrorBody{Type: errorType, Message: message}})
+}
+
+// anthropicErrorResponse 是 Anthropic 错误响应，字段顺序与官方相同
+type anthropicErrorResponse struct {
+	Type  string             `json:"type"`
+	Error anthropicErrorBody `json:"error"`
+}
+
+// anthropicErrorBody 是 Anthropic 错误对象
+type anthropicErrorBody struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
 }
 
 func writeGeminiError(w http.ResponseWriter, status int, statusName string, message string) {
 	setAccessLogResponseError(w, message)
-	writeJSON(w, status, map[string]any{"error": map[string]any{
+	writeJSON(w, status, officialOrder("gemini", map[string]any{"error": map[string]any{
 		"code":    status,
 		"message": message,
 		"status":  statusName,
-	}})
+	}}))
 }
 
 // writeOpenAIRequestError 以 OpenAI 错误体写出请求失败，可重试时带 Retry-After
@@ -283,7 +348,7 @@ func writeGeminiRequestError(w http.ResponseWriter, err error) {
 		payload["details"] = []any{map[string]any{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": strconv.FormatInt(seconds, 10) + "s"}}
 	}
 	setAccessLogResponseError(w, err.Error())
-	writeJSON(w, status, map[string]any{"error": payload})
+	writeJSON(w, status, officialOrder("gemini", map[string]any{"error": payload}))
 }
 
 // setRetryAfter 在错误给出可重试时刻时写入 Retry-After 秒数并返回它，否则返回 0
@@ -323,10 +388,11 @@ func openAIErrorCode(err error) string {
 	if errors.Is(err, aistudio.ErrNoEligibleAccount) {
 		return "account_required"
 	}
-	if errors.Is(err, aistudio.ErrInvalidArgument) {
-		return "invalid_request"
+	var feedback *aistudio.PromptFeedbackError
+	if errors.As(err, &feedback) {
+		return "invalid_prompt"
 	}
-	if isUnverifiedProtocolError(err) {
+	if errors.Is(err, aistudio.ErrInvalidArgument) || isUnverifiedProtocolError(err) {
 		return "invalid_request"
 	}
 	if contextOverflow(err) {
@@ -383,6 +449,8 @@ func geminiErrorStatus(err error) string {
 		return "PERMISSION_DENIED"
 	case http.StatusNotFound:
 		return "NOT_FOUND"
+	case http.StatusConflict:
+		return "ALREADY_EXISTS"
 	case http.StatusTooManyRequests:
 		return "RESOURCE_EXHAUSTED"
 	case http.StatusServiceUnavailable:

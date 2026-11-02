@@ -48,6 +48,9 @@ func supportedTools(tools Tools, model Model) (Tools, error) {
 		hasURLContext = hasURLContext || tool == "url_context"
 	}
 	tools.Google = google
+	if !hasURLContext {
+		tools.URLContext = nil
+	}
 	if hasMaps && (hasCode || hasURLContext) {
 		return Tools{}, fmt.Errorf("google_maps 不能与 code_execution 或 url_context 同时使用")
 	}
@@ -70,7 +73,7 @@ func transcribeFunctionParts(contents []Content) ([]Content, error) {
 			if part.FunctionCall == nil && part.FunctionResult == nil {
 				continue
 			}
-			transcript, err := toolPartTranscript(part)
+			transcript, err := ToolPartTranscript(part)
 			if err != nil {
 				return nil, fmt.Errorf("contents[%d].parts[%d]: %w", contentIndex, partIndex, err)
 			}
@@ -80,8 +83,8 @@ func transcribeFunctionParts(contents []Content) ([]Content, error) {
 	return transcribed, nil
 }
 
-// toolPartTranscript 返回函数调用、函数结果与代码执行 part 的 Gemini API JSON 文本
-func toolPartTranscript(part Part) (string, error) {
+// ToolPartTranscript 返回函数调用、函数结果与代码执行 part 的 Gemini API JSON 文本
+func ToolPartTranscript(part Part) (string, error) {
 	var value map[string]any
 	switch {
 	case part.FunctionCall != nil:

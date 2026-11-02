@@ -1,14 +1,18 @@
 import { computed, reactive } from 'vue'
+import { jsonBody } from '@/api'
 import { useConsole } from '@/console'
+import { useI18n, type TranslationKey } from '@/i18n'
+import { keepPage } from '@/desktop'
 import type { Model, VoiceDetail } from '@/types'
-import { apiKey, errorMessage, StreamError } from '../request'
+import { apiKey, errorMessage, failureText } from '../request'
 import { newTurnID } from '../session'
 import { audioBlob, generateContent } from './api'
+import { modelMatches } from '../catalog'
 import { pageKindOf } from './kinds'
 import type { SpeechTemplate } from './speech-templates'
 
 // SpeechProtocol 是语音页发送请求使用的公开协议
-export type SpeechProtocol = 'gemini' | 'openai-speech'
+type SpeechProtocol = 'gemini' | 'openai-speech'
 
 // speechProtocols 是语音页协议下拉的选项
 export const speechProtocols: { value: SpeechProtocol; label: string }[] = [
@@ -17,7 +21,7 @@ export const speechProtocols: { value: SpeechProtocol; label: string }[] = [
 ]
 
 // SpeechBlock 是一段台词：说话人序号、风格与正文
-export interface SpeechBlock {
+interface SpeechBlock {
   id: string
   speaker: number
   style: string
@@ -42,11 +46,14 @@ export interface SpeechSettings {
   conversational: boolean
 }
 
-// StylePreset 是风格下拉的一项预设
+// StylePreset 是风格下拉的一项预设：label 与 description 是界面上的名称与说明，value 是写入请求的官网原文
 export interface StylePreset {
-  label: string
+  label: TranslationKey
+  description?: TranslationKey
   value: string
 }
+
+const { t, locale } = useI18n()
 
 // daikonTags 是支持分段风格的 TTS 模型的表情与音效标签，插入为 <tag>
 const daikonTags =
@@ -62,67 +69,121 @@ const emotionTags =
 
 // daikonStyles 是支持分段风格的 TTS 模型的风格预设
 const daikonStyles: StylePreset[] = [
-  { label: 'Whisper', value: 'whisper quietly' },
-  { label: 'Friendly', value: 'Warm and neutral delivery with micro-pauses' },
-  { label: 'Narration', value: 'commanding, rich vocal modulation, dramatic pauses' },
-  { label: 'Promote', value: 'High energy, elongated vowels' },
-  { label: 'Podcast', value: 'Calm, measured delivery' },
+  { label: 'pg.styleWhisper', description: 'pg.styleWhisperDetail', value: 'whisper quietly' },
+  {
+    label: 'pg.styleFriendly',
+    description: 'pg.styleFriendlyDetail',
+    value: 'Warm and neutral delivery with micro-pauses',
+  },
+  {
+    label: 'pg.styleNarration',
+    description: 'pg.styleNarrationDetail',
+    value: 'commanding, rich vocal modulation, dramatic pauses',
+  },
+  {
+    label: 'pg.stylePromote',
+    description: 'pg.stylePromoteDetail',
+    value: 'High energy, elongated vowels',
+  },
+  {
+    label: 'pg.stylePodcast',
+    description: 'pg.stylePodcastDetail',
+    value: 'Calm, measured delivery',
+  },
 ]
 
 // classicStyles 是其他 TTS 模型的风格预设
 const classicStyles: StylePreset[] = [
   {
-    label: 'Vocal Smile',
+    label: 'pg.styleVocalSmile',
+    description: 'pg.styleVocalSmileDetail',
     value:
       'The "Vocal Smile": The soft palate is raised to keep the tone bright, sunny, and explicitly inviting.',
   },
   {
-    label: 'Newscaster',
+    label: 'pg.styleNewscaster',
+    description: 'pg.styleNewscasterDetail',
     value: 'Professional, authoritative, clear articulation with standard broadcast cadence.',
   },
-  { label: 'Whisper', value: 'Intimate, breathy, close-to-mic proximity effect.' },
-  { label: 'Empathetic', value: 'Warm, understanding, soft tone with gentle inflections.' },
   {
-    label: 'Promo/Hype',
+    label: 'pg.styleWhisper',
+    description: 'pg.styleBreathyWhisperDetail',
+    value: 'Intimate, breathy, close-to-mic proximity effect.',
+  },
+  {
+    label: 'pg.styleEmpathetic',
+    description: 'pg.styleEmpatheticDetail',
+    value: 'Warm, understanding, soft tone with gentle inflections.',
+  },
+  {
+    label: 'pg.stylePromoHype',
+    description: 'pg.stylePromoHypeDetail',
     value: 'High energy, punchy consonants, elongated vowels on excitement words.',
   },
-  { label: 'Deadpan', value: 'Flat affect, minimal pitch variation, dry delivery.' },
+  {
+    label: 'pg.styleDeadpan',
+    description: 'pg.styleDeadpanDetail',
+    value: 'Flat affect, minimal pitch variation, dry delivery.',
+  },
 ]
 
 // paceOptions 是旧版 TTS 模型说话人语速的预设
 export const paceOptions: StylePreset[] = [
-  { label: 'Natural', value: 'Natural conversational pace.' },
-  { label: 'Rapid Fire', value: 'Fast, energetic, no dead air. Sentences overlap slightly.' },
-  { label: 'The Drift', value: 'Slow, liquid, zero urgency. Long pauses for breath.' },
-  { label: 'Staccato', value: 'Short, clipped sentences with distinct pauses between words.' },
+  {
+    label: 'pg.paceNatural',
+    description: 'pg.paceNaturalDetail',
+    value: 'Natural conversational pace.',
+  },
+  {
+    label: 'pg.paceRapidFire',
+    description: 'pg.paceRapidFireDetail',
+    value: 'Fast, energetic, no dead air. Sentences overlap slightly.',
+  },
+  {
+    label: 'pg.paceDrift',
+    description: 'pg.paceDriftDetail',
+    value: 'Slow, liquid, zero urgency. Long pauses for breath.',
+  },
+  {
+    label: 'pg.paceStaccato',
+    description: 'pg.paceStaccatoDetail',
+    value: 'Short, clipped sentences with distinct pauses between words.',
+  },
 ]
 
 // accentOptions 是旧版 TTS 模型说话人口音的预设
 export const accentOptions: StylePreset[] = [
-  { label: 'Neutral', value: 'Neutral' },
-  { label: 'American (Gen)', value: 'American (General)' },
-  { label: 'American (Valley)', value: 'American (Valley Girl)' },
-  { label: 'American (South)', value: 'Southern US' },
-  { label: 'British (RP)', value: 'British (RP)' },
-  { label: 'British (Brixton)', value: 'British (Brixton)' },
-  { label: 'Transatlantic', value: 'Transatlantic' },
-  { label: 'Australian', value: 'Australian' },
+  { label: 'pg.accentNeutral', value: 'Neutral' },
+  { label: 'pg.accentAmericanGeneral', value: 'American (General)' },
+  { label: 'pg.accentAmericanValley', value: 'American (Valley Girl)' },
+  { label: 'pg.accentAmericanSouth', value: 'Southern US' },
+  { label: 'pg.accentBritishRp', value: 'British (RP)' },
+  { label: 'pg.accentBritishBrixton', value: 'British (Brixton)' },
+  { label: 'pg.accentTransatlantic', value: 'Transatlantic' },
+  { label: 'pg.accentAustralian', value: 'Australian' },
 ]
+
+// defaultAlias 返回第 index 位说话人在请求中的默认名称，与官网一致
+export function defaultAlias(index: number): string {
+  return `Speaker ${index + 1}`
+}
 
 // newSpeaker 返回第 index 位说话人的初始设置
 function newSpeaker(index: number, voice: string): Speaker {
-  return { alias: `Speaker ${index + 1}`, voice, persona: '', style: '', pace: '', accent: '' }
+  return { alias: defaultAlias(index), voice, persona: '', style: '', pace: '', accent: '' }
+}
+
+// speakerName 返回第 index 位说话人在界面上的名称：默认名称按界面语言显示，自定义名称保持原样
+function speakerName(index: number): string {
+  const alias = state.speakers[index]!.alias
+  return alias === defaultAlias(index)
+    ? t('pg.speakerDefault').replace('{n}', String(index + 1))
+    : alias
 }
 
 // models 返回实时目录中的语音模型
 function models(): Model[] {
   return useConsole().models.value.filter((model) => pageKindOf(model) === 'speech')
-}
-
-// voicesOf 返回模型的音色介绍，目录没有介绍时只有名称
-function voicesOf(model: Model | undefined): VoiceDetail[] {
-  if (model?.voice_details?.length) return model.voice_details
-  return (model?.capability_options?.voices ?? []).map((name) => ({ name }))
 }
 
 const state = reactive({
@@ -146,8 +207,11 @@ let controller: AbortController | undefined
 let previewController: AbortController | undefined
 let previewAudio: HTMLAudioElement | undefined
 
+// 关闭桌面窗口时，生成中与只存在于页面的音频保留页面
+keepPage(() => state.running || state.audio.startsWith('blob:'))
+
 const currentModel = computed(() => models().find((model) => model.id === state.settings.model))
-const voices = computed(() => voicesOf(currentModel.value))
+const voices = computed(() => currentModel.value?.voice_details ?? [])
 // daikon 表示模型支持分段风格，官网对这类模型使用 <tag> 标签、风格下拉与 Filler words
 const daikon = computed(() => Boolean(currentModel.value?.capabilities?.speech_metadata))
 const tags = computed(() => [...(daikon.value ? daikonTags : emotionTags)].sort())
@@ -164,6 +228,10 @@ const canRun = computed(
 )
 // usedSpeakers 是运行设置中列出的说话人序号
 const usedSpeakers = computed(() => (multi.value ? [0, 1] : [0]))
+// temperature 是请求使用的温度：未设置时为模型默认值
+const temperature = computed(
+  () => state.settings.temperature ?? currentModel.value?.temperature ?? 1,
+)
 
 // voiceDetail 返回音色的介绍
 function voiceDetail(name: string): VoiceDetail | undefined {
@@ -173,7 +241,7 @@ function voiceDetail(name: string): VoiceDetail | undefined {
 // defaultVoice 返回第 index 位说话人的默认音色：与官网相同优先 Fola、Rami 或 Zephyr、Puck
 function defaultVoice(index: number): string {
   const preferred = daikon.value ? ['Fola', 'Rami'] : ['Zephyr', 'Puck']
-  const name = preferred[index] ?? preferred[0]!
+  const name = preferred[index]!
   if (voiceDetail(name)) return name
   return voices.value[index]?.name ?? voices.value[0]?.name ?? ''
 }
@@ -188,7 +256,7 @@ function ensureVoices(): void {
 // ensureModel 在目录变化后选定模型：地址中的模型优先，其次保留当前模型，否则用第一个语音模型
 function ensureModel(requested?: string): void {
   const list = models()
-  const wanted = list.find((model) => model.id === requested)
+  const wanted = list.find((model) => modelMatches(model, requested))
   if (wanted) setModel(wanted.id)
   else if (!list.some((model) => model.id === state.settings.model) && list[0]) setModel(list[0].id)
   else ensureVoices()
@@ -253,7 +321,7 @@ function close(): void {
   state.blocks = []
 }
 
-// useTemplate 载入官网示例对话的说话人、风格、台词与 Filler words
+// useTemplate 载入官网示例对话的说话人、风格、台词与 Filler words，英文界面另载入官网示例音频
 function useTemplate(template: SpeechTemplate): void {
   clear()
   state.speakers = [0, 1].map((index) => {
@@ -269,7 +337,7 @@ function useTemplate(template: SpeechTemplate): void {
     style: turn.style,
     text: daikon.value ? turn.text : convertTags(turn.text, false),
   }))
-  state.audio = template.audio
+  state.audio = locale.value === 'en' ? template.audio : ''
 }
 
 // addBlock 与官网一致在末尾加入一段台词，说话人与上一段交替
@@ -278,9 +346,9 @@ function addBlock(): void {
   state.blocks.push({ id: newTurnID(), speaker: last?.speaker === 0 ? 1 : 0, style: '', text: '' })
 }
 
-// removeBlock 删除一段台词，至少保留一段
+// removeBlock 删除一段台词
 function removeBlock(index: number): void {
-  if (state.blocks.length > 1) state.blocks.splice(index, 1)
+  state.blocks.splice(index, 1)
 }
 
 // part 把一段台词写为请求片段：多人模式带说话人名称，有风格时带风格
@@ -350,10 +418,7 @@ function legacyPrompt(blocks: readonly SpeechBlock[], isMulti: boolean): string 
 }
 
 // requestBody 按官网运行请求组合 generateContent：分段风格模型每段台词为一个带说话人与风格的片段，旧版模型为一段整理后的文字；试听单段时沿用整段对话的说话人设置
-function requestBody(
-  model: Model,
-  blocks: readonly SpeechBlock[] = state.blocks,
-): Record<string, unknown> {
+function requestBody(model: Model, blocks: readonly SpeechBlock[]): Record<string, unknown> {
   const isMulti = multi.value
   const speakers = isMulti ? state.speakers : [state.speakers[0]!]
   const voice = (name: string) => ({ prebuiltVoiceConfig: { voiceName: name } })
@@ -380,7 +445,7 @@ function requestBody(
       },
     ],
     generationConfig: {
-      temperature: state.settings.temperature ?? model.temperature ?? 1,
+      temperature: temperature.value,
       ...(model.top_p === undefined ? {} : { topP: model.top_p }),
       ...(model.top_k === undefined ? {} : { topK: model.top_k }),
       responseModalities: ['AUDIO'],
@@ -393,7 +458,7 @@ function requestBody(
 function openAISpeechBody(
   modelID: string,
   blocks: readonly SpeechBlock[] = state.blocks,
-): Record<string, unknown> {
+): { model: string; input: string; voice: string; response_format: string; instructions?: string } {
   const input = blocks
     .map((block) => block.text)
     .filter((value) => value.trim() !== '')
@@ -416,10 +481,10 @@ async function openAISpeech(body: unknown, signal: AbortSignal): Promise<Blob> {
   const response = await fetch('/v1/audio/speech', {
     method: 'POST',
     headers,
-    body: JSON.stringify(body),
+    body: jsonBody(body),
     signal,
   })
-  if (!response.ok) throw new StreamError(await errorMessage(response), response.status)
+  if (!response.ok) throw new Error(await errorMessage(response))
   return response.blob()
 }
 
@@ -435,7 +500,7 @@ async function synthesize(
   const blob = audioBlob(response.candidates?.[0]?.content?.parts ?? [])
   if (blob) return blob
   const reason = response.candidates?.[0]?.finishReason ?? response.promptFeedback?.blockReason
-  throw new Error(reason ? `No audio returned (${reason})` : 'No audio returned')
+  throw new Error(reason ? t('pg.noAudioReason').replace('{reason}', reason) : t('pg.noAudio'))
 }
 
 // run 生成整段对话的音频
@@ -451,7 +516,7 @@ async function run(): Promise<void> {
   try {
     state.audio = URL.createObjectURL(await synthesize(model, state.blocks, signal))
   } catch (error) {
-    if (!signal.aborted) state.error = error instanceof Error ? error.message : String(error)
+    if (!signal.aborted) state.error = failureText(error, t('pg.speechUnreachable'))
   } finally {
     state.running = false
     controller = undefined
@@ -487,7 +552,7 @@ async function preview(block: SpeechBlock): Promise<void> {
     state.previewLoading = ''
     await previewAudio.play()
   } catch (error) {
-    if (!signal.aborted) state.error = error instanceof Error ? error.message : String(error)
+    if (!signal.aborted) state.error = failureText(error, t('pg.speechUnreachable'))
     if (state.previewing === block.id) stopPreview()
   }
 }
@@ -516,7 +581,9 @@ export function useSpeech() {
     openAIMulti,
     canRun,
     usedSpeakers,
+    temperature,
     voiceDetail,
+    speakerName,
     ensureModel,
     setModel,
     reset,
@@ -525,7 +592,6 @@ export function useSpeech() {
     useTemplate,
     addBlock,
     removeBlock,
-    requestBody,
     openAISpeechBody,
     codePrompt,
     run,

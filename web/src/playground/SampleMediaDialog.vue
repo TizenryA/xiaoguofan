@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
 import { ref, watch } from 'vue'
 import { useI18n } from '@/i18n'
 import UiDialog from '@/playground/ui/UiDialog.vue'
@@ -79,7 +78,7 @@ function add(): void {
         type="button"
         ms-button
         class="ms-button-primary"
-        aria-label="add to prompt"
+        :aria-label="t('pg.addToPrompt')"
         :aria-disabled="selected === undefined"
         @click="add"
       >

@@ -1,20 +1,19 @@
 import { computed, reactive } from 'vue'
-import { api, ApiError } from '@/api'
+import { api } from '@/api'
 import { useConsole } from '@/console'
+import { keepPage } from '@/desktop'
+import { useI18n } from '@/i18n'
 import type { Model } from '@/types'
+import { base64Bytes } from '../bytes'
+import { failureText } from '../request'
 import { newTurnID } from '../session'
-import {
-  base64Bytes,
-  createOpenAIVideo,
-  createVideo,
-  waitOpenAIVideo,
-  waitVideo,
-  type InlineImage,
-} from './api'
+import { createOpenAIVideo, createVideo, waitOpenAIVideo, waitVideo, type InlineImage } from './api'
+import { modelMatches } from '../catalog'
 import { pageKindOf } from './kinds'
+import { requestTitle } from '../title'
 
 // VideoProtocol 是视频页发送请求使用的公开协议
-export type VideoProtocol = 'gemini' | 'openai-videos'
+type VideoProtocol = 'gemini' | 'openai-videos'
 
 // videoProtocols 是视频页协议下拉的选项
 export const videoProtocols: { value: VideoProtocol; label: string }[] = [
@@ -37,7 +36,7 @@ export interface VideoSettings {
 }
 
 // VideoTurn 是视频页的一轮：用户轮次记录提示词与图片，模型轮次记录生成的视频地址
-export interface VideoTurn {
+interface VideoTurn {
   id: string
   role: 'user' | 'model'
   created: number
@@ -48,8 +47,16 @@ export interface VideoTurn {
   model?: string
   aspectRatio?: string
   videos?: string[]
+  task?: VideoTask
   duration?: number
+  stopped?: boolean
   error?: string
+}
+
+// VideoTask 是模型轮次在服务端的视频任务：Gemini API 为 operation 名，OpenAI Videos 为视频 ID
+interface VideoTask {
+  protocol: VideoProtocol
+  id: string
 }
 
 // VideoData 是保存到对话库的视频会话
@@ -60,7 +67,7 @@ export interface VideoData {
 }
 
 // VideoOption 是运行设置下拉中的一项，disabled 时附官网提示
-export interface VideoOption<T> {
+interface VideoOption<T> {
   value: T
   disabled: boolean
 }
@@ -78,8 +85,7 @@ function models(): Model[] {
 
 // optionList 读取模型的视频选项
 function optionList(model: Model | undefined, key: string): string[] {
-  const value = model?.capability_options?.[key]
-  return Array.isArray(value) ? value.map(String) : []
+  return model?.capability_options?.[key] ?? []
 }
 
 // defaultSettings 返回官网默认设置：16:9、8 秒、模型的第一档分辨率
@@ -97,7 +103,7 @@ function defaultSettings(model: Model | undefined): VideoSettings {
 
 // sortedResolutions 返回按清晰度排列的分辨率
 function sortedResolutions(model: Model | undefined): string[] {
-  return optionList(model, 'video_output_resolutions').sort(
+  return [...optionList(model, 'video_output_resolutions')].sort(
     (a, b) => resolutionOrder.indexOf(a) - resolutionOrder.indexOf(b),
   )
 }
@@ -105,6 +111,7 @@ function sortedResolutions(model: Model | undefined): string[] {
 const state = reactive({
   id: null as string | null,
   title: '',
+  description: '',
   settings: defaultSettings(undefined),
   turns: [] as VideoTurn[],
   draft: '',
@@ -113,9 +120,11 @@ const state = reactive({
   references: [] as VideoFrame[],
   running: false,
   started: 0,
-  loadError: '',
 })
 let controller: AbortController | undefined
+
+// 关闭桌面窗口时，生成中的视频保留页面
+keepPage(() => state.running)
 
 const currentModel = computed(() => models().find((model) => model.id === state.settings.model))
 
@@ -133,6 +142,27 @@ const durations = computed<VideoOption<number>[]>(() =>
     })),
 )
 
+// imageInputs 按实时目录返回模型接受的图片输入：video_inputs 的 frames 为首尾帧、reference_images 为参考图，video_tasks 的 image_to_video 为起始图、reference_to_video 为参考图；两项都未列出时只接受起始图
+function imageInputs(model: Model | undefined): {
+  start: boolean
+  last: boolean
+  references: boolean
+} {
+  const inputs = optionList(model, 'video_inputs')
+  const tasks = optionList(model, 'video_tasks')
+  return {
+    start:
+      (inputs.length === 0 && tasks.length === 0) ||
+      inputs.includes('frames') ||
+      tasks.includes('image_to_video'),
+    last: inputs.includes('frames'),
+    references: inputs.includes('reference_images') || tasks.includes('reference_to_video'),
+  }
+}
+
+// videoInputs 是当前模型接受的图片输入
+const videoInputs = computed(() => imageInputs(currentModel.value))
+
 // resolutions 按官网规则禁用：时长不是 8 秒时只能选 720p
 const resolutions = computed<VideoOption<string>[]>(() =>
   sortedResolutions(currentModel.value).map((value) => ({
@@ -144,7 +174,7 @@ const resolutions = computed<VideoOption<string>[]>(() =>
 // ensureModel 在目录变化后选定模型：地址中的模型优先，其次保留当前模型，否则用第一个视频模型
 function ensureModel(requested?: string): void {
   const list = models()
-  const wanted = list.find((model) => model.id === requested)
+  const wanted = list.find((model) => modelMatches(model, requested))
   if (wanted && wanted.id !== state.settings.model) {
     setModel(wanted.id)
     return
@@ -153,11 +183,15 @@ function ensureModel(requested?: string): void {
   if (list[0]) setModel(list[0].id)
 }
 
-// setModel 切换模型，保留仍然可用的设置
+// setModel 切换模型，保留仍然可用的设置与图片，移除新模型不接受的图片
 function setModel(id: string): void {
   const model = models().find((item) => item.id === id)
   const defaults = defaultSettings(model)
   const settings = state.settings
+  const inputs = imageInputs(model)
+  if (!inputs.start) state.start = undefined
+  if (!inputs.last) state.last = undefined
+  if (!inputs.references) state.references = []
   state.settings = {
     model: defaults.model,
     protocol: settings.protocol,
@@ -186,58 +220,88 @@ function setLast(frame: VideoFrame | undefined): void {
   if (frame !== undefined) state.settings.durationSeconds = 8
 }
 
+// leave 离开当前会话：生成中先保存会话与已创建的视频任务，再停止本页的等待
+function leave(): void {
+  if (state.running) void save().catch(() => undefined)
+  controller?.abort()
+}
+
 // newSession 清空当前会话
 function newSession(): void {
-  controller?.abort()
+  leave()
   Object.assign(state, {
     id: null,
     title: '',
+    description: '',
     turns: [],
     draft: '',
     start: undefined,
     last: undefined,
     references: [],
     running: false,
-    loadError: '',
   })
 }
 
 // load 载入对话库中的视频会话
-function load(id: string, title: string, data: VideoData): void {
-  controller?.abort()
+function load(id: string, prompt: { title: string; description: string; data: VideoData }): void {
+  leave()
   Object.assign(state, {
     id,
-    title,
-    settings: { ...defaultSettings(undefined), ...data.settings },
-    turns: data.turns,
+    title: prompt.title,
+    description: prompt.description,
+    settings: { ...prompt.data.settings },
+    turns: prompt.data.turns,
     draft: '',
     start: undefined,
     last: undefined,
     references: [],
     running: false,
-    loadError: '',
   })
+  resume()
 }
 
-// promptTitle 以首个提示词的第一行作为会话标题
-function promptTitle(): string {
-  const text =
-    state.turns
-      .find((turn) => turn.role === 'user')
-      ?.prompt?.trim()
-      .split('\n')[0] ?? ''
-  return text.length > 60 ? `${text.slice(0, 60)}…` : text
+// resume 在会话最后一轮的视频任务尚无结果时继续等待，没有任务的未完成轮次记为已停止
+function resume(): void {
+  const turn = state.turns.at(-1)
+  if (
+    turn?.role !== 'model' ||
+    turn.videos !== undefined ||
+    turn.stopped ||
+    turn.error !== undefined
+  )
+    return
+  const task = turn.task
+  if (task === undefined) {
+    turn.stopped = true
+    return
+  }
+  state.started = performance.now() - (Date.now() - turn.created)
+  void follow(turn, async (signal) =>
+    task.protocol === 'openai-videos'
+      ? [await waitOpenAIVideo({ id: task.id, status: 'queued' }, signal)]
+      : (await waitVideo({ name: task.id }, signal)).map(servicePath),
+  )
 }
 
-// save 把会话写入对话库
-async function save(): Promise<void> {
-  if (state.turns.length === 0) return
+// generateTitle 与官网一样在会话未命名时于提交时以提示词生成标题，失败时保持未命名
+async function generateTitle(model: string, prompt: string): Promise<void> {
+  const title = await requestTitle(model, prompt, '', () => ({
+    owner: state.turns,
+    title: state.title,
+  }))
+  if (title === '') return
+  state.title = title
+  await save().catch(() => undefined)
+}
+
+// save 把会话写入对话库，empty 为 true 时没有轮次的会话也写入
+async function save(empty = false): Promise<void> {
+  if (state.turns.length === 0 && !empty) return
   state.id ??= newTurnID()
-  if (state.title === '') state.title = promptTitle()
   await api.savePrompt<VideoData>(state.id, {
     title: state.title,
     model: state.settings.model,
-    description: promptTitle(),
+    description: state.description,
     data: {
       kind: 'video',
       settings: state.settings,
@@ -308,19 +372,22 @@ const openAIFrames = computed(
 
 // servicePath 把服务返回的绝对地址换成当前页面同源路径
 function servicePath(uri: string): string {
-  try {
-    const url = new URL(uri, window.location.origin)
-    return `${url.pathname}${url.search}`
-  } catch {
-    return uri
-  }
+  const url = new URL(uri, window.location.origin)
+  return `${url.pathname}${url.search}`
 }
 
-// run 以输入框内容生成视频；输入保留在输入框，便于继续修改
+// canRun 表示可以运行：有模型，有提示词、起始图或参考图，且 OpenAI Videos 没有它无法表达的尾帧或参考图
+const canRun = computed(
+  () =>
+    currentModel.value !== undefined &&
+    (state.draft.trim() !== '' || state.start !== undefined || state.references.length > 0) &&
+    !openAIFrames.value,
+)
+
+// run 以输入框内容生成视频，与官网一样有图片时提示词可以为空
 async function run(): Promise<void> {
   const model = currentModel.value
-  if (state.running || model === undefined || state.draft.trim() === '' || openAIFrames.value)
-    return
+  if (state.running || model === undefined || !canRun.value) return
   const openAI = state.settings.protocol === 'openai-videos'
   const body = openAI ? openAIForm(model.id) : requestBody()
   state.turns.push({
@@ -340,26 +407,51 @@ async function run(): Promise<void> {
     aspectRatio: state.settings.aspectRatio,
   })
   state.turns.push(turn)
-  state.running = true
+  if (state.title === '' && state.draft.trim() !== '') void generateTitle(model.id, state.draft)
   state.started = performance.now()
+  const owner = state.turns
+  await follow(turn, async (signal) => {
+    await save()
+    if (openAI) {
+      const video = await createOpenAIVideo(body as FormData, signal)
+      await keepTask(turn, { protocol: 'openai-videos', id: video.id }, owner)
+      return [await waitOpenAIVideo(video, signal)]
+    }
+    const operation = await createVideo(model.id, body, signal)
+    await keepTask(turn, { protocol: 'gemini', id: operation.name }, owner)
+    return (await waitVideo(operation, signal)).map(servicePath)
+  })
+}
+
+// keepTask 记下模型轮次的视频任务，会话仍是 owner 时立即保存，离开后重新打开可继续等待
+async function keepTask(turn: VideoTurn, task: VideoTask, owner: VideoTurn[]): Promise<void> {
+  turn.task = task
+  if (state.turns === owner) await save()
+}
+
+// follow 等待模型轮次的视频并写入结果；等待中离开了该会话时，结果留给重新打开时继续等待，不改动当前会话
+async function follow(
+  turn: VideoTurn,
+  wait: (signal: AbortSignal) => Promise<string[]>,
+): Promise<void> {
+  const owner = state.turns
+  state.running = true
   controller = new AbortController()
   const signal = controller.signal
   try {
-    await save()
-    turn.videos = openAI
-      ? [await waitOpenAIVideo(await createOpenAIVideo(body as FormData, signal), signal)]
-      : (await waitVideo(await createVideo(model.id, body, signal), signal)).map(servicePath)
+    turn.videos = await wait(signal)
   } catch (error) {
-    turn.error = signal.aborted
-      ? 'Generation stopped'
-      : error instanceof Error
-        ? error.message
-        : String(error)
+    if (state.turns === owner) {
+      if (signal.aborted) turn.stopped = true
+      else turn.error = failureText(error, useI18n().t('pg.videoUnreachable'))
+    }
   } finally {
-    turn.duration = Math.round(performance.now() - state.started)
-    state.running = false
-    controller = undefined
-    await save().catch(() => undefined)
+    if (state.turns === owner) {
+      turn.duration = Math.round(performance.now() - state.started)
+      controller = undefined
+      await save().catch(() => undefined)
+      if (state.turns === owner) state.running = false
+    }
   }
 }
 
@@ -368,28 +460,19 @@ function stop(): void {
   controller?.abort()
 }
 
-// rename 修改会话标题并保存
-async function rename(title: string): Promise<void> {
-  state.title = title.trim() || promptTitle()
+// rename 修改会话标题与描述并保存
+async function rename(title: string, description: string): Promise<void> {
+  state.title = title.trim()
+  state.description = description.trim()
   await save()
 }
 
-// remove 从对话库删除当前会话并清空页面
+// remove 停止当前等待并清空页面，再从对话库删除该会话
 async function remove(): Promise<void> {
-  if (state.id !== null) await api.deletePrompt(state.id)
+  const id = state.id
+  state.running = false
   newSession()
-}
-
-// open 打开对话库中的视频会话
-async function open(id: string): Promise<void> {
-  if (state.id === id) return
-  try {
-    const prompt = await api.prompt<VideoData>(id)
-    load(id, prompt.title, prompt.data)
-  } catch (error) {
-    state.loadError =
-      error instanceof ApiError && error.status === 404 ? 'not_found' : String(error)
-  }
+  if (id !== null) await api.deletePrompt(id)
 }
 
 // useVideo 返回视频页状态与操作
@@ -398,7 +481,9 @@ export function useVideo() {
     state,
     models: computed(models),
     currentModel,
+    videoInputs,
     openAIFrames,
+    canRun,
     aspectRatios,
     durations,
     resolutions,
@@ -408,10 +493,10 @@ export function useVideo() {
     setLast,
     newSession,
     load,
-    open,
     run,
     stop,
     rename,
     remove,
+    save,
   }
 }
