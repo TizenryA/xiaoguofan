@@ -39,10 +39,7 @@ def sha256(path):
 
 
 def download_extract(url, digest, dest):
-    """Verify official release bytes before unpacking; cache only complete trees."""
-    marker = dest / '.verified-sha256'
-    if marker.exists() and marker.read_text().strip() == digest:
-        return
+    """Download and verify official release bytes before each safe extraction."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     archive = dest.with_suffix('.download')
     try:
@@ -59,7 +56,7 @@ def download_extract(url, digest, dest):
         if dest.exists():
             shutil.rmtree(dest)
         stage.rename(dest)
-        marker.write_text(digest + '\n')
+        (dest / '.verified-sha256').write_text(digest + '\n')
     finally:
         archive.unlink(missing_ok=True)
 

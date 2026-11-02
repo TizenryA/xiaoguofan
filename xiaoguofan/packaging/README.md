@@ -16,14 +16,14 @@
 解压对应架构压缩包，进入目录：
 
 ```
-cd xiaoguofan-v0.9.1-linux-amd64
+cd xiaoguofan-v0.9.15-linux-amd64
 sudo python3 install.py --mode linux --origin https://your.example/lite
 ```
 
 Docker版：
 
 ```
-cd xiaoguofan-v0.9.1-docker-amd64
+cd xiaoguofan-v0.9.15-docker-amd64
 sudo python3 install.py --mode docker --origin https://your.example/lite
 ```
 
@@ -56,4 +56,4 @@ Docker版：`systemctl status xiaoguofan-compose`、`docker compose --env-file /
 
 ## 构建
 
-在仓库根运行 `python3 xiaoguofan/packaging/build.py`。源代码不含生产凭据，产物位于dist/xiaoguofan；包含每架构worker镜像、Docker版额外的门户镜像、SHA256SUMS和源码提交信息。联网下载构建依赖；Linux版首次安装仍需联网安装Python依赖（不是完全离线包）。
+构建机要求 Linux x86_64、Python 3.12+、Go 1.27+、Node.js 22.13+、Docker Engine 与 buildx；构建 ARM64 镜像需配置 QEMU/binfmt。在仓库根运行 `python3 xiaoguofan/packaging/build.py`。脚本下载固定版本 Zig 与 SpiderMonkey，每次核对官方归档 SHA-256 后重新解压，使用 CGO 静态链接；源代码不含生产凭据，产物位于dist/xiaoguofan；包含每架构worker镜像、Docker版额外的门户镜像、SHA256SUMS和源码提交信息。联网下载构建依赖；Linux版首次安装仍需联网安装Python依赖（不是完全离线包）。
