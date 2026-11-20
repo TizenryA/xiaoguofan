@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -44,7 +45,7 @@ func (s *server) startChatChoices(ctx context.Context, request aistudio.Generate
 			upstream, err := s.service.Generate(choices.ctx, choice)
 			source := upstream
 			if err == nil && stream {
-				source, err = awaitStreamStart(choices.ctx, upstream)
+				source, _, err = awaitStreamStart(choices.ctx, upstream)
 			}
 			started <- err
 			if err != nil {
@@ -73,7 +74,7 @@ func (s *server) startChatChoices(ctx context.Context, request aistudio.Generate
 	return choices
 }
 
-// relayEvents 经内存队列把 source 的事件转发到 out
+// relayEvents 经内存队列把 source 的事件转发到 out，已发出的槽位清空，队列发空时从头复用
 func relayEvents(ctx context.Context, source <-chan aistudio.Event, out chan<- aistudio.Event) {
 	var queue []aistudio.Event
 	for source != nil || len(queue) > 0 {
@@ -86,7 +87,12 @@ func relayEvents(ctx context.Context, source <-chan aistudio.Event, out chan<- a
 		case <-ctx.Done():
 			return
 		case send <- next:
-			queue = queue[1:]
+			queue[0] = aistudio.Event{}
+			if len(queue) == 1 {
+				queue = queue[:0]
+			} else {
+				queue = queue[1:]
+			}
 		case event, ok := <-source:
 			if !ok {
 				source = nil
@@ -147,7 +153,54 @@ func (choices *chatChoices) record(ctx context.Context, results []generationResu
 	SetAccessLogGenerationResult(ctx, sumUsage(results), toolCalls)
 }
 
-// sumUsage 返回各次生成用量之和，多次生成时不带模态细分，均无用量时返回 nil
+// choicesUsage 返回多个 choice 或候选对外报告的用量：输入与缓存按一次计，输出、思考与工具 token 及其模态细分逐个相加，均无用量时返回 nil
+func choicesUsage(results []generationResult) *aistudio.Usage {
+	var total *aistudio.Usage
+	for index := range results {
+		usage := results[index].usage
+		if usage == nil {
+			continue
+		}
+		if total == nil {
+			value := *usage
+			if usage.Details != nil {
+				details := *usage.Details
+				value.Details = &details
+			}
+			total = &value
+			continue
+		}
+		total.OutputTokens += usage.OutputTokens
+		total.ReasoningTokens += usage.ReasoningTokens
+		total.ToolTokens += usage.ToolTokens
+		total.TotalTokens += usage.TotalTokens - usage.InputTokens
+		total.OutputTokensMissing = total.OutputTokensMissing || usage.OutputTokensMissing
+		if total.Details == nil || usage.Details == nil {
+			total.Details = nil
+			continue
+		}
+		total.Details.CandidatesTokensDetails = addModalityTokens(total.Details.CandidatesTokensDetails, usage.Details.CandidatesTokensDetails)
+		total.Details.ToolUsePromptTokensDetails = addModalityTokens(total.Details.ToolUsePromptTokensDetails, usage.Details.ToolUsePromptTokensDetails)
+		total.Details.BilledToolCalls, total.Details.ToolCallStats, total.Details.ModelInvocationTokenCounts, total.Details.NonGroundingModelInvocationTokenCounts = nil, nil, nil, nil
+	}
+	return total
+}
+
+// addModalityTokens 返回两组模态 token 数按模态相加的结果
+func addModalityTokens(base, added []aistudio.ModalityTokenCount) []aistudio.ModalityTokenCount {
+	sum := slices.Clone(base)
+	for _, count := range added {
+		index := slices.IndexFunc(sum, func(item aistudio.ModalityTokenCount) bool { return item.Modality == count.Modality })
+		if index < 0 {
+			sum = append(sum, count)
+			continue
+		}
+		sum[index].TokenCount += count.TokenCount
+	}
+	return sum
+}
+
+// sumUsage 返回各次生成实际消耗的用量之和，多次生成时不带模态细分，均无用量时返回 nil
 func sumUsage(results []generationResult) *aistudio.Usage {
 	var total *aistudio.Usage
 	for index := range results {

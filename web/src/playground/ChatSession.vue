@@ -26,6 +26,59 @@ const scrollbar = ref<InstanceType<typeof ItemsScrollbar>>()
 
 // streamingIndex 是正在生成的模型轮次下标
 const streamingIndex = computed(() => (session.running ? session.turns.length - 1 : -1))
+// renderBatch 是打开对话后每帧渲染的轮次数，长对话从末尾一批开始逐帧向前补齐
+const renderBatch = 1
+// firstShown 是已渲染的第一个轮次下标
+const firstShown = ref(0)
+let filling = 0
+let fillFrame = 0
+// codeFont 是代码块的字体，首批轮次等它载入或载入失败后才排版，代码按最终字体换行，之后不因字体晚到而改变高度
+const codeFont = '1em "Google Sans Code Variable"'
+
+// scheduleFill 在下一帧绘制之后的任务中向前多渲染一批，每批轮次的排版各在一帧里完成
+function scheduleFill(first = false): void {
+  fillFrame = requestAnimationFrame(() => (filling = window.setTimeout(() => void fill(first))))
+}
+
+// fill prepends batches from the end upward and preserves scrollTop when scrolled to the temporary top.
+async function fill(first: boolean): Promise<void> {
+  if (first) await document.fonts.load(codeFont).catch(() => [])
+  const prevHeight = scroller.value?.scrollHeight ?? 0
+  const prevTop = scroller.value?.scrollTop ?? 0
+  firstShown.value = Math.max(0, firstShown.value - renderBatch)
+  await nextTick()
+  // 等待字体与更新期间切换对话时组件已卸载，补齐随之结束
+  if (!scroller.value) return
+  const element = scroller.value
+  if (first) {
+    if (firstShown.value > 0 && element.scrollHeight <= element.clientHeight) return fill(true)
+    follow()
+  } else if (detached && prevTop <= 1 && element.scrollTop <= 1) {
+    const added = element.scrollHeight - prevHeight
+    if (added > 0) {
+      element.scrollTop += added
+      lastTop = element.scrollTop
+    }
+  }
+  if (firstShown.value > 0) scheduleFill()
+}
+// detached 表示用户向上滚动后停止跟随，回到底部时恢复；lastTop 是判断向上滚动的基准位置，跟随时为自动跟随设定的位置，停止跟随后与向下滚动时为当前位置；lastHeight 是当时的可见高度
+let detached = false
+let lastTop = 0
+let lastHeight = 0
+watch(
+  () => session.turns,
+  (turns) => {
+    cancelAnimationFrame(fillFrame)
+    window.clearTimeout(filling)
+    detached = false
+    // 长对话的末尾一批也在下一帧之后渲染，不与打开对话时的页面更新挤在同一个任务里
+    firstShown.value = turns.length > renderBatch ? turns.length : 0
+    if (firstShown.value > 0) scheduleFill(true)
+    else void nextTick(() => follow(true))
+  },
+  { immediate: true },
+)
 // responseTurn 表示用户轮次只含函数响应，显示在上一轮的函数调用块内
 const responseTurn = (index: number): boolean => {
   const turn = session.turns[index]
@@ -59,57 +112,54 @@ const scrollbarItems = computed<ScrollbarItem[]>(() => {
   return items
 })
 
-// detached 表示用户向上滚动后停止跟随，回到底部时恢复；lastTop 是上一次滚动事件或自动跟随设定的位置，lastHeight 是当时的可见高度
-let detached = false
-let lastTop = 0
-let lastHeight = 0
 let scrollingTimer = 0
 const scrolled = ref(false)
 const scrollable = ref(false)
 const atBottom = ref(true)
 const userScrolling = ref(false)
 
-// measure 记录对话是否可滚动、是否位于底部
+// measure records whether the conversation is scrollable and whether it sits at the bottom.
 function measure(): void {
   const element = scroller.value!
   scrollable.value = element.scrollHeight > element.clientHeight
-  atBottom.value = element.scrollTop >= element.scrollHeight - element.clientHeight
+  atBottom.value = element.scrollTop >= element.scrollHeight - element.clientHeight - 1
 }
 
-// follow 与官网 ms-autoscroll-container 一致：没有停止跟随时滚到底部，force 先恢复跟随；内容变矮使位置被截短时同样记录新的底部
+// follow scrolls to the bottom unless detached; force re-attaches.
 function follow(force = false): void {
-  const element = scroller.value!
+  const element = scroller.value
+  if (!element) return
   if (force) detached = false
   if (detached) return
   const max = element.scrollHeight - element.clientHeight
   lastTop = max
   lastHeight = element.clientHeight
-  if (element.scrollTop >= max) return
+  if (element.scrollTop >= max - 1) return
   element.scrollTop = max
   atBottom.value = true
 }
 
-// onScroll 用户向上滚动任意距离即停止跟随，滚到底部恢复跟随；可见高度增加使位置被截短的距离不算向上滚动
+// onScroll detaches auto-follow on any upward scroll including subpixel steps and re-attaches at bottom.
 function onScroll(): void {
   const element = scroller.value!
   const max = element.scrollHeight - element.clientHeight
-  const top = Math.max(0, Math.floor(element.scrollTop))
-  const bottom = top >= max
+  const rawTop = Math.max(0, element.scrollTop)
+  const bottom = rawTop >= max - 1
   const grown = Math.max(0, element.clientHeight - lastHeight)
-  if (lastTop <= max && lastTop - top > 1 + grown) detached = true
+  if (lastTop <= max && lastTop - rawTop > 1 + grown) detached = true
   if (bottom) detached = false
-  lastTop = top
+  if (detached || bottom || rawTop > lastTop) lastTop = bottom ? max : rawTop
   lastHeight = element.clientHeight
-  scrolled.value = top > 0
+  scrolled.value = rawTop > 0
   atBottom.value = bottom
   userScrolling.value = true
   window.clearTimeout(scrollingTimer)
   scrollingTimer = window.setTimeout(() => (userScrolling.value = false), 200)
 }
 
-// resize 在内容或容器尺寸变化时跟随到底部
+// resize 在内容或容器尺寸变化时跟随到底部，编辑轮次时不跳转滚动位置
 const resize = new ResizeObserver(() => {
-  follow()
+  if (!content.value?.querySelector('.edit-textarea')) follow()
   measure()
 })
 // observe 观察对话内容与滚动容器的尺寸
@@ -117,13 +167,12 @@ function observe(): void {
   resize.observe(content.value!)
   resize.observe(scroller.value!)
 }
-onMounted(() => {
-  lastHeight = scroller.value!.clientHeight
-  observe()
-})
+// 可见高度由尺寸观察的首次回调经 follow 记录，挂载时不读取布局
+onMounted(observe)
 onDeactivated(() => resize.disconnect())
 onActivated(() => {
-  scroller.value!.scrollTop = lastTop
+  if (!scroller.value) return
+  scroller.value.scrollTop = lastTop
   observe()
 })
 watch(
@@ -150,6 +199,8 @@ function onScrollerKeydown(event: KeyboardEvent): void {
 
 onUnmounted(() => {
   window.clearTimeout(scrollingTimer)
+  cancelAnimationFrame(fillFrame)
+  window.clearTimeout(filling)
   resize.disconnect()
 })
 </script>
@@ -167,7 +218,7 @@ onUnmounted(() => {
       <div ref="content" class="chat-session-content">
         <template v-for="(turn, index) in session.turns" :key="turn.id">
           <ChatTurn
-            v-if="!responseTurn(index)"
+            v-if="index >= firstShown && !responseTurn(index)"
             :turn="turn"
             :index="index"
             :streaming="index === streamingIndex"
@@ -205,7 +256,7 @@ onUnmounted(() => {
   margin-top: 12px;
   overflow-y: auto;
   padding-top: var(--ms-autoscroll-container-padding-top);
-  container-type: size;
+  container-type: inline-size;
   outline: none;
   scrollbar-width: none;
 }
@@ -233,7 +284,11 @@ onUnmounted(() => {
   }
 }
 
+/* 轮次之间的 8 px 间距由 gap 给出，补入轮次时已有轮次的样式不变 */
 .chat-session-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   max-width: 1000px;
   margin: 0 auto;
   padding: 0 20px 24px;

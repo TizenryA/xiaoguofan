@@ -13,13 +13,14 @@ import { useI18n } from '@/i18n'
 import UiDialog from '@/playground/ui/UiDialog.vue'
 import UiIcon from '@/playground/ui/UiIcon.vue'
 import SavePromptDialog from './SavePromptDialog.vue'
+import TokenCountTooltip from './TokenCountTooltip.vue'
 import { isOmniModel } from './catalog'
 import { useMediaQuery } from './media-query'
 import { useCompare, usePlayground } from './session'
 
 defineProps<{ settingsOpen: boolean; narrow: boolean }>()
 const emit = defineEmits<{ newChat: []; toggleSettings: [] }>()
-const { t, tokenLabel, errorText } = useI18n()
+const { t, errorText } = useI18n()
 const { showNotice } = useConsole()
 const router = useRouter()
 const playground = usePlayground()
@@ -31,10 +32,11 @@ const handset = useMediaQuery('(max-width: 768px)')
 const editing = ref(false)
 const confirmDelete = ref(false)
 
-// hasPrompt 表示对话已有内容，标题可编辑
+// hasPrompt 表示对话已有内容或附件，标题可编辑
 const hasPrompt = computed(
   () =>
     session.turns.length > 0 ||
+    session.attachments.length > 0 ||
     session.id !== null ||
     session.settings.systemInstruction.trim() !== '',
 )
@@ -49,10 +51,6 @@ const temporaryLabel = computed(() =>
 // title 是工具栏标题：空白新对话为 Playground，已有内容未命名时为 Untitled prompt
 const title = computed(() =>
   hasPrompt.value ? session.title || t('pg.untitled') : t('nav.playground'),
-)
-// tokens 是当前对话的 token 数
-const tokens = computed(() =>
-  session.promptTokens === null ? '' : tokenLabel(session.promptTokens),
 )
 
 // makeCopy 复制当前对话并打开副本
@@ -94,7 +92,7 @@ async function removePrompt(): Promise<void> {
           <UiIcon name="edit" :size="18" />
         </button>
       </div>
-      <span v-if="tokens && !comparing" class="token-count">{{ tokens }}</span>
+      <TokenCountTooltip v-if="!comparing" />
     </div>
     <div class="toolbar-right">
       <span
@@ -256,6 +254,7 @@ async function removePrompt(): Promise<void> {
 }
 
 .toolbar-right {
+  position: relative;
   grid-column: 3;
 }
 
@@ -279,14 +278,9 @@ async function removePrompt(): Promise<void> {
   animation: fade-in 225ms cubic-bezier(0, 0, 0.2, 1);
 }
 
-.token-count {
-  padding: 0 8px;
-  font-size: 12px;
-  line-height: 18px;
-  white-space: nowrap;
-}
-
 .saving-indicator {
+  position: absolute;
+  right: calc(100% + 4px);
   display: flex;
   padding: 4px;
   color: var(--color-v3-text-var);

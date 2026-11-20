@@ -3,9 +3,9 @@ import os
 import time
 from pathlib import Path
 
-LIMIT = 2 * 1024**3
-HIGH = 1792 * 1024**2
-WORKER_BYTES = 650 * 1024**2
+LIMIT = 10 * 1024**3
+HIGH = 9 * 1024**3
+WORKER_BYTES = 700 * 1024**2
 BASE_RESERVE = 384 * 1024**2
 HEADROOM = 96 * 1024**2
 

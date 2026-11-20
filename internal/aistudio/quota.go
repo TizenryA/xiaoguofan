@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,7 +16,26 @@ const quotaResetTimezone = "America/Los_Angeles"
 // PlanLimitKind 是套餐限额冷却的类型名，也是其冷却原因的前缀
 const PlanLimitKind = "套餐限额"
 
-// planLimitBackoff 为没有恢复时间的套餐限额按连续次数递增的冷却时长
+// DailyLimitKind 是每日限额冷却的类型名，也是其冷却原因的前缀
+const DailyLimitKind = "每日限额"
+
+// RequestQuotaCooldown 判断冷却原因是上游按每个请求判定是否放行的套餐限额或每日限额，用尽后较短的请求仍可能完成
+func RequestQuotaCooldown(reason string) bool {
+	return strings.HasPrefix(reason, PlanLimitKind) || strings.HasPrefix(reason, DailyLimitKind)
+}
+
+// quotaCooldownKinds 是上游以 429 限制额度时冷却的类型名
+var quotaCooldownKinds = []string{"短期限额", "分钟限额", DailyLimitKind, PlanLimitKind, "无配额"}
+
+// quotaCooldownReason 判断冷却原因是否来自上游 429 额度限制
+func quotaCooldownReason(reason string) bool {
+	return slices.ContainsFunc(quotaCooldownKinds, func(kind string) bool { return strings.HasPrefix(reason, kind+": ") })
+}
+
+// rejectedSizeWindow 是每日限额拒绝过的请求大小用于跳过不小于它的回退请求的时长
+const rejectedSizeWindow = time.Minute
+
+// planLimitBackoff 为没有恢复时间的套餐限额与短期限额按连续次数递增的冷却时长
 var planLimitBackoff = []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute, time.Hour}
 
 // quotaLimitPattern 匹配额度错误中逐项列出的额度上限
@@ -29,11 +49,22 @@ type CooldownState struct {
 	Until  time.Time `json:"until"`
 	Reason string    `json:"reason,omitempty"`
 	Level  int       `json:"level,omitempty"`
+	// Fallback 是套餐限额或每日限额冷却期间，忽略这两类冷却的回退选号另受的较早结束的冷却
+	Fallback *CooldownState `json:"fallback,omitempty"`
+	// RejectedSize 是每日限额冷却期间上游在 RejectedUntil 之前的一分钟内以额度拒绝过的最小请求输入字节数
+	RejectedSize int64 `json:"rejected_size,omitempty"`
+	// RejectedUntil 是 RejectedSize 失效的时刻
+	RejectedUntil time.Time `json:"rejected_until,omitzero"`
 }
 
 // Active 判断冷却状态当前是否生效
 func (c CooldownState) Active(now time.Time) bool {
 	return !c.Until.IsZero() && now.Before(c.Until)
+}
+
+// rejects 判断上游一分钟内以每日限额拒绝过不大于 size 的请求
+func (c CooldownState) rejects(size int64, now time.Time) bool {
+	return now.Before(c.RejectedUntil) && size >= c.RejectedSize
 }
 
 // QuotaCooldown 表示上游额度限制对应的调度冷却
@@ -43,6 +74,8 @@ type QuotaCooldown struct {
 	Kind     string
 	Reason   string
 	Escalate bool
+	// RequestSize 是被拒请求输入正文的字节数，0 表示未知
+	RequestSize int64
 }
 
 // QuotaCooldownForError 解析上游分钟或每日额度限制
@@ -63,7 +96,7 @@ func QuotaCooldownForError(err error, now time.Time) (QuotaCooldown, bool) {
 	for _, evidence := range []string{rpcError.Metadata["quota_unit"], rpcError.Metadata["quota_limit"], rpcError.Metadata["quota_metric"], message} {
 		evidence = strings.ToLower(evidence)
 		if dailyQuotaEvidence(evidence) {
-			until, kind = nextQuotaDay(now), "每日限额"
+			until, kind = nextQuotaDay(now), DailyLimitKind
 			break
 		}
 		if minuteQuotaEvidence(evidence) {
@@ -79,8 +112,11 @@ func QuotaCooldownForError(err error, now time.Time) (QuotaCooldown, bool) {
 		until = now.Add(rpcError.RetryDelay)
 	} else if reset, ok := usageLimitReset(message); ok {
 		until, kind = now.Add(reset), PlanLimitKind
-	} else if kind == "短期限额" && strings.Contains(message, "reached your usage limit") {
-		kind, escalate = PlanLimitKind, true
+	} else if kind == "短期限额" {
+		escalate = true
+		if rpcError.PerUserQuota || strings.Contains(message, "reached your usage limit") {
+			kind = PlanLimitKind
+		}
 	}
 	return QuotaCooldown{Until: until, Global: global, Kind: kind, Reason: kind + ": " + err.Error(), Escalate: escalate}, true
 }
@@ -92,6 +128,18 @@ func BuildRejectionCooldown(err error) (QuotaCooldown, bool) {
 		return QuotaCooldown{}, false
 	}
 	return QuotaCooldown{Kind: "Build 拒绝", Reason: "Build 拒绝: " + err.Error(), Escalate: true}, true
+}
+
+// AccountRejectionKind 是上游以 403、协议错误码 7 暂时拒绝账户时冷却的类型名，也是其冷却原因的前缀
+const AccountRejectionKind = "权限拒绝"
+
+// AccountRejectionCooldown 返回上游以 403、协议错误码 7 拒绝账户且官网不跳转拒绝页时的冷却：账户在该模型上自上次成功后第一次被拒只记下不冷却，再被拒时以 planLimitBackoff 递增
+func AccountRejectionCooldown(err error) (QuotaCooldown, bool) {
+	var rpcError *RPCError
+	if !errors.As(err, &rpcError) || rpcError.StatusCode != http.StatusForbidden || rpcError.Code != 7 || rpcError.accessDenial() != nil {
+		return QuotaCooldown{}, false
+	}
+	return QuotaCooldown{Kind: AccountRejectionKind, Reason: AccountRejectionKind + ": " + rpcError.StatusError(), Escalate: true}, true
 }
 
 // BuildGenerationDisabled 判断错误是上游停用 Build 代理生成的 PROXY_GENERATION_DISABLED

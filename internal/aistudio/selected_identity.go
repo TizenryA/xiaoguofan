@@ -2,14 +2,17 @@ package aistudio
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
@@ -143,9 +146,93 @@ func matchSelectedIdentity(rows []selectedAccount, id SelectedIdentity) (string,
 	return strconv.Itoa(index), nil
 }
 
-// ResolveSelectedAuthUser verifies email+Gaia against Google's current cookie session.
-// Never trust the saved numeric position: account order can change.
+// selectedIdentityCache shares only verified mappings for the same identity and
+// Google session credentials. Cookie rotation and localStorage updates do not
+// cause another ListAccounts request. Nothing is persisted as a trusted mapping.
+var selectedIdentityCache = struct {
+	sync.Mutex
+	entries map[[32]byte]*selectedIdentityResolution
+}{entries: make(map[[32]byte]*selectedIdentityResolution)}
+
+type selectedIdentityResolution struct {
+	done     chan struct{}
+	authUser string
+	err      error
+}
+
+func selectedIdentityKey(state StorageState) [32]byte {
+	var credentials []string
+	now := float64(time.Now().UnixNano()) / 1e9
+	for _, cookie := range state.Cookies {
+		if !cookieDomainMatches(cookie.Domain, "accounts.google.com") && !cookieDomainMatches(cookie.Domain, "myaccount.google.com") {
+			continue
+		}
+		switch cookie.Name {
+		case "SID", "HSID", "SSID", "APISID", "SAPISID", "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PAPISID", "OSID", "LSID", "ACCOUNT_CHOOSER", "__Host-GAPS":
+			if cookie.Value != "" && (cookie.Expires < 0 || cookie.Expires > now) {
+				encoded, _ := json.Marshal([]string{cookie.Domain, cookie.Path, cookie.Name, cookie.Value, strconv.FormatBool(cookie.Secure), cookie.PartitionKey})
+				credentials = append(credentials, string(encoded))
+			}
+		}
+	}
+	slices.Sort(credentials)
+	encoded, _ := json.Marshal([]any{credentials, state.extra["xiaoguofan_identity"], state.extra["xiaoguofan_identity_verification"]})
+	return sha256.Sum256(encoded)
+}
+
+// InvalidateSelectedAuthUser discards the mapping after an authentication error.
+// The next request rechecks the same credentials instead of using a stale index.
+func InvalidateSelectedAuthUser(state StorageState) {
+	key := selectedIdentityKey(state)
+	selectedIdentityCache.Lock()
+	delete(selectedIdentityCache.entries, key)
+	selectedIdentityCache.Unlock()
+}
+
+// ResolveSelectedAuthUser reuses the mapping until session credentials change or
+// authentication fails. Concurrent callers share the initial identity lookup.
 func ResolveSelectedAuthUser(ctx context.Context, client *http.Client, state StorageState, fallback ...int) (string, error) {
+	id, err := state.SelectedIdentity()
+	if err != nil {
+		return "", err
+	}
+	if id == nil {
+		return VerifySelectedAuthUser(ctx, client, state, fallback...)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	key := selectedIdentityKey(state)
+	selectedIdentityCache.Lock()
+	if resolved := selectedIdentityCache.entries[key]; resolved != nil {
+		selectedIdentityCache.Unlock()
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-resolved.done:
+			return resolved.authUser, resolved.err
+		}
+	}
+	// Bound memory across imported/replaced accounts; eviction only causes a recheck.
+	if len(selectedIdentityCache.entries) >= 1024 {
+		clear(selectedIdentityCache.entries)
+	}
+	resolved := &selectedIdentityResolution{done: make(chan struct{})}
+	selectedIdentityCache.entries[key] = resolved
+	selectedIdentityCache.Unlock()
+	resolved.authUser, resolved.err = VerifySelectedAuthUser(ctx, client, state, fallback...)
+	selectedIdentityCache.Lock()
+	if resolved.err != nil && selectedIdentityCache.entries[key] == resolved {
+		delete(selectedIdentityCache.entries, key)
+	}
+	close(resolved.done)
+	selectedIdentityCache.Unlock()
+	return resolved.authUser, resolved.err
+}
+
+// VerifySelectedAuthUser verifies email+Gaia against Google's current session.
+// Use at credential import; never trust the saved numeric account position.
+func VerifySelectedAuthUser(ctx context.Context, client *http.Client, state StorageState, fallback ...int) (string, error) {
 	id, err := state.SelectedIdentity()
 	if err != nil {
 		return "", err
@@ -177,6 +264,7 @@ func ResolveSelectedAuthUser(ctx context.Context, client *http.Client, state Sto
 	req.Header.Set("Origin", "https://www.google.com")
 	req.Header.Set("Referer", aiStudioOrigin+"/")
 	isolated := *client
+	isolated.Jar = nil
 	isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	res, err := isolated.Do(req)
 	if err != nil {

@@ -1,9 +1,7 @@
 package aistudio
 
 import (
-	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 )
@@ -23,17 +21,16 @@ const (
 )
 
 var tieredRPCMethods = map[string]struct{}{
-	"GenerateContent":           {},
-	"CountTokens":               {},
-	"ProxyUnaryCall":            {},
-	"CodeAssistantOffline":      {},
-	"CancelInteraction":         {},
-	"CreateInteraction":         {},
-	"CreateInteractionStream":   {},
-	"GetInteractionStream":      {},
-	"GenerateVideo":             {},
-	"GetGenerateVideoOperation": {},
-	"StreamExtractVideoFrames":  {},
+	"GenerateContent":          {},
+	"CountTokens":              {},
+	"ProxyUnaryCall":           {},
+	"CodeAssistantOffline":     {},
+	"CancelInteraction":        {},
+	"CreateInteraction":        {},
+	"CreateDecision":           {},
+	"CreateInteractionStream":  {},
+	"GetInteractionStream":     {},
+	"StreamExtractVideoFrames": {},
 }
 
 // String 返回账户权益的稳定显示名称
@@ -62,25 +59,6 @@ func (tier BenefitTier) HeaderValue() string {
 	default:
 		return ""
 	}
-}
-
-// BenefitTierForAccount 读取并缓存指定账户的官网权益等级
-func (c *Client) BenefitTierForAccount(ctx context.Context, accountID string) (BenefitTier, error) {
-	response, err := c.do(ctx, "GetAiStudioBenefitTier", accountID, "", []byte("[]"), false)
-	if err != nil {
-		return BenefitTierFree, err
-	}
-	defer response.Body.Close()
-	raw, err := io.ReadAll(response.Body)
-	if err != nil {
-		return BenefitTierFree, fmt.Errorf("读取 GetAiStudioBenefitTier: %w", err)
-	}
-	tier, err := decodeBenefitTier(raw)
-	if err != nil {
-		return BenefitTierFree, err
-	}
-	c.setBenefitTier(accountID, tier)
-	return tier, nil
 }
 
 // setBenefitTier 记录账户的权益等级
@@ -150,7 +128,10 @@ func (e *ModelAccessError) Error() string {
 			names = append(names, fmt.Sprintf("访问方式 %d", mode))
 		}
 	}
-	return fmt.Sprintf("模型 %s 需要 %s，启用的账户都不具备", e.Model, strings.Join(names, " 或 "))
+	if len(names) == 1 {
+		return fmt.Sprintf("模型 %s 需要 %s，启用的账户都不具备", e.Model, names[0])
+	}
+	return fmt.Sprintf("模型 %s 需要以下任一权益，启用的账户都不具备：%s", e.Model, strings.Join(names, "；"))
 }
 
 // HTTPStatus 返回权益不足对应的状态码

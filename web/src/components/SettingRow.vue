@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useI18n } from '@/i18n'
+import HelpHint from './HelpHint.vue'
 
 defineProps<{
   label: string
@@ -9,6 +10,10 @@ defineProps<{
   effect: 'immediate' | 'service' | 'management'
   changed?: boolean
   env?: string | undefined
+  // envNote 是部分控件由环境变量决定时的说明，整行控件仍可编辑
+  envNote?: string | undefined
+  // wide 表示控件列加宽，放得下成对的模型下拉
+  wide?: boolean
 }>()
 
 const { t } = useI18n()
@@ -16,32 +21,42 @@ const { t } = useI18n()
 
 <template>
   <div
-    class="flex flex-col gap-3 border-b border-line py-4 last:border-b-0 md:flex-row md:items-start md:justify-between md:gap-10"
+    class="group/row @container border-b border-line py-3.5 last:border-b-0 [&:has([role=switch])_label]:cursor-pointer"
   >
-    <div class="min-w-0 md:max-w-md">
-      <div class="flex flex-wrap items-center gap-2">
-        <span v-if="groupId" :id="`${groupId}-label`" class="text-sm font-medium text-gray-200">{{
-          label
-        }}</span>
-        <label v-else :for="controlId" class="text-sm font-medium text-gray-200">{{ label }}</label>
-        <span
-          v-if="changed"
-          v-tooltip="t('settings.unsavedField')"
-          class="h-1.5 w-1.5 rounded-full bg-amber-400"
-          ><span class="sr-only">{{ t('settings.unsavedField') }}</span></span
-        >
-      </div>
-      <p v-if="description" class="mt-1 text-xs leading-5 text-gray-500">{{ description }}</p>
-      <p class="mt-1 text-xs text-gray-600">{{ t(`settings.effect.${effect}`) }}</p>
-      <p v-if="env" class="mt-1 text-xs text-amber-300">
-        {{ t('settings.environmentLocked').replace('{key}', env) }}
-      </p>
-    </div>
-    <fieldset
-      :disabled="env !== undefined"
-      class="w-full min-w-0 disabled:opacity-60 md:w-80 md:shrink-0"
+    <div
+      class="flex flex-col gap-3 has-[[role=switch]]:flex-row has-[[role=switch]]:items-center has-[[role=switch]]:justify-between @xl:flex-row @xl:items-start @xl:justify-between @xl:has-[[role=switch]]:items-start"
     >
-      <slot />
-    </fieldset>
+      <div class="min-w-0 flex-1 @xl:max-w-md @xl:pt-2">
+        <div class="flex flex-wrap items-center gap-2">
+          <span v-if="groupId" :id="`${groupId}-label`" class="text-sm font-medium text-gray-200">{{
+            label
+          }}</span>
+          <label v-else :for="controlId" class="text-sm font-medium text-gray-200">{{
+            label
+          }}</label>
+          <slot name="tag" />
+          <HelpHint :label="label">
+            <p v-if="description">{{ description }}</p>
+            <p :class="description ? 'mt-1.5 text-gray-500' : 'text-gray-500'">
+              {{ t(`settings.effect.${effect}`) }}
+            </p>
+          </HelpHint>
+        </div>
+        <p v-if="changed && effect !== 'immediate'" class="mt-1 text-xs text-gray-500">
+          {{ t(`settings.effect.${effect}`) }}
+        </p>
+        <p v-if="env ?? envNote" class="mt-1 text-xs text-gray-400">
+          {{ t('settings.environmentLocked').replace('{key}', (env ?? envNote)!) }}
+        </p>
+        <slot name="note" />
+      </div>
+      <fieldset
+        :disabled="env !== undefined"
+        class="w-full min-w-0 disabled:opacity-60 has-[[role=switch]]:flex has-[[role=switch]]:w-auto has-[[role=switch]]:shrink-0 @xl:shrink-0 @xl:has-[[role=switch]]:py-[11px]"
+        :class="wide ? '@xl:w-[30rem]' : '@xl:w-80'"
+      >
+        <slot />
+      </fieldset>
+    </div>
   </div>
 </template>

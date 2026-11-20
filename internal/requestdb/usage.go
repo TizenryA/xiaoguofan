@@ -367,28 +367,49 @@ type cost struct {
 	unpriced map[string]bool
 }
 
-// scanCost 从原始记录逐条按模型单价累加 [from, to) 内符合筛选的费用，starts 非空时同时累加到各分桶
+// scanCost 在 SQL 中按分桶、模型与长上下文分档汇总 [from, to) 内符合筛选的原始记录 token，再按单价累加费用，starts 非空时同时累加到各分桶
 func (store *Store) scanCost(ctx context.Context, from, to int64, starts []int64, filters api.UsageFilters) (cost, error) {
 	clause, filterArgs := filterSQL(filters)
-	rows, err := store.db.QueryContext(ctx, `SELECT time, model, input_tokens, cached_tokens, reasoning_tokens + reply_tokens
- FROM requests WHERE time >= ? AND time < ?`+clause, append([]any{from, to}, filterArgs...)...)
+	var slots strings.Builder
+	var args []any
+	for index := range max(len(starts), 1) {
+		start, stop := from, to
+		if starts != nil {
+			start = max(starts[index], from)
+			if index+1 < len(starts) {
+				stop = starts[index+1]
+			}
+		}
+		if index > 0 {
+			slots.WriteByte(',')
+		}
+		slots.WriteString("(?,?,?)")
+		args = append(args, index, start, stop)
+	}
+	tier := "input_tokens > " + strconv.Itoa(pricing.LongContext)
+	rows, err := store.db.QueryContext(ctx, `WITH slots(slot, start, stop) AS (VALUES `+slots.String()+`)
+ SELECT slot, model, `+tier+`, SUM(input_tokens), SUM(cached_tokens), SUM(reasoning_tokens + reply_tokens)
+ FROM slots JOIN requests INDEXED BY requests_cost ON time >= start AND time < stop`+clause+`
+ GROUP BY slot, model, `+tier, append(args, filterArgs...)...)
 	if err != nil {
 		return cost{}, err
 	}
 	result := cost{buckets: make([]float64, len(starts)), unpriced: map[string]bool{}}
-	var at, input, cached, output int64
+	var slot int
+	var long bool
+	var input, cached, output int64
 	var model string
 	for rows.Next() {
-		if err := rows.Scan(&at, &model, &input, &cached, &output); err != nil {
+		if err := rows.Scan(&slot, &model, &long, &input, &cached, &output); err != nil {
 			return cost{}, errors.Join(err, rows.Close())
 		}
 		if input+output > 0 && !pricing.Priced(model) {
 			result.unpriced[model] = true
 		}
-		value := pricing.Cost(model, input, cached, output)
+		value := pricing.TierCost(model, long, input, cached, output)
 		result.total += value
 		if starts != nil {
-			result.buckets[bucketIndex(starts, at)] += value
+			result.buckets[slot] += value
 		}
 	}
 	return result, errors.Join(rows.Err(), rows.Close())
@@ -411,7 +432,6 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 	for _, dimension := range usageDimensions {
 		groups[dimension] = map[string]*aggregate{}
 	}
-	pairs := map[[2]string]*aggregate{}
 	stack := map[string][][2]int64{}
 	add := func(target map[string]*aggregate, key string, value *entry) {
 		if target[key] == nil {
@@ -426,11 +446,6 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 		for _, dimension := range usageDimensions {
 			add(groups[dimension], value.dimension(dimension), value)
 		}
-		pair := [2]string{value.account, value.model}
-		if pairs[pair] == nil {
-			pairs[pair] = &aggregate{}
-		}
-		pairs[pair].add(value)
 		key := value.dimension(query.Stack)
 		if stack[key] == nil {
 			stack[key] = make([][2]int64, len(starts))
@@ -468,7 +483,7 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 		From: query.From.UTC(), To: query.To.UTC(), BucketSeconds: int64(query.Bucket / time.Second), GeneratedAt: now.UTC(),
 		Totals: totals.stats(), Previous: previous.stats(), Cost: current.total, PreviousCost: before.total, UnpricedModels: unpriced, StackBy: query.Stack,
 		Recent:  api.UsageRecent{Minutes: int(recentWindow / time.Minute), Requests: recent.requests, Tokens: recent.totalTokens},
-		Buckets: make([]api.UsageBucket, len(starts)), Groups: map[string][]api.UsageGroup{}, Pairs: []api.UsagePair{},
+		Buckets: make([]api.UsageBucket, len(starts)), Groups: map[string][]api.UsageGroup{},
 	}
 	for index, start := range starts {
 		report.Buckets[index] = api.UsageBucket{At: time.UnixMilli(start).UTC(), Cost: current.buckets[index], UsageStats: buckets[index].stats()}
@@ -476,12 +491,6 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 	for _, dimension := range usageDimensions {
 		report.Groups[dimension] = rankGroups(groups[dimension])
 	}
-	for pair, total := range pairs {
-		report.Pairs = append(report.Pairs, api.UsagePair{Account: pair[0], Model: pair[1], UsageStats: total.stats()})
-	}
-	slices.SortFunc(report.Pairs, func(a, b api.UsagePair) int {
-		return cmp.Or(cmp.Compare(b.Requests, a.Requests), strings.Compare(a.Account, b.Account), strings.Compare(a.Model, b.Model))
-	})
 	report.Series = stackSeries(report.Groups[query.Stack], stack, len(starts))
 	var latest sql.NullInt64
 	if err := store.db.QueryRowContext(ctx, `SELECT MAX(time) FROM requests`).Scan(&latest); err != nil {
@@ -504,6 +513,31 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 		report.Options[dimension] = slices.Sorted(maps.Keys(groups[dimension]))
 	}
 	return report, nil
+}
+
+// UsagePairs 返回时间范围内符合筛选的账户与模型组合汇总，按请求数降序、账户与模型升序排列
+func (store *Store) UsagePairs(ctx context.Context, query api.UsageQuery) ([]api.UsagePair, error) {
+	totals := map[[2]string]*aggregate{}
+	visit := func(value *entry) {
+		key := [2]string{value.account, value.model}
+		if totals[key] == nil {
+			totals[key] = &aggregate{}
+		}
+		totals[key].add(value)
+	}
+	for _, part := range plan(query.From.UnixMilli(), query.To.UnixMilli(), nil) {
+		if err := store.scan(ctx, part, query.Filters, visit); err != nil {
+			return nil, err
+		}
+	}
+	pairs := make([]api.UsagePair, 0, len(totals))
+	for key, total := range totals {
+		pairs = append(pairs, api.UsagePair{Account: key[0], Model: key[1], UsageStats: total.stats()})
+	}
+	slices.SortFunc(pairs, func(a, b api.UsagePair) int {
+		return cmp.Or(cmp.Compare(b.Requests, a.Requests), strings.Compare(a.Account, b.Account), strings.Compare(a.Model, b.Model))
+	})
+	return pairs, nil
 }
 
 // rankGroups 按请求数降序、取值升序排列维度分项

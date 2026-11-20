@@ -22,7 +22,7 @@ import (
 //go:embed dom.js
 var domJavaScript string
 
-//go:embed firefox152.json.gz
+//go:embed firefox158.json.gz
 var firefoxShapeGzip []byte
 
 //go:embed smhost.js
@@ -46,6 +46,120 @@ var firefoxShapeJSON = sync.OnceValues(func() (string, error) {
 	return string(data), err
 })
 
+// shapeTable 是进程内准备一次、各 VM 共用的只读形状表：parts 为把 defaults 换成空对象、各接口的 pr 换成成员名与种类 pk 后在 Closure 监听表全局名处切开的各段，各 VM 以自己的随机名拼回；defaults 与 members 为各接口默认值与原型成员的 JSON，names 为 defaults 的接口名按原顺序的 JSON 数组，各 VM 只在首次读取某接口的这两项时解析它
+type shapeTable struct {
+	parts    []string
+	names    string
+	defaults map[string]string
+	members  map[string]string
+}
+
+// firefoxShape 从内嵌的 Firefox 形状表准备 shapeTable
+var firefoxShape = sync.OnceValues(func() (*shapeTable, error) {
+	shape, err := firefoxShapeJSON()
+	if err != nil {
+		return nil, err
+	}
+	table := &shapeTable{defaults: map[string]string{}, members: map[string]string{}}
+	var text strings.Builder
+	last := 0
+	decoder := json.NewDecoder(strings.NewReader(shape))
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		var replaced string
+		switch key {
+		case "defaults":
+			replaced, err = "{}", table.splitDefaults(value)
+		case "interfaces":
+			replaced, err = table.splitMembers(value)
+		default:
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		end := int(decoder.InputOffset())
+		text.WriteString(shape[last : end-len(value)])
+		text.WriteString(replaced)
+		last = end
+	}
+	text.WriteString(shape[last:])
+	table.parts = closureListenerMapPattern.Split(text.String(), -1)
+	return table, nil
+})
+
+// splitDefaults 把各接口默认值按接口名移入 defaults，并按原顺序记下接口名
+func (table *shapeTable) splitDefaults(value json.RawMessage) error {
+	entries := json.NewDecoder(bytes.NewReader(value))
+	if _, err := entries.Token(); err != nil {
+		return err
+	}
+	var names []string
+	for entries.More() {
+		name, err := entries.Token()
+		if err != nil {
+			return err
+		}
+		var entry json.RawMessage
+		if err := entries.Decode(&entry); err != nil {
+			return err
+		}
+		names = append(names, name.(string))
+		table.defaults[name.(string)] = string(entry)
+	}
+	encoded, err := json.Marshal(names)
+	table.names = string(encoded)
+	return err
+}
+
+// splitMembers 把接口表中各接口的 pr 按接口名移入 members，原处换成成员名与种类的 pk，有 entries 成对迭代器的接口记 pi，返回改写后的接口表 JSON
+func (table *shapeTable) splitMembers(value json.RawMessage) (string, error) {
+	var interfaces []map[string]json.RawMessage
+	if err := json.Unmarshal(value, &interfaces); err != nil {
+		return "", err
+	}
+	for _, info := range interfaces {
+		var name string
+		if err := json.Unmarshal(info["n"], &name); err != nil {
+			return "", err
+		}
+		var members []struct {
+			N  string `json:"n"`
+			K  string `json:"k"`
+			Fn string `json:"fn"`
+		}
+		if err := json.Unmarshal(info["pr"], &members); err != nil {
+			return "", err
+		}
+		keys := make([][2]string, len(members))
+		for index, member := range members {
+			keys[index] = [2]string{member.N, member.K}
+			if member.N == "@@iterator" && member.Fn == "entries" {
+				info["pi"] = json.RawMessage("true")
+			}
+		}
+		encoded, err := json.Marshal(keys)
+		if err != nil {
+			return "", err
+		}
+		table.members[name] = string(info["pr"])
+		info["pk"] = encoded
+		delete(info, "pr")
+	}
+	encoded, err := json.Marshal(interfaces)
+	return string(encoded), err
+}
+
 // Profile 保存账户指纹与页面状态决定的宿主现场值
 type Profile struct {
 	PageURL      string
@@ -62,6 +176,12 @@ type Profile struct {
 	TrustedTypes bool
 	// NavigationStart 是页面导航开始的时间，为零时页面时间起点取宿主安装时刻
 	NavigationStart time.Time
+	// Navigation 是顶层页面 PerformanceNavigationTiming 的取值，以导航开始为零点的毫秒数
+	Navigation map[string]any
+	// DOMLoading 是顶层页面旧版 performance.timing.domLoading 相对导航开始的毫秒数
+	DOMLoading int
+	// MediaInputs 是页面未授权时 enumerateDevices 列出的输入设备种类，按 audioinput、videoinput 顺序
+	MediaInputs []string
 }
 
 // closureListenerMapPattern 匹配 Closure 事件库在页面载入时以随机数命名的监听表全局名
@@ -142,9 +262,11 @@ const hostJavaScript = `
     templatedObject: input.templatedObject,
     setTemplateResolver: input.setTemplateResolver,
     performanceNow: input.performanceNow,
+    inputNow: input.inputNow,
     timeOrigin: input.timeOrigin,
     createIframeWindow: input.createIframeWindow,
     loadImage: input.loadImage,
+    loadFrame: input.loadFrame,
     resolveInterface: input.resolveInterface,
     orderKeys: input.orderKeys,
   });
@@ -167,13 +289,18 @@ type agent struct {
 	loop            *eventLoop
 	profile         Profile
 	loadImage       func(string) bool
-	pending         *sync.WaitGroup
+	loadFrame       func(string) bool
+	pending         int
+	settled         []chan struct{}
 	timezone        string
 	navigationStart time.Time
 	depth           int
 	shared          mozjs.Handle
 	track           mozjs.Handle
 	notify          mozjs.Handle
+	activate        mozjs.Handle
+	mouseInput      mozjs.Handle
+	keyInput        mozjs.Handle
 	array           mozjs.Handle
 	top             *realmHost
 	realms          []*realmHost
@@ -230,6 +357,18 @@ func (state *agent) dispatch(realm *realmHost, id float64, argument mozjs.Value)
 		return
 	}
 	state.cx.ReleaseValue(value)
+}
+
+// loaded 结束一个页面资源请求，没有进行中的请求时唤醒等待静置的调用方
+func (state *agent) loaded() {
+	state.pending--
+	if state.pending > 0 {
+		return
+	}
+	for _, done := range state.settled {
+		close(done)
+	}
+	state.settled = nil
 }
 
 // afterTask 在每个任务结束后为 Promise 拒绝派发 unhandledrejection 与 rejectionhandled
@@ -323,20 +462,21 @@ func (state *agent) installRealm(name string, same mozjs.Handle) (*realmHost, er
 	if err != nil {
 		return nil, err
 	}
-	realmStarted := time.Now()
+	realmStarted := state.loop.wall()
 	if name == "top" && !state.navigationStart.IsZero() {
 		realmStarted = state.navigationStart
 	}
 	fields := map[string]mozjs.Value{
 		"realm": mozjs.String(name), "trustedTypes": mozjs.Bool(state.profile.TrustedTypes), "profileJSON": mozjs.String(string(profileJSON)),
-		"timeOrigin": mozjs.Number(float64(realmStarted.UnixMilli())), "started": mozjs.Number(mozjs.Now() - float64(time.Since(realmStarted).Microseconds())/1000),
+		"timeOrigin": mozjs.Number(float64(realmStarted.UnixMilli())), "started": mozjs.Number(mozjs.Clock() - float64(state.loop.wall().Sub(realmStarted).Microseconds())/1000),
 	}
 	if state.shared == 0 {
-		shapeJSON, err := firefoxShapeJSON()
+		shape, err := firefoxShape()
 		if err != nil {
 			return nil, fmt.Errorf("读取 Firefox 形状表: %w", err)
 		}
-		fields["shapeJSON"] = mozjs.String(closureListenerMapPattern.ReplaceAllLiteralString(shapeJSON, "closure_lm_"+strconv.Itoa(rand.IntN(1000000))))
+		fields["shapeJSON"] = mozjs.String(strings.Join(shape.parts, "closure_lm_"+strconv.Itoa(rand.IntN(1000000))))
+		fields["shapeDefaults"] = mozjs.String(shape.names)
 	}
 	for key, value := range fields {
 		if err := cx.Set(config, key, value); err != nil {
@@ -381,6 +521,15 @@ func (state *agent) installAgent(result mozjs.Handle) error {
 		return err
 	}
 	if state.notify, err = handleOf(cx.Get(result, "notify")); err != nil {
+		return err
+	}
+	if state.activate, err = handleOf(cx.Get(result, "activate")); err != nil {
+		return err
+	}
+	if state.mouseInput, err = handleOf(cx.Get(result, "mouseInput")); err != nil {
+		return err
+	}
+	if state.keyInput, err = handleOf(cx.Get(result, "keyInput")); err != nil {
 		return err
 	}
 	reporter, err := handleOf(cx.Get(result, "reportMicrotask"))
@@ -472,16 +621,46 @@ func (state *agent) natives(realm *realmHost) map[string]hostNative {
 	if state.loadImage != nil {
 		natives["loadImage"] = hostNative{2, func(call *mozjs.Call) error {
 			address, id := call.ArgString(0), call.ArgNumber(1)
-			state.pending.Add(1)
+			state.pending++
+			issued, started := state.loop.now(), time.Now()
 			go func() {
-				defer state.pending.Done()
 				loaded := state.loadImage(address)
-				state.loop.schedule(0, func() { state.dispatch(realm, id, mozjs.Bool(loaded)) })
+				state.loop.push(&task{at: issued + milliseconds(time.Since(started)), job: func() {
+					state.dispatch(realm, id, mozjs.Bool(loaded))
+					state.loaded()
+				}})
+			}()
+			return nil
+		}}
+	}
+	if state.loadFrame != nil {
+		natives["loadFrame"] = hostNative{2, func(call *mozjs.Call) error {
+			address, id := call.ArgString(0), call.ArgNumber(1)
+			state.pending++
+			issued, started := state.loop.now(), time.Now()
+			go func() {
+				loaded := state.loadFrame(address)
+				state.loop.push(&task{at: issued + milliseconds(time.Since(started)), job: func() {
+					state.dispatch(realm, id, mozjs.Bool(loaded))
+					state.loaded()
+				}})
 			}()
 			return nil
 		}}
 	}
 	if realm.name == "top" {
+		natives["shapeEntry"] = hostNative{2, func(call *mozjs.Call) error {
+			shape, err := firefoxShape()
+			if err != nil {
+				return err
+			}
+			entries := shape.defaults
+			if call.ArgString(0) == "pr" {
+				entries = shape.members
+			}
+			call.Return(mozjs.String(entries[call.ArgString(1)]))
+			return nil
+		}}
 		natives["createIframeWindow"] = hostNative{0, func(call *mozjs.Call) error {
 			frame, err := state.installRealm("frame", state.top.global)
 			if err != nil {
@@ -515,6 +694,9 @@ func (state *agent) realmProfile(realm string) map[string]any {
 		if width, ok := profile.Window["innerWidth"]; ok {
 			values["visualViewport"] = map[string]any{"width": width, "height": profile.Window["innerHeight"]}
 		}
+		if len(profile.Navigation) > 0 {
+			values["performance.navigationEntry"] = profile.Navigation
+		}
 	} else {
 		for _, name := range frameWindowNames {
 			if value, ok := profile.Window[name]; ok {
@@ -531,7 +713,10 @@ func (state *agent) realmProfile(realm string) map[string]any {
 			values["document"] = document
 		}
 	}
-	result := map[string]any{"hasFocus": profile.HasFocus, "window": window, "values": values}
+	result := map[string]any{"hasFocus": profile.HasFocus, "window": window, "values": values, "mediaInputs": append([]string{}, profile.MediaInputs...)}
+	if realm == "top" && len(profile.Navigation) > 0 {
+		result["domLoading"] = profile.DOMLoading
+	}
 	if realm == "top" && len(profile.Globals) > 0 {
 		result["globals"] = profile.Globals
 	}

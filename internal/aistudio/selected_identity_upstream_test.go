@@ -37,12 +37,12 @@ func TestSelectedIdentityMetadataWinsOverUpstreamSession(t *testing.T) {
 	client := &http.Client{Transport: identityRoundTripper(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(payload)), Header: http.Header{}}, nil
 	})}
-	got, err := ResolveSelectedAuthUser(context.Background(), client, state, 7)
+	got, err := VerifySelectedAuthUser(context.Background(), client, state, 7)
 	if err != nil || got != "0" {
 		t.Fatalf("metadata must win: got %q, err %v", got, err)
 	}
 	payload = "invalid"
-	if _, err := ResolveSelectedAuthUser(context.Background(), client, state, 7); err == nil {
+	if _, err := VerifySelectedAuthUser(context.Background(), client, state, 7); err == nil {
 		t.Fatal("identity failure must not fall back")
 	}
 }

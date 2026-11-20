@@ -11,4 +11,10 @@ class ManagedStreamingResponse(StreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            await self.cleanup()
+            import anyio
+            with anyio.CancelScope(shield=True):
+                try:
+                    if hasattr(self.body_iterator, 'aclose'):
+                        await self.body_iterator.aclose()
+                finally:
+                    await self.cleanup()

@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 
 	"github.com/minio/selfupdate"
+
+	"github.com/Mag1cFall/AIStudio2API/internal/api"
 )
 
 // platformUpdateMode 返回命令行版的更新方式：原地替换可执行文件
@@ -28,7 +30,8 @@ func (u *selfUpdater) install(ctx context.Context, release *githubRelease) error
 	if err != nil {
 		return err
 	}
-	u.log("INFO", "在线更新 | 2/2 | 替换可执行文件 | 版本="+release.TagName)
+	u.setStage("install")
+	u.requests.logStage("service", "INFO", api.LogStage{Name: "在线更新", Step: 2, Steps: 2}, "替换可执行文件", "version", release.TagName)
 	if err := selfupdate.Apply(bytes.NewReader(executable), selfupdate.Options{TargetPath: u.executable}); err != nil {
 		if rollback := selfupdate.RollbackError(err); rollback != nil {
 			return fmt.Errorf("替换可执行文件: %w；恢复原文件失败: %v", err, rollback)
@@ -39,7 +42,7 @@ func (u *selfUpdater) install(ctx context.Context, release *githubRelease) error
 }
 
 // updateRestart 返回在线更新完成后的重启动作：结束当前服务，由 Run 以原参数启动替换后的可执行文件
-func updateRestart(stop func(), restarting *atomic.Bool, _ func(level, message string)) func() {
+func updateRestart(stop func(), restarting *atomic.Bool, _ func(level, message string, attrs ...any)) func() {
 	return func() {
 		restarting.Store(true)
 		stop()

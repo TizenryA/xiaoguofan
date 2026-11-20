@@ -20,10 +20,15 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/updater"
 )
 
-// appIcon 为窗口与 Linux 托盘使用的应用图标
+// appIcon 为 Windows 与 Linux 的窗口图标
 //
 //go:embed icons/appicon.png
 var appIcon []byte
+
+// macAppIcon 为 macOS 的 Dock 与对话框图标，按 macOS 图标网格留白，与应用包内的 icons.icns 同源
+//
+//go:embed icons/appicon-mac.png
+var macAppIcon []byte
 
 // trayIcon 为 Windows 与 Linux 托盘图标
 //
@@ -43,24 +48,27 @@ var trayTemplateIcon []byte
 // messagePrefix 为管理页面发给桌面壳的消息前缀
 const messagePrefix = "aistudio2api:"
 
-// App 为桌面应用的窗口、托盘与托盘菜单，没有窗口时 window 为 nil，Windows 缺少 WebView2 运行时时 webview 为 false
+// App 为桌面应用的窗口、托盘与托盘菜单，没有窗口时 window 为 nil，Windows 缺少 WebView2 运行时时 webview 为 false、询问与安装期间 installing 为 true，桌面环境没有系统托盘时 trayed 为 false，tray 为 macOS 的菜单栏图标
 type App struct {
-	app     *application.App
-	webview bool
-	window  *application.WebviewWindow
-	open    bool
-	origin  string
-	url     string
-	target  string
-	loaded  bool
-	busy    bool
-	closing bool
-	bounds  application.Rect
-	maxed   bool
-	mu      sync.Mutex
-	menu    *application.WebviewWindow
-	locale  string
-	theme   string
+	app        *application.App
+	webview    bool
+	installing bool
+	trayed     bool
+	tray       *application.SystemTray
+	window     *application.WebviewWindow
+	open       bool
+	origin     string
+	url        string
+	target     string
+	loaded     bool
+	busy       bool
+	closing    bool
+	bounds     application.Rect
+	maxed      bool
+	mu         sync.Mutex
+	menu       *application.WebviewWindow
+	locale     string
+	theme      string
 }
 
 // HandleUpdateHelper 在更新器辅助进程中完成文件替换并退出，其他进程直接返回
@@ -68,15 +76,23 @@ func HandleUpdateHelper() {
 	updater.HandleHelperMode()
 }
 
-// New 创建桌面应用与托盘，show 为 true 时同时创建主窗口，WebView 数据写入 webviewDir；已有实例运行时把它的窗口带到前台并结束当前进程
-func New(show bool, webviewDir string) *App {
+// New 创建桌面应用与托盘，show 为 true 时同时创建主窗口（Windows 缺少 WebView2 运行时时改为在 Run 中询问并安装），hideDock 为 true 时 macOS 只显示菜单栏图标、不显示 Dock 图标，WebView 数据写入 webviewDir，stop 在窗口与托盘关闭后、进程退出前执行；已有实例运行时把它的窗口带到前台并结束当前进程
+func New(show, hideDock bool, webviewDir string, stop func()) *App {
 	shell := &App{}
+	policy := application.ActivationPolicyRegular
+	if hideDock {
+		policy = application.ActivationPolicyAccessory
+	}
+	icon := appIcon
+	if runtime.GOOS == "darwin" {
+		icon = macAppIcon
+	}
 	shell.app = application.New(application.Options{
 		Name:        "AIStudio2API",
 		Description: "AIStudio2API",
-		Icon:        appIcon,
+		Icon:        icon,
 		Mac: application.MacOptions{
-			ActivationPolicy: application.ActivationPolicyRegular,
+			ActivationPolicy: policy,
 		},
 		Linux: application.LinuxOptions{
 			DisableQuitOnLastWindowClosed: true,
@@ -92,30 +108,46 @@ func New(show bool, webviewDir string) *App {
 			WndProcInterceptor:            shell.trayMessage,
 		},
 		RawMessageHandler: shell.handleMessage,
+		PostShutdown:      stop,
 		ErrorHandler:      func(err error) { slog.Error("桌面窗口错误", "error", err) },
 		WarningHandler:    func(message string) { slog.Warn("桌面窗口警告", "message", message) },
 	})
-	if runtime.GOOS == "windows" && shell.app.Env.Info().PlatformInfo["WebView2"] == "" && !(show && installWebView2()) {
+	shell.webview = runtime.GOOS != "windows" || shell.app.Env.Info().PlatformInfo["WebView2"] != ""
+	shell.open = show
+	shell.startTray()
+	switch {
+	case !shell.webview && show:
+		shell.installing = true
+	case !shell.webview:
 		slog.Warn("没有找到 WebView2 运行时，管理页面在默认浏览器中打开")
-		shell.open = show
-		shell.createTray()
-		return shell
-	}
-	shell.webview = true
-	if show {
+	case show || !shell.hasTray():
 		shell.createWindow()
 	}
 	shell.app.Event.OnApplicationEvent(events.Mac.ApplicationShouldHandleReopen, func(*application.ApplicationEvent) {
 		shell.show()
 	})
-	shell.createTray()
 	return shell
+}
+
+// hasTray 返回托盘是否已创建
+func (s *App) hasTray() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.trayed
+}
+
+// windowBackground 返回与管理页面画布同色的窗口背景：亮色主题为 #f6f8fa，其余为启动画面与深色主题的 #0d1117
+func windowBackground(theme string) application.RGBA {
+	if theme == "light" {
+		return application.NewRGB(246, 248, 250)
+	}
+	return application.NewRGB(13, 17, 23)
 }
 
 // createWindow 返回主窗口，没有时以上次销毁前的位置、大小与最大化状态创建
 func (s *App) createWindow() *application.WebviewWindow {
 	s.mu.Lock()
-	window, target, bounds, maxed := s.window, s.target, s.bounds, s.maxed
+	window, target, bounds, maxed, theme := s.window, s.target, s.bounds, s.maxed, s.theme
 	s.mu.Unlock()
 	if window != nil {
 		return window
@@ -129,11 +161,14 @@ func (s *App) createWindow() *application.WebviewWindow {
 		MinHeight:        560,
 		HTML:             splashPage,
 		Frameless:        runtime.GOOS != "darwin",
-		BackgroundColour: application.NewRGB(13, 17, 23),
+		BackgroundColour: windowBackground(theme),
 		Mac: application.MacWindow{
 			TitleBar:                application.MacTitleBarHiddenInset,
 			InvisibleTitleBarHeight: 40,
 		},
+		Linux: application.LinuxWindow{WebviewGpuPolicy: application.WebviewGpuPolicyNever},
+		// WebView2CompositionHosting 让标题栏按钮作为非客户区参与 Windows 命中测试，悬停最大化按钮时系统显示贴靠布局
+		Windows: application.WindowsWindow{WebView2CompositionHosting: true},
 	}
 	if target != "" {
 		options.HTML, options.URL = "", target
@@ -147,6 +182,10 @@ func (s *App) createWindow() *application.WebviewWindow {
 		window.Maximise()
 	}
 	window.RegisterHook(events.Common.WindowClosing, func(event *application.WindowEvent) {
+		if !s.hasTray() {
+			go s.app.Quit()
+			return
+		}
 		maxed, minimised, bounds := window.IsMaximised(), window.IsMinimised(), window.Bounds()
 		s.mu.Lock()
 		keep := s.window == window && s.busy
@@ -200,9 +239,12 @@ func pageAddress(address *url.URL) string {
 	return (&url.URL{Path: address.Path, RawQuery: query.Encode()}).String()
 }
 
-// Run 运行窗口与托盘，启动画面显示到 start 返回管理页面地址；start 出错时以系统语言显示错误对话框后退出，运行到用户从托盘退出或 ctx 结束
+// Run 运行窗口与托盘，启动画面显示到 start 返回管理页面地址，需要安装 WebView2 运行时时与 start 同时询问并安装；start 出错时以系统语言显示错误对话框后退出，运行到用户从托盘退出或 ctx 结束
 func (s *App) Run(ctx context.Context, start func() (string, error)) error {
 	s.app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
+		if s.installing {
+			go s.installRuntime()
+		}
 		go func() {
 			pageURL, err := start()
 			if err != nil {
@@ -220,27 +262,35 @@ func (s *App) Run(ctx context.Context, start func() (string, error)) error {
 	return s.app.Run()
 }
 
-// navigate 记录管理页面地址，启动画面已加载时让主窗口显示带桌面参数的管理页面；没有 WebView2 时按启动参数在浏览器中打开
+// navigate 记录管理页面地址，启动画面已加载时让主窗口显示带桌面参数的管理页面；没有 WebView2 且不在安装时按启动参数在浏览器中打开
 func (s *App) navigate(pageURL string) {
-	if !s.webview {
-		s.mu.Lock()
-		s.url = pageURL
-		s.mu.Unlock()
-		if s.open {
-			s.openPage()
-		}
-		return
-	}
 	address, _ := url.Parse(pageURL)
 	origin := address.Scheme + "://" + address.Host
 	target := origin + pageAddress(address)
 	s.mu.Lock()
 	s.origin, s.url, s.target = origin, pageURL, target
-	window, loaded := s.window, s.loaded
+	window, loaded, browse := s.window, s.loaded, !s.webview && !s.installing && s.open
 	s.mu.Unlock()
+	if browse {
+		s.openPage()
+	}
 	if window != nil && loaded {
 		window.SetURL(target)
 	}
+}
+
+// installRuntime 询问并安装 WebView2 运行时，装好后显示主窗口，没有装上时按启动参数在浏览器中打开管理页面
+func (s *App) installRuntime() {
+	installed := installWebView2()
+	s.mu.Lock()
+	s.webview, s.installing = installed, false
+	s.mu.Unlock()
+	if installed {
+		s.show()
+		return
+	}
+	slog.Warn("没有找到 WebView2 运行时，管理页面在默认浏览器中打开")
+	s.openPage()
 }
 
 // splashLoaded 记录启动画面已加载，管理页面地址已知时让主窗口显示管理页面
@@ -265,6 +315,9 @@ func (s *App) createTray() {
 	tray.SetTooltip("AIStudio2API")
 	s.attachMenu(tray)
 	s.setLocale(i18n.Console)
+	s.mu.Lock()
+	s.trayed = true
+	s.mu.Unlock()
 }
 
 // toggleAutostart 按系统中的当前设置切换开机自启动，失败时显示错误对话框
@@ -292,9 +345,12 @@ func (s *App) openPage() {
 	}
 }
 
-// show 显示、还原并聚焦主窗口，没有窗口时先创建，关闭后仍隐藏保留的窗口取消销毁；没有 WebView2 时在浏览器中打开管理页面
+// show 显示、还原并聚焦主窗口，没有窗口时先创建，关闭后仍隐藏保留的窗口取消销毁；没有 WebView2 或正在安装时在浏览器中打开管理页面
 func (s *App) show() {
-	if !s.webview {
+	s.mu.Lock()
+	webview := s.webview
+	s.mu.Unlock()
+	if !webview {
 		s.openPage()
 		return
 	}
@@ -305,9 +361,10 @@ func (s *App) show() {
 	window.Show()
 	window.UnMinimise()
 	window.Focus()
+	activateApp()
 }
 
-// handleMessage 处理管理页面经 postMessage 发来的窗口操作、界面语言、配色、当前路由与是否有未完成的工作
+// handleMessage 处理管理页面经 postMessage 发来的窗口操作、界面语言、配色、Dock 图标、当前路由与是否有未完成的工作
 func (s *App) handleMessage(window application.Window, message string, origin *application.OriginInfo) {
 	command, found := strings.CutPrefix(message, messagePrefix)
 	if !found {
@@ -351,6 +408,8 @@ func (s *App) handleMessage(window application.Window, message string, origin *a
 			s.mu.Lock()
 			s.theme = theme
 			s.mu.Unlock()
+		} else if dock, ok := strings.CutPrefix(command, "dock:"); ok {
+			setDockIcon(dock == "show")
 		} else if busy, ok := strings.CutPrefix(command, "busy:"); ok {
 			s.setBusy(busy == "1")
 		} else if route, ok := strings.CutPrefix(command, "route:"); ok && page != "" {
@@ -372,15 +431,19 @@ func (s *App) openExternal(link string) {
 	}
 }
 
-// setLocale 记录管理页面的界面语言，托盘菜单打开时按它取文字
+// setLocale 记录管理页面的界面语言，托盘菜单打开时按它取文字，界面语言变化时重设 macOS 的原生菜单
 func (s *App) setLocale(locale string) {
 	_, ok := trayLabels[locale]
 	if !ok {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	changed := s.locale != locale
 	s.locale = locale
+	s.mu.Unlock()
+	if changed {
+		s.localizeMenus(locale)
+	}
 }
 
 // labels 返回当前界面语言的托盘菜单文字

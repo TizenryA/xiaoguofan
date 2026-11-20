@@ -1,12 +1,16 @@
 // mozjs.cpp 实现 mozjs.h：上下文、根表、求值、Go 原生函数、微任务队列、Promise 拒绝记录与浏览器宿主原生函数
 #include "mozjs.h"
+#include "clock.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -14,6 +18,9 @@
 #include "jsfriendapi.h"
 #include "js/Array.h"
 #include "js/ArrayBuffer.h"
+#include "js/BuildId.h"
+#include "js/Transcoding.h"
+#include "js/experimental/JSStencil.h"
 #include "js/CallAndConstruct.h"
 #include "js/CharacterEncoding.h"
 #include "js/CompilationAndEvaluation.h"
@@ -50,7 +57,7 @@ extern "C" __declspec(dllimport) void WINAPI GetCurrentThreadStackLimits(PULONG_
 #endif
 
 extern "C" bool mzGoNative(uintptr_t id, int32_t native, mz_call* call);
-extern "C" void mozjs_set_camou_locale(const char* language, const char* region, const char* locale);
+extern "C" void mozjs_set_camou_locale(const char* locale);
 extern "C" bool mozjs_delete_global_property(JSContext* cx, JSObject* global, JS::HandleId id);
 
 class HostJobQueue;
@@ -109,6 +116,20 @@ static const JSClassOps WindowClassOps = {
 
 // WindowClass 的两个宿主槽保存惰性解析与枚举回调
 static const JSClass WindowClass = {"Window", JSCLASS_GLOBAL_FLAGS_WITH_SLOTS(2), &WindowClassOps};
+
+static bool TemplateResolve(JSContext* cx, JS::HandleObject object, JS::HandleId id, bool* resolved);
+static bool TemplateEnumerate(JSContext* cx, JS::HandleObject object);
+static bool TemplateMayResolve(const JSAtomState& names, jsid id, JSObject* maybeObject);
+
+// TemplateClassOps 在接口原型首次被查找或枚举时定义其全部成员
+static const JSClassOps TemplateClassOps = {
+    .enumerate = TemplateEnumerate,
+    .resolve = TemplateResolve,
+    .mayResolve = TemplateMayResolve,
+};
+
+// TemplateClass 的宿主槽保存尚未调用的成员定义回调
+static const JSClass TemplateClass = {"Object", JSCLASS_HAS_RESERVED_SLOTS(1), &TemplateClassOps};
 
 // Keep 把值放入根表并返回句柄
 static uint32_t Keep(mz_context* mz, const JS::Value& value) {
@@ -269,6 +290,53 @@ static bool WindowEnumerate(JSContext* cx, JS::HandleObject object, JS::MutableH
       return false;
     }
   }
+  return true;
+}
+
+// MaterializeTemplate 清空接口原型的成员定义回调后调用它
+static bool MaterializeTemplate(JSContext* cx, JS::HandleObject object) {
+  JS::RootedValue callback(cx, JS::GetReservedSlot(object, 0));
+  if (callback.isUndefined()) {
+    return true;
+  }
+  JS::SetReservedSlot(object, 0, JS::UndefinedValue());
+  JS::RootedValue argument(cx, JS::ObjectValue(*object));
+  JS::RootedValue result(cx);
+  return JS::Call(cx, JS::UndefinedHandleValue, callback, JS::HandleValueArray(argument), &result);
+}
+
+// TemplateResolve 在首次查找时定义接口原型的成员，再报告所查的键是否已定义
+static bool TemplateResolve(JSContext* cx, JS::HandleObject object, JS::HandleId id, bool* resolved) {
+  *resolved = false;
+  if (JS::GetReservedSlot(object, 0).isUndefined()) {
+    return true;
+  }
+  if (!MaterializeTemplate(cx, object)) {
+    return false;
+  }
+  return JS_AlreadyHasOwnPropertyById(cx, object, id, resolved);
+}
+
+// TemplateEnumerate 在枚举或冻结前定义接口原型的成员
+static bool TemplateEnumerate(JSContext* cx, JS::HandleObject object) {
+  return MaterializeTemplate(cx, object);
+}
+
+// TemplateMayResolve 判断接口原型是否仍有未定义的成员
+static bool TemplateMayResolve(const JSAtomState& names, jsid id, JSObject* maybeObject) {
+  return !maybeObject || !JS::GetReservedSlot(maybeObject, 0).isUndefined();
+}
+
+// HostTemplateObject 以给定原型新建接口原型对象，成员在首次查找或枚举时由回调定义
+static bool HostTemplateObject(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  JS::RootedObject proto(cx, &args[0].toObject());
+  JS::RootedObject object(cx, JS_NewObjectWithGivenProto(cx, &TemplateClass, proto));
+  if (!object) {
+    return false;
+  }
+  JS::SetReservedSlot(object, 0, args[1]);
+  args.rval().setObject(*object);
   return true;
 }
 
@@ -579,7 +647,18 @@ static bool ContentSecurityPolicyAllows(JSContext* cx, JS::RuntimeCode kind, JS:
 // SecurityCallbacks 是 Trusted Types 与 CSP 的引擎回调
 static const JSSecurityCallbacks SecurityCallbacks = {ContentSecurityPolicyAllows, CodeForEvalGets, nullptr};
 
-extern "C" const char* mz_init(void) { return JS_InitWithFailureDiagnostic(); }
+// StencilBuildId 是进程内 XDR 编码使用的构建标识
+static bool StencilBuildId(JS::BuildIdCharVector* buildId) { return buildId->append("aistudio2api", 12); }
+
+// stencilMutex 保护 stencilCache
+static std::mutex stencilMutex;
+// stencilCache 保存进程内各脚本的 XDR 编码编译结果，键为文件名、行号与源码
+static std::unordered_map<std::string, std::shared_ptr<JS::TranscodeBuffer>> stencilCache;
+
+extern "C" const char* mz_init(void) {
+  JS::SetProcessBuildIdOp(StencilBuildId);
+  return JS_InitWithFailureDiagnostic();
+}
 
 extern "C" mz_context* mz_context_new(uintptr_t id, uint32_t heap_bytes, size_t stack_quota, const char* locale) {
   JSContext* cx = JS_NewContext(heap_bytes ? heap_bytes : JS::DefaultHeapMaxBytes);
@@ -606,6 +685,7 @@ extern "C" mz_context* mz_context_new(uintptr_t id, uint32_t heap_bytes, size_t 
   JS::SetWarningReporter(cx, IgnoreWarning);
   JS_SetSecurityCallbacks(cx, &SecurityCallbacks);
   JS::ContextOptionsRef(cx).setAsyncStackCaptureDebuggeeOnly(true);
+  JS_SetGCParameter(cx, JSGC_MAX_NURSERY_BYTES, 4 * 1024 * 1024);
   if (locale && *locale) {
     JS_SetDefaultLocale(JS_GetRuntime(cx), locale);
   }
@@ -630,14 +710,14 @@ extern "C" void mz_context_free(mz_context* mz) {
   delete mz;
 }
 
-extern "C" void mz_set_camou_locale(const char* language, const char* region, const char* locale) {
-  mozjs_set_camou_locale(language, region, locale);
+extern "C" void mz_set_camou_locale(const char* locale) {
+  mozjs_set_camou_locale(locale);
 }
 
 extern "C" uint32_t mz_global_new(mz_context* mz, uint32_t same, const char* timezone) {
   JSContext* cx = mz->cx;
   JS::RealmOptions options;
-  options.creationOptions().setSharedMemoryAndAtomicsEnabled(true).setDefineSharedArrayBufferConstructor(false);
+  options.creationOptions().setSharedMemoryAndAtomicsEnabled(true).setDefineSharedArrayBufferConstructor(false).setPreserveJitCode(true);
   if (same) {
     options.creationOptions().setExistingCompartment(&Slot(mz, same).toObject());
   } else {
@@ -646,6 +726,7 @@ extern "C" uint32_t mz_global_new(mz_context* mz, uint32_t same, const char* tim
   if (timezone && *timezone) {
     options.behaviors().setTimeZoneOverride(timezone);
   }
+  mz_clock_realm(options);
   JS::RootedObject global(cx, JS_NewGlobalObject(cx, &WindowClass, nullptr, JS::DontFireOnNewGlobalHook, options));
   if (!global) {
     Capture(mz);
@@ -674,11 +755,47 @@ extern "C" bool mz_evaluate(mz_context* mz, uint32_t global, const char* source,
   JS::RootedObject target(cx, &Slot(mz, global).toObject());
   JSAutoRealm ar(cx, target);
   JS::CompileOptions options(cx);
-  options.setFileAndLine(filename, line);
+  options.setFileAndLine(filename, line).setIsRunOnce(true);
   JS::SourceText<mozilla::Utf8Unit> text;
   JS::RootedValue rval(cx);
-  if (!text.init(cx, source, len, JS::SourceOwnership::Borrowed) || !JS::Evaluate(cx, options, text, &rval) ||
-      !FromJS(mz, cx, rval, out)) {
+  std::string key = std::string(filename) + "|" + std::to_string(line) + "|" + std::string(source, len);
+  std::shared_ptr<JS::TranscodeBuffer> cached;
+  {
+    std::lock_guard<std::mutex> lock(stencilMutex);
+    auto found = stencilCache.find(key);
+    if (found != stencilCache.end()) {
+      cached = found->second;
+    }
+  }
+  RefPtr<JS::Stencil> stencil;
+  if (cached) {
+    JS::DecodeOptions decode(options);
+    JS::TranscodeRange range(cached->begin(), cached->length());
+    JS::Stencil* decoded = nullptr;
+    if (JS::DecodeStencil(cx, decode, range, &decoded) != JS::TranscodeResult::Ok) {
+      Capture(mz);
+      return false;
+    }
+    stencil = already_AddRefed<JS::Stencil>(decoded);
+  } else {
+    if (!text.init(cx, source, len, JS::SourceOwnership::Borrowed)) {
+      Capture(mz);
+      return false;
+    }
+    stencil = JS::CompileGlobalScriptToStencil(cx, options, text);
+    if (!stencil) {
+      Capture(mz);
+      return false;
+    }
+    auto buffer = std::make_shared<JS::TranscodeBuffer>();
+    if (JS::EncodeStencil(cx, stencil, *buffer) == JS::TranscodeResult::Ok) {
+      std::lock_guard<std::mutex> lock(stencilMutex);
+      stencilCache.emplace(key, buffer);
+    }
+  }
+  JS::InstantiateOptions instantiate(options);
+  JS::RootedScript script(cx, JS::InstantiateGlobalStencil(cx, instantiate, stencil));
+  if (!script || !JS_ExecuteScript(cx, script, &rval) || !FromJS(mz, cx, rval, out)) {
     Capture(mz);
     return false;
   }
@@ -941,9 +1058,9 @@ extern "C" double mz_now(void) {
   return double(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()) / 1000.0;
 }
 
-extern "C" void mz_gc(mz_context* mz) {
+extern "C" void mz_gc(mz_context* mz, bool shrink) {
   JS::PrepareForFullGC(mz->cx);
-  JS::NonIncrementalGC(mz->cx, JS::GCOptions::Shrink, JS::GCReason::API);
+  JS::NonIncrementalGC(mz->cx, shrink ? JS::GCOptions::Shrink : JS::GCOptions::Normal, JS::GCReason::API);
 }
 
 extern "C" size_t mz_thread_stack_size(void) {
@@ -965,10 +1082,17 @@ extern "C" size_t mz_thread_stack_size(void) {
 #endif
 }
 
-// HostNow 返回单调时钟毫秒数，精度为微秒
+// HostNow 返回本线程 VM 时钟的毫秒数，精度为微秒
 static bool HostNow(JSContext* cx, unsigned argc, JS::Value* vp) {
   JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
-  args.rval().setDouble(mz_now());
+  args.rval().setDouble(mz_clock());
+  return true;
+}
+
+// HostTaskStarted 返回本线程当前任务开始时的 VM 时钟毫秒数
+static bool HostTaskStarted(JSContext* cx, unsigned argc, JS::Value* vp) {
+  JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+  args.rval().setDouble(mz_clock_task());
   return true;
 }
 
@@ -1233,10 +1357,12 @@ extern "C" bool mz_install_host_natives(mz_context* mz, uint32_t target) {
   JSContext* cx = mz->cx;
   JS::RootedObject object(cx, &Slot(mz, target).toObject());
   JSAutoRealm ar(cx, object);
-  if (!JS_DefineFunction(cx, object, "now", HostNow, 0, 0) || !JS_DefineFunction(cx, object, "kindOf", HostKindOf, 1, 0) ||
+  if (!JS_DefineFunction(cx, object, "now", HostNow, 0, 0) || !JS_DefineFunction(cx, object, "taskStarted", HostTaskStarted, 0, 0) ||
+      !JS_DefineFunction(cx, object, "kindOf", HostKindOf, 1, 0) ||
       !JS_DefineFunction(cx, object, "throwLocation", HostThrowLocation, 0, 0) ||
       !JS_DefineFunction(cx, object, "incumbent", HostIncumbent, 0, 0) ||
       !JS_DefineFunction(cx, object, "lazyGlobals", HostLazyGlobals, 3, 0) ||
+      !JS_DefineFunction(cx, object, "templateObject", HostTemplateObject, 2, 0) ||
       !JS_DefineFunction(cx, object, "callListener", HostCallListener, 3, 0) ||
       !JS_DefineFunction(cx, object, "promiseResult", HostPromiseResult, 1, 0)) {
     Capture(mz);

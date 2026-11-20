@@ -16,14 +16,14 @@
 解压对应架构压缩包，进入目录：
 
 ```
-cd xiaoguofan-v0.9.15-linux-amd64
+cd xiaoguofan-v0.9.22-linux-amd64
 sudo python3 install.py --mode linux --origin https://your.example/lite
 ```
 
 Docker版：
 
 ```
-cd xiaoguofan-v0.9.15-docker-amd64
+cd xiaoguofan-v0.9.22-docker-amd64
 sudo python3 install.py --mode docker --origin https://your.example/lite
 ```
 

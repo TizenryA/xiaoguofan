@@ -26,12 +26,11 @@ func FindExecutable(ctx context.Context, proxy string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if path, ok := installedExecutable(ctx, name); ok {
-		return path, nil
-	}
-	path, err := installCamoufox(ctx, name, proxy)
-	if err != nil {
-		return "", fmt.Errorf("自动准备 Camoufox: %w", err)
+	path, ok := installedExecutable(ctx, name)
+	if !ok {
+		if path, err = installCamoufox(ctx, name, proxy); err != nil {
+			return "", fmt.Errorf("自动准备 Camoufox: %w", err)
+		}
 	}
 	return path, nil
 }

@@ -15,7 +15,7 @@ import (
 	"github.com/Mag1cFall/uquic/quicvarint"
 )
 
-// http3Conn 是一条按 neqo 0.28 行为收发的 HTTP/3 连接
+// http3Conn 是一条按 neqo 0.31 行为收发的 HTTP/3 连接
 type http3Conn struct {
 	quic *quic.Conn
 	// mu 保护 QPACK 编码器，并保证编码器流指令先于引用它的头块写出
@@ -32,6 +32,8 @@ type http3Conn struct {
 	ready chan struct{}
 	// remember 记录服务端 SETTINGS 中的 QPACK 设置，供下次 0-RTT 沿用
 	remember func(capacity uint64, blocked uint64)
+	// streams 是本连接已打开的请求流数
+	streams atomic.Int64
 }
 
 // newHTTP3Conn 在 QUIC 连接上按 neqo 的顺序打开控制流、QPACK 编码器流与解码器流；settings 非 nil 表示握手尚未完成的 0-RTT 连接

@@ -7,7 +7,6 @@ import re
 from pathlib import Path
 
 PREFIX = '[防截断]'
-LIMIT = 16 * 1024 * 1024
 BRIDGE = Path(__file__).parent / 'anti_core' / 'bridge.js'
 NONCHAT = re.compile(r'image|vision-preview|audio|tts|stt|whisper|embed|video|flux|dall-e|sdxl|diffusion|moderation', re.I)
 
@@ -37,7 +36,7 @@ def augment_models(body):
 
 
 async def _spawn():
-    return await asyncio.create_subprocess_exec('node','--max-old-space-size=64',str(BRIDGE),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+    return await asyncio.create_subprocess_exec('node',str(BRIDGE),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
 
 
 async def _stop(proc):
@@ -49,11 +48,10 @@ async def _stop(proc):
 
 async def _call(command):
     raw=json.dumps(command,ensure_ascii=True).encode()+b'\n'
-    if len(raw)>LIMIT:raise ValueError('防截断请求过大')
     proc=await _spawn()
     try:
-        out,_=await asyncio.wait_for(proc.communicate(raw),timeout=20)
-        if proc.returncode or len(out)>LIMIT:raise ValueError('防截断转换失败')
+        out,_=await asyncio.wait_for(proc.communicate(raw),timeout=120)
+        if proc.returncode:raise ValueError('防截断转换失败')
         return json.loads(out)
     finally:
         await _stop(proc)
@@ -72,11 +70,8 @@ async def transform_stream(source,name,model):
     proc=await _spawn()
     async def pump():
         proc.stdin.write(json.dumps({'op':'stream','name':name,'model':model},ensure_ascii=True).encode()+b'\n')
-        total=0
         try:
             async for chunk in source:
-                total+=len(chunk)
-                if total>LIMIT:raise ValueError('防截断响应过大')
                 proc.stdin.write(json.dumps({'chunk':base64.b64encode(chunk).decode()}).encode()+b'\n')
                 await proc.stdin.drain()
             proc.stdin.write(b'{"end":true}\n');await proc.stdin.drain();proc.stdin.close()

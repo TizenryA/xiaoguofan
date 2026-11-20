@@ -13,7 +13,12 @@ export interface Part {
   functionResponse?: { name: string; response: Record<string, unknown>; id?: string }
   executableCode?: { language: string; code: string }
   codeExecutionResult?: { outcome: string; output?: string }
+  toolCall?: { toolType?: string; toolName?: string; args?: Record<string, unknown>; id?: string }
+  toolResponse?: { toolType?: string; response?: Record<string, unknown>; id?: string }
+  videoMetadata?: { startOffset?: string; endOffset?: string; fps?: number }
+  mediaProcessing?: 'STATIC' | 'AGENTIC'
   fileName?: string
+  fileExpires?: number
   tokenCount?: number
 }
 
@@ -29,7 +34,7 @@ export interface Support {
   chunks: number[]
 }
 
-// Turn 是对话中的一轮；模型轮次记录总耗时、首个片段延迟、思考耗时、输出 token 与其中的思考 token、依据来源与出错信息，时长单位为毫秒
+// Turn 是对话中的一轮；模型轮次记录总耗时、首个片段延迟、思考耗时、输出 token 与其中的思考 token、依据来源、出错信息、是否在 Agent 模式下生成与经 Interactions 生成时的交互 ID，时长单位为毫秒
 export interface Turn {
   id: string
   role: 'user' | 'model'
@@ -40,11 +45,14 @@ export interface Turn {
   thinking?: number
   tokens?: number
   thoughtTokens?: number
+  cachedTokens?: number
   finishReason?: string
   sources?: Source[]
   supports?: Support[]
   searchQueries?: string[]
   error?: string
+  agent?: boolean
+  interactionId?: string
 }
 
 // SafetyCategory 是官网安全设置的四个类别
@@ -75,7 +83,30 @@ export type ImageOutput = 'IMAGE_TEXT' | 'IMAGE'
 // ImageQuality 是 OpenAI Images 协议的图片质量
 export type ImageQuality = 'auto' | 'low' | 'medium' | 'high'
 
-// RunSettings 是 Playground 运行设置，数值项为 null 时使用模型默认值；thinkingBudget 为 -1 时由模型决定、0 时不思考；protocol 与 stream 决定请求使用的公开协议与是否流式
+// EnvironmentSource 是 agent 环境中挂载的一个源：inline 为内联文件，gcs 与 repository 为 Source URL 指向的存储桶与仓库，target 为挂载路径
+export interface EnvironmentSource {
+  type: 'inline' | 'gcs' | 'repository'
+  source: string
+  target: string
+  content: string
+}
+
+// EgressRule 是 agent 环境出站白名单的一条规则，headers 为注入匹配请求的 HTTP 请求头
+export interface EgressRule {
+  domain: string
+  headers: { name: string; value: string }[]
+}
+
+// AgentEnvironment 是 agent 的运行环境：new 为按 sources 与 rules 新建的环境，existing 为 id 指向的已有环境，produced 是本对话的运行得到的环境 ID
+export interface AgentEnvironment {
+  type: 'new' | 'existing'
+  id: string
+  produced?: string
+  sources: EnvironmentSource[]
+  rules: EgressRule[]
+}
+
+// RunSettings 是 Playground 运行设置，数值项为 null 时使用模型默认值；thinkingBudget 为 -1 时由模型决定、0 时不思考；protocol 与 stream 决定请求使用的公开协议与是否流式；agentModel 与 maxTotalTokens 是 Antigravity 所选的模型与 token 上限，空值为 agent 默认，environment 是带远程环境的 agent 的运行环境；thinkingSummaries、visualization 与 collaborativePlanning 是 Deep Research 的思考摘要、可视化与协作规划
 export interface RunSettings {
   model: string
   protocol: Protocol
@@ -103,6 +134,12 @@ export interface RunSettings {
   imageCount: number
   openAISize: string
   imageQuality: ImageQuality
+  agentModel: string
+  maxTotalTokens: number | null
+  environment: AgentEnvironment
+  thinkingSummaries: boolean
+  visualization: boolean
+  collaborativePlanning: boolean
 }
 
 // PaneData 是一个窗格的运行设置与对话

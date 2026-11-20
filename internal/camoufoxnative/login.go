@@ -65,12 +65,8 @@ func HasDisplay() bool {
 	return runtime.GOOS != "linux" || os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != ""
 }
 
-// Login 启动隔离 Camoufox 供用户登录 Google，并在 AI Studio 可用后导出认证状态
+// Login 启动隔离 Camoufox 供用户登录 Google，并在 AI Studio 可用后导出认证状态；登录期间浏览器退出时返回 loginBrowserExit 的错误
 func Login(ctx context.Context, options LoginOptions) (result LoginResult, err error) {
-	options, err = validateLoginOptions(options)
-	if err != nil {
-		return LoginResult{}, err
-	}
 	if options.View == nil && !HasDisplay() {
 		return LoginResult{}, ErrNoDisplay
 	}
@@ -79,10 +75,17 @@ func Login(ctx context.Context, options LoginOptions) (result LoginResult, err e
 	defer cancel()
 	session, err := startLoginSession(loginCtx, options, storageState{})
 	if err != nil {
+		if exited := loginBrowserExit(err); exited != nil {
+			return LoginResult{}, exited
+		}
 		return LoginResult{}, err
 	}
 	defer func() {
 		closeErr := session.Close()
+		if exited := loginBrowserExit(err); exited != nil {
+			err = errors.Join(exited, closeErr)
+			return
+		}
 		if err == nil && closeErr != nil {
 			result.CloseError = closeErr.Error()
 			return
@@ -133,29 +136,6 @@ func errorText(err error) string {
 	return err.Error()
 }
 
-func validateLoginOptions(options LoginOptions) (LoginOptions, error) {
-	options.ExecutablePath = strings.TrimSpace(options.ExecutablePath)
-	options.Directory = strings.TrimSpace(options.Directory)
-	if options.ExecutablePath == "" {
-		return LoginOptions{}, errors.New("缺少 Camoufox 路径")
-	}
-	if options.Directory == "" {
-		return LoginOptions{}, errors.New("缺少隔离登录目录")
-	}
-	directory, err := filepath.Abs(options.Directory)
-	if err != nil {
-		return LoginOptions{}, fmt.Errorf("解析隔离登录目录: %w", err)
-	}
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return LoginOptions{}, fmt.Errorf("创建隔离登录目录: %w", err)
-	}
-	if options.Timeout <= 0 {
-		return LoginOptions{}, errors.New("隔离登录超时必须为正数")
-	}
-	options.Directory = directory
-	return options, nil
-}
-
 func startLoginSession(ctx context.Context, options LoginOptions, state storageState) (*loginSession, error) {
 	ffVersion := camoufoxFirefoxMajor
 	fingerprintPath := filepath.Join(options.Directory, "storage-state.json")
@@ -190,7 +170,7 @@ func startLoginSession(ctx context.Context, options LoginOptions, state storageS
 		return nil, fmt.Errorf("连接 Camoufox BiDi: %w", err)
 	}
 	session.connection = connection
-	session.client = newBiDiClient(connection)
+	session.client = newBiDiClient(connection, process)
 	capabilities := map[string]any{}
 	if options.View != nil {
 		capabilities = liveViewCapabilities
@@ -239,7 +219,7 @@ func startLoginSession(ctx context.Context, options LoginOptions, state storageS
 		"context": session.contextID,
 		"url":     aiStudioOrigin + "/prompts/new_chat",
 		"wait":    wait,
-	}); err != nil && !strings.Contains(err.Error(), "NS_ERROR_ABORT") {
+	}); err != nil && !commandErrorContains(err, "NS_ERROR_ABORT") {
 		return nil, fmt.Errorf("导航 AI Studio: %w", err)
 	}
 	failed = false
@@ -273,6 +253,21 @@ func (session *loginSession) waitLogin(ctx context.Context, origins map[string]s
 			return "", err
 		}
 	}
+}
+
+// loginBrowserExit 在 err 由登录窗口关闭（页面被丢弃或浏览器以退出码 0 退出）或登录浏览器意外退出引起时返回对应的错误，其余返回 nil
+func loginBrowserExit(err error) error {
+	if commandErrorContains(err, "Browsing context got discarded") {
+		return errors.New("登录窗口已关闭，登录没有完成")
+	}
+	var exited *browserExited
+	if !errors.As(err, &exited) {
+		return nil
+	}
+	if exited.clean {
+		return errors.New("登录窗口已关闭，登录没有完成")
+	}
+	return fmt.Errorf("登录浏览器意外退出: %w", err)
 }
 
 func (session *loginSession) captureCurrentOrigin(ctx context.Context, pageURL string, origins map[string]storageOrigin) {

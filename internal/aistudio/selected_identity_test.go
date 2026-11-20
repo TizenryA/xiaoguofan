@@ -66,12 +66,12 @@ func TestSelectedIdentityVerifiedOverHTTPNotSavedIndex(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(payload)), Header: http.Header{}}, nil
 	})}
-	got, err := ResolveSelectedAuthUser(context.Background(), client, state)
+	got, err := VerifySelectedAuthUser(context.Background(), client, state)
 	if err != nil || got != "0" {
 		t.Fatalf("%s %v", got, err)
 	}
 	payload = ""
-	if _, err = ResolveSelectedAuthUser(context.Background(), client, state); err == nil {
+	if _, err = VerifySelectedAuthUser(context.Background(), client, state); err == nil {
 		t.Fatal("lost identity accepted")
 	}
 }
@@ -83,7 +83,7 @@ func TestSelectedIdentityOrdinaryRPCAndCookiePersistence(t *testing.T) {
 	if err := WriteStorageState(path, state); err != nil {
 		t.Fatal(err)
 	}
-	account := &Account{ID: "fixture", StoragePath: path, StorageState: state, Config: AccountConfig{Enabled: true}, State: AccountReady}
+	account := &Account{ID: "fixture", StoragePath: path, StorageState: state, Config: AccountConfig{Enabled: true, AuthUser: 7}, State: AccountReady}
 	pool := NewAccountPool([]*Account{account}, 1)
 	accountRow := func(email, id string) []byte {
 		b := append([]byte{26, byte(len(email))}, []byte(email)...)
@@ -95,10 +95,19 @@ func TestSelectedIdentityOrdinaryRPCAndCookiePersistence(t *testing.T) {
 	raw = append(raw, 10, byte(len(b)))
 	raw = append(raw, b...)
 	payload := base64.StdEncoding.EncodeToString(raw)
+	InvalidateSelectedAuthUser(state)
+	t.Cleanup(func() { InvalidateSelectedAuthUser(state) })
 	calls := 0
+	identityCalls := 0
+	rpcStatus := http.StatusOK
 	client := &http.Client{Transport: identityRoundTripper(func(r *http.Request) (*http.Response, error) {
 		body := payload
+		status := http.StatusOK
+		if r.URL.Host == "accounts.google.com" {
+			identityCalls++
+		}
 		if r.URL.Host != "accounts.google.com" {
+			status = rpcStatus
 			calls++
 			if r.Header.Get("X-Goog-AuthUser") != "1" {
 				t.Fatal("RPC used wrong account")
@@ -108,7 +117,7 @@ func TestSelectedIdentityOrdinaryRPCAndCookiePersistence(t *testing.T) {
 			}
 			body = "[]"
 		}
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
 	})}
 	transport := &MakerSuiteHTTPTransport{pool: pool, signer: NewSigner(), headers: ProtocolHeaderProviderFunc(func(context.Context, string) (http.Header, error) {
 		h := http.Header{}
@@ -125,9 +134,29 @@ func TestSelectedIdentityOrdinaryRPCAndCookiePersistence(t *testing.T) {
 	if calls != 1 {
 		t.Fatal("RPC not sent")
 	}
+	response, err = transport.Do(context.Background(), RPCRequest{AccountID: "fixture", URL: "https://alkalimakersuite-pa.clients6.google.com/GetUserBenefits", Method: "GetUserBenefits", Body: []byte("[]")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if identityCalls != 1 || calls != 2 {
+		t.Fatalf("normal RPC must reuse mapped identity: identity=%d RPC=%d", identityCalls, calls)
+	}
 	lease, _, err := pool.TryAcquireFor(context.Background(), AccountSelection{AccountID: "fixture"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	mapped := ProtocolHeaderProviderFunc(func(context.Context, string) (http.Header, error) {
+		headers := http.Header{}
+		for _, name := range []string{"User-Agent", "X-Goog-Api-Key", "X-User-Agent"} {
+			headers.Set(name, "fixture")
+		}
+		headers.Set("X-Goog-Authuser", "1")
+		return headers, nil
+	})
+	_, headers, err := prepareProtocolHeaders(context.Background(), lease, RPCRequest{URL: "https://aistudio.google.com/"}, NewSigner(), mapped, time.Now(), true)
+	if err != nil || headers.Get("X-Goog-Authuser") != "1" {
+		t.Fatal("saved numeric position overwrote mapped page identity", err, headers)
 	}
 	if err = lease.ReplaceCookies(state.Cookies); err != nil {
 		t.Fatal(err)
@@ -141,11 +170,20 @@ func TestSelectedIdentityOrdinaryRPCAndCookiePersistence(t *testing.T) {
 	if err != nil || id == nil || id.GaiaID != "222" {
 		t.Fatal("identity lost during cookie refresh")
 	}
+	rpcStatus = http.StatusUnauthorized
+	response, err = transport.Do(context.Background(), RPCRequest{AccountID: "fixture", URL: "https://alkalimakersuite-pa.clients6.google.com/GetUserBenefits", Method: "GetUserBenefits", Body: []byte("[]")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized || identityCalls != 1 {
+		t.Fatal("authentication error must reach the normal recovery path", response.StatusCode, identityCalls)
+	}
 	payload = ""
 	if _, err = transport.Do(context.Background(), RPCRequest{AccountID: "fixture", URL: "https://alkalimakersuite-pa.clients6.google.com/GetUserBenefits", Method: "GetUserBenefits"}); err == nil {
 		t.Fatal("missing identity accepted")
 	}
-	if calls != 1 {
+	if calls != 3 || identityCalls != 2 {
 		t.Fatal("failed identity sent RPC")
 	}
 }

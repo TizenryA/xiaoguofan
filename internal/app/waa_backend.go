@@ -2,85 +2,70 @@ package app
 
 import (
 	"context"
-	"fmt"
-	"strings"
-	"sync"
-	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
-// prepareWAABackend 按 WAA 后端准备运行依赖与账户登录驱动
-func prepareWAABackend(ctx context.Context, cfg config.Config, requests *requestRegistry, accounts int, proxy string) (string, aistudio.IsolatedLoginDriver, error) {
-	if cfg.WAABackend == config.WAABackendSpiderMonkey {
-		requests.log("service", "INFO", fmt.Sprintf("运行时装配 | 2/3 | WAA 后端=spidermonkey | 账户=%d", accounts))
-		return "", &lazyLoginDriver{timeout: cfg.RequestTimeout, proxy: proxy}, nil
-	}
-	requests.log("service", "INFO", fmt.Sprintf("运行时装配 | 2/3 | 校验 Camoufox | 账户=%d", accounts))
-	camoufoxPath, err := camoufoxnative.FindExecutable(ctx, proxy)
-	if err != nil {
-		return "", nil, err
-	}
+// camoufoxWorkerPath 是 Camoufox 后端 Worker 选项中的可执行文件路径，Worker 启动时换成已就绪的 Camoufox
+const camoufoxWorkerPath = "camoufox"
+
+// prepareWAABackend 按 WAA 后端返回 Worker 选项中的 Camoufox 路径与账户登录驱动，Camoufox 后端在后台准备 Camoufox
+func prepareWAABackend(cfg config.Config, requests *requestRegistry, accounts []*aistudio.Account, proxy string) (string, aistudio.IsolatedLoginDriver) {
 	removeStaleCamoufoxProfiles(requests)
-	login, err := aistudio.NewNativeLoginDriver(camoufoxPath, cfg.RequestTimeout)
-	if err != nil {
-		return "", nil, err
+	login := camoufoxLoginDriver{proxy: proxy}
+	if cfg.WAABackend == config.WAABackendSpiderMonkey {
+		requests.logStage("service", "INFO", api.LogStage{Name: "运行时装配", Step: 2, Steps: 3}, "使用 SpiderMonkey WAA 后端", "accounts", len(accounts))
+		for _, account := range accounts {
+			if err := camoufoxnative.RemoveAccountCache(account.StoragePath); err != nil {
+				requests.log(account.ID, "WARN", "Camoufox 缓存清理失败", "error", err)
+			}
+		}
+		return "", login
 	}
-	return camoufoxPath, login, nil
+	requests.logStage("service", "INFO", api.LogStage{Name: "运行时装配", Step: 2, Steps: 3}, "使用 Camoufox WAA 后端", "accounts", len(accounts))
+	camoufoxnative.PrepareInBackground(proxy)
+	return camoufoxWorkerPath, login
 }
 
 // removeStaleCamoufoxProfiles 清理上次进程遗留的 Camoufox profile
 func removeStaleCamoufoxProfiles(requests *requestRegistry) {
 	if removed, err := camoufoxnative.RemoveStaleProfiles(); err != nil {
-		requests.log("service", "WARN", fmt.Sprintf(
-			"遗留 Camoufox profile 清理失败 | 已删除=%d | 错误=%s", removed, strings.TrimSpace(err.Error()),
-		))
+		requests.log("service", "WARN", "遗留 Camoufox profile 清理失败", "removed", removed, "error", err)
 	} else if removed > 0 {
-		requests.log("service", "INFO", fmt.Sprintf("遗留 Camoufox profile 已清理 | 数量=%d", removed))
+		requests.log("service", "INFO", "遗留 Camoufox profile 已清理", "removed", removed)
 	}
 }
 
-// newWAAWorker 启动账户的 Camoufox 或 SpiderMonkey Worker
+// newWAAWorker 启动账户的 Camoufox 或 SpiderMonkey Worker，Camoufox 尚未就绪时返回正在准备的进度或准备失败的原因
 func newWAAWorker(ctx context.Context, accountID string, options camoufoxnative.Options) (*aistudio.NativeWorker, error) {
 	if options.ExecutablePath == "" {
 		return aistudio.NewSpiderMonkeyWorker(ctx, accountID, options)
 	}
+	path, err := camoufoxnative.ReadyPath()
+	if err != nil {
+		return nil, err
+	}
+	options.ExecutablePath = path
 	return aistudio.NewNativeWorker(ctx, accountID, options)
 }
 
-// lazyLoginDriver 在第一次登录或校验账户时定位 Camoufox 并创建登录驱动
-type lazyLoginDriver struct {
-	timeout time.Duration
-	proxy   string
-	mu      sync.Mutex
-	driver  *aistudio.NativeLoginDriver
+// camoufoxLoginDriver 在登录时准备 Camoufox，同一进程内的登录与生成服务共用一次进行中的下载
+type camoufoxLoginDriver struct {
+	proxy string
 }
 
-func (lazy *lazyLoginDriver) resolve(ctx context.Context) (*aistudio.NativeLoginDriver, error) {
-	lazy.mu.Lock()
-	defer lazy.mu.Unlock()
-	if lazy.driver != nil {
-		return lazy.driver, nil
-	}
-	camoufoxPath, err := camoufoxnative.FindExecutable(ctx, lazy.proxy)
-	if err != nil {
-		return nil, err
-	}
-	driver, err := aistudio.NewNativeLoginDriver(camoufoxPath, lazy.timeout)
-	if err != nil {
-		return nil, err
-	}
-	lazy.driver = driver
-	return driver, nil
-}
-
-// Login 使用按需准备的 Camoufox 执行隔离登录
-func (lazy *lazyLoginDriver) Login(ctx context.Context, request aistudio.IsolatedLoginRequest) (aistudio.IsolatedLoginResult, error) {
-	driver, err := lazy.resolve(ctx)
+// Login 等 Camoufox 就绪后执行隔离登录
+func (driver camoufoxLoginDriver) Login(ctx context.Context, request aistudio.IsolatedLoginRequest) (aistudio.IsolatedLoginResult, error) {
+	path, err := camoufoxnative.Prepare(ctx, driver.proxy)
 	if err != nil {
 		return aistudio.IsolatedLoginResult{}, err
 	}
-	return driver.Login(ctx, request)
+	login, err := aistudio.NewNativeLoginDriver(path)
+	if err != nil {
+		return aistudio.IsolatedLoginResult{}, err
+	}
+	return login.Login(ctx, request)
 }

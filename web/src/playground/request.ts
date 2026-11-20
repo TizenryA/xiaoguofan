@@ -1,8 +1,9 @@
 import { jsonBody } from '@/api'
 import { useConsole } from '@/console'
 import type { Model } from '@/types'
-import { Capability, hasCode, toolCodes, type Tool } from './catalog'
-import type { Part, RunSettings, Source, Support, Turn } from './types'
+import { Capability, hasCode, isAgent, isOmniModel, toolCodes, type Tool } from './catalog'
+import type { Protocol } from './protocols'
+import type { AgentEnvironment, Part, RunSettings, Source, Support, Turn } from './types'
 
 // GenerateRequest 是一次 Gemini API 生成请求的正文
 export interface GenerateRequest {
@@ -11,10 +12,11 @@ export interface GenerateRequest {
   generationConfig: Record<string, unknown>
   safetySettings?: { category: string; threshold: string }[]
   tools?: Record<string, unknown>[]
+  toolConfig?: { includeServerSideToolInvocations: boolean }
 }
 
 // toolPayloads 是各工具在 Gemini API tools 中的写法
-const toolPayloads: Partial<Record<Tool, Record<string, unknown>>> = {
+export const toolPayloads: Partial<Record<Tool, Record<string, unknown>>> = {
   code_execution: { codeExecution: {} },
   google_search: { googleSearch: {} },
   url_context: { urlContext: {} },
@@ -31,20 +33,38 @@ function parseJSON(text: string): unknown {
   }
 }
 
-// requestContents 把对话轮次写为 contents：去掉思考正文、出错的空轮次与附件的显示字段
-function requestContents(turns: readonly Turn[]): GenerateRequest['contents'] {
+// requestContents 把对话轮次写为 contents：去掉思考正文、出错的空轮次与附件的显示字段，Omni 与官网一样不发送视频设置
+function requestContents(turns: readonly Turn[], omni: boolean): GenerateRequest['contents'] {
   return turns
     .map((turn) => ({
       role: turn.role,
       parts: turn.parts
         .filter((part) => !(part.thought && part.text !== undefined && !part.thoughtSignature))
-        .map(apiPart),
+        .map((part) => (omni ? omitVideoSettings(apiPart(part)) : apiPart(part))),
     }))
     .filter((turn) => turn.parts.length > 0)
 }
 
-// apiPart 返回去掉试用页显示字段的片段，内联附件的文件名写为 inlineData.displayName
-export function apiPart({ fileName, tokenCount: _tokenCount, ...part }: Part): Part {
+// omitVideoSettings 返回去掉视频截取、帧率与处理方式的片段
+function omitVideoSettings({
+  videoMetadata: _metadata,
+  mediaProcessing: _mode,
+  ...part
+}: Part): Part {
+  return part
+}
+
+// apiPart 返回去掉试用页显示字段的片段：已上传 Drive 的附件只发送文件引用，内联数据只用于本页预览，内联附件的文件名写为 inlineData.displayName
+export function apiPart({
+  fileName,
+  fileExpires: _fileExpires,
+  tokenCount: _tokenCount,
+  ...part
+}: Part): Part {
+  if (part.fileData !== undefined && part.inlineData !== undefined) {
+    const { inlineData: _preview, ...uploaded } = part
+    return uploaded
+  }
   if (fileName === undefined || part.inlineData === undefined) return part
   return { ...part, inlineData: { ...part.inlineData, displayName: fileName } }
 }
@@ -120,7 +140,10 @@ export function buildRequest(
     if (Array.isArray(declarations) && declarations.length > 0)
       tools.push({ functionDeclarations: declarations })
   }
-  const request: GenerateRequest = { contents: requestContents(turns), generationConfig: config }
+  const request: GenerateRequest = {
+    contents: requestContents(turns, isOmniModel(model)),
+    generationConfig: config,
+  }
   if (settings.systemInstruction.trim() !== '' && hasCode(model, Capability.SystemInstruction)) {
     request.systemInstruction = { parts: [{ text: settings.systemInstruction }] }
   }
@@ -131,16 +154,107 @@ export function buildRequest(
     }))
   }
   if (tools.length > 0) request.tools = tools
+  // Agent 模式要求返回搜索、网址读取等服务端工具步骤，按发生顺序显示
+  if (enabled.includes('code_execution'))
+    request.toolConfig = { includeServerSideToolInvocations: true }
   return request
 }
 
-// StreamUpdate 是一次流式事件带来的变化
+// agentFields 返回 agent 请求的 agent_config 与 environment 字段，都不需要时为 undefined
+export function agentFields(
+  settings: RunSettings,
+  model: Model | undefined,
+): Record<string, unknown> | undefined {
+  const config = agentConfig(settings, model)
+  const environment = hasCode(model, Capability.RemoteEnvironment)
+    ? agentEnvironment(settings.environment)
+    : undefined
+  if (config === undefined && environment === undefined) return undefined
+  return {
+    ...(config !== undefined && { agent_config: config }),
+    ...(environment !== undefined && { environment }),
+  }
+}
+
+// agentConfig 按官方 Interactions REST 写出 agent 的 agent_config：Antigravity 为所选模型与 token 上限，都未设置时不发送；Deep Research 按思考摘要、可视化与协作规划的能力码写出这三项；其余模型不发送
+function agentConfig(
+  settings: RunSettings,
+  model: Model | undefined,
+): Record<string, unknown> | undefined {
+  if (model === undefined || !isAgent(model)) return undefined
+  if (model.agent_model !== undefined) {
+    if (settings.agentModel === '' && settings.maxTotalTokens === null) return undefined
+    return {
+      type: 'antigravity',
+      ...(settings.agentModel !== '' && { model: settings.agentModel }),
+      ...(settings.maxTotalTokens !== null && {
+        max_total_tokens: String(settings.maxTotalTokens),
+      }),
+    }
+  }
+  const config: Record<string, unknown> = {}
+  if (hasCode(model, Capability.ThinkingSummaries))
+    config.thinking_summaries = settings.thinkingSummaries ? 'auto' : 'none'
+  if (hasCode(model, Capability.Visualization))
+    config.visualization = settings.visualization ? 'auto' : 'off'
+  if (hasCode(model, Capability.CollaborativePlanning) && settings.collaborativePlanning)
+    config.collaborative_planning = true
+  return Object.keys(config).length > 0 ? { type: 'deep-research', ...config } : undefined
+}
+
+// agentEnvironment 按官方 Interactions REST 写出运行设置中的环境：已有环境与官网一样只发环境 ID，新环境带源或规则时为 remote 环境对象，没有规则时不发送 network，什么都没设置时不发送
+function agentEnvironment(
+  environment: AgentEnvironment,
+): string | Record<string, unknown> | undefined {
+  if (environment.type === 'existing') return environment.id.trim() || undefined
+  const sources = environment.sources
+  const allowlist = environment.rules
+    .filter((rule) => rule.domain.trim() !== '')
+    .map((rule) => {
+      const headers = rule.headers.filter((header) => header.name.trim() !== '')
+      return {
+        domain: rule.domain.trim(),
+        ...(headers.length > 0 && {
+          transform: Object.fromEntries(
+            headers.map((header) => [header.name.trim(), header.value]),
+          ),
+        }),
+      }
+    })
+  if (sources.length === 0 && allowlist.length === 0) return undefined
+  return {
+    type: 'remote',
+    ...(sources.length > 0 && {
+      sources: sources.map((source) =>
+        source.type === 'inline'
+          ? { type: 'inline', target: source.target, content: source.content }
+          : { type: source.type, source: source.source, target: source.target },
+      ),
+    }),
+    ...(allowlist.length > 0 && { network: { allowlist } }),
+  }
+}
+
+// continuation 与官网一样选取 Interactions 续接的起点：以 Interactions 发送且最后一个模型轮带交互 ID 时，以该 ID 续接并只发送其后的轮次，否则发送全部轮次
+export function continuation(
+  protocol: Protocol,
+  turns: readonly Turn[],
+): { previous: string | undefined; turns: readonly Turn[] } {
+  const index = turns.map((turn) => turn.role).lastIndexOf('model')
+  const previous = protocol === 'interactions' ? turns[index]?.interactionId : undefined
+  return { previous, turns: previous === undefined ? turns : turns.slice(index + 1) }
+}
+
+// StreamUpdate 是一次流式事件带来的变化，interactionId 与 environmentId 是 Interactions 完成时的交互 ID 与远程环境 ID
 export interface StreamUpdate {
   parts: Part[]
+  interactionId?: string
+  environmentId?: string
   finishReason?: string
   tokens?: number
   thoughtTokens?: number
   promptTokens?: number
+  cachedTokens?: number
   sources?: Source[]
   supports?: Support[]
   searchQueries?: string[]
@@ -186,6 +300,7 @@ interface GeminiChunk {
   promptFeedback?: { blockReason?: string }
   usageMetadata?: {
     promptTokenCount?: number
+    cachedContentTokenCount?: number
     candidatesTokenCount?: number
     thoughtsTokenCount?: number
   }
@@ -204,6 +319,8 @@ export function streamUpdate(raw: unknown): StreamUpdate {
   }
   if (usage?.thoughtsTokenCount !== undefined) update.thoughtTokens = usage.thoughtsTokenCount
   if (usage?.promptTokenCount !== undefined) update.promptTokens = usage.promptTokenCount
+  if (usage?.cachedContentTokenCount !== undefined)
+    update.cachedTokens = usage.cachedContentTokenCount
   const grounding = candidate?.groundingMetadata
   if (grounding?.groundingChunks) {
     update.sources = grounding.groundingChunks
@@ -243,13 +360,31 @@ export function appendParts(parts: Part[], incoming: readonly Part[]): void {
   }
 }
 
-// countTokens 调用本服务 countTokens 计算当前对话的输入 token
-export async function countTokens(
+// TokenCountResult 是 countTokens 返回的总 token 数、系统指令 token 数与各轮次 token 数
+export interface TokenCountResult {
+  totalTokens: number
+  systemTokens?: number
+  contentTokens?: number[]
+}
+
+interface RawTokenPart {
+  partTokens?: number[]
+  roleTokens?: number
+}
+
+// sumTokenPart 汇总系统指令或单个轮次的各 Part 与角色 token 数
+function sumTokenPart(item: RawTokenPart | undefined): number | undefined {
+  if (!item || (item.partTokens === undefined && item.roleTokens === undefined)) return undefined
+  return (item.partTokens ?? []).reduce((sum, count) => sum + count, 0) + (item.roleTokens ?? 0)
+}
+
+// countTokensDetailed 调用本服务 countTokens 返回总输入 token、系统指令 token 与各轮次 token 明细
+export async function countTokensDetailed(
   modelID: string,
   apiKey: string,
   request: GenerateRequest,
   signal: AbortSignal,
-): Promise<number> {
+): Promise<TokenCountResult> {
   const headers = new Headers({ 'Content-Type': 'application/json' })
   if (apiKey !== '') headers.set('x-goog-api-key', apiKey)
   const response = await fetch(`/v1beta/models/${encodeURIComponent(modelID)}:countTokens`, {
@@ -261,6 +396,27 @@ export async function countTokens(
     }),
   })
   if (!response.ok) throw new Error(await errorMessage(response))
-  const value = (await response.json()) as { totalTokens?: number }
-  return value.totalTokens ?? 0
+  const value = (await response.json()) as {
+    totalTokens?: number
+    systemInstructionsTokens?: RawTokenPart
+    contentTokens?: RawTokenPart[]
+  }
+  const systemTokens = sumTokenPart(value.systemInstructionsTokens)
+  const contentTokens = value.contentTokens?.map((item) => sumTokenPart(item) ?? 0)
+  return {
+    totalTokens: value.totalTokens ?? 0,
+    ...(systemTokens !== undefined && { systemTokens }),
+    ...(contentTokens !== undefined && { contentTokens }),
+  }
+}
+
+// countTokens 调用本服务 countTokens 计算当前对话或单个附件的输入 token
+export async function countTokens(
+  modelID: string,
+  apiKey: string,
+  request: GenerateRequest,
+  signal: AbortSignal,
+): Promise<number> {
+  const result = await countTokensDetailed(modelID, apiKey, request, signal)
+  return result.totalTokens
 }

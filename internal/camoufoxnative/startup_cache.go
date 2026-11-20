@@ -2,6 +2,7 @@ package camoufoxnative
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -37,20 +38,15 @@ func saveStartupCache(profile, cacheDirectory string) {
 // copyStartupCache 把 source 中存在的启动缓存条目复制到 target
 func copyStartupCache(source, target string) error {
 	for _, name := range startupCacheEntries {
-		from := filepath.Join(source, name)
-		info, err := os.Stat(from)
-		if errors.Is(err, fs.ErrNotExist) {
+		if _, err := os.Stat(filepath.Join(source, name)); errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
-		if err != nil {
-			return err
-		}
-		to := filepath.Join(target, name)
-		if info.IsDir() {
-			err = os.CopyFS(to, os.DirFS(from))
-		} else {
-			err = copyStartupFile(from, to)
-		}
+		err := fs.WalkDir(os.DirFS(source), name, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return err
+			}
+			return copyStartupFile(filepath.Join(source, path), filepath.Join(target, path))
+		})
 		if err != nil {
 			return err
 		}
@@ -58,14 +54,23 @@ func copyStartupCache(source, target string) error {
 	return nil
 }
 
-// copyStartupFile 复制单个启动缓存文件并创建目标目录
+// copyStartupFile 以流式读写复制单个启动缓存文件并创建目标目录
 func copyStartupFile(from, to string) error {
-	data, err := os.ReadFile(from)
+	source, err := os.Open(from)
 	if err != nil {
 		return err
 	}
+	defer source.Close()
 	if err := os.MkdirAll(filepath.Dir(to), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(to, data, 0o600)
+	target, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(target, source); err != nil {
+		_ = target.Close()
+		return err
+	}
+	return target.Close()
 }

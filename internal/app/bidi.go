@@ -3,8 +3,8 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
@@ -14,7 +14,7 @@ import (
 func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.BidiRequest) (*aistudio.BidiSession, error) {
 	request.Model = service.mappedModel(request.Model)
 	api.SetAccessLogTarget(ctx, request.Model, "")
-	request.Model = service.pool.CanonicalModelID(request.Model)
+	request.Model = service.catalogModelID(ctx, request.Model)
 	requestCtx, cancel, err := service.bidiRequestContext(ctx)
 	if err != nil {
 		api.SetAccessLogError(ctx, err)
@@ -35,10 +35,7 @@ func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.Bi
 	}
 	request.ObserveModelAccessChange = service.publishModelAccess
 	request.ObserveAccountFailure = func(accountID string, cause error) {
-		service.requests.log(service.accountLabel(accountID), "WARN", fmt.Sprintf(
-			"账号切换 | 模型=%s\n原因: %s",
-			strings.TrimPrefix(request.Model, "models/"), strings.TrimSpace(cause.Error()),
-		))
+		service.requests.log(service.accountLabel(accountID), "WARN", "账号切换", attemptFields(strings.TrimPrefix(request.Model, "models/"), cause)...)
 	}
 	request.RecoverWAARuntime = func(recoveryCtx context.Context, accountID string, cause error) (bool, error) {
 		workerFailed := service.workers.WorkerFailed(accountID)
@@ -54,7 +51,8 @@ func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.Bi
 		)
 		return recovered, recoveryErr
 	}
-	requestCtx = aistudio.ContextWithAccountSelectionObserver(requestCtx, func(account *aistudio.Account) {
+	requestCtx = aistudio.ContextWithAccountSelectionObserver(requestCtx, func(lease *aistudio.AccountLease) {
+		account := lease.Account()
 		workerGenerations[account.ID] = service.workers.WorkerGeneration(account.ID)
 		api.SetAccessLogTarget(ctx, request.Model, account.Config.Label)
 	})
@@ -73,40 +71,46 @@ func (preparer *accountWorkerPreparer) WorkerGeneration() uint64 {
 	return preparer.account.generation.Load()
 }
 
+// bidiCandidates 按已有 Worker 与实测资格优先的顺序列出支持实时会话的账户，全部冷却时按排队上限等待恢复
 func (service *trackedService) bidiCandidates(ctx context.Context, model string, modelAccessScope string) ([]string, error) {
 	modelID := strings.TrimPrefix(strings.TrimSpace(model), "models/")
-	groups, err := service.pool.ClassifyCandidates(
-		ctx,
-		aistudio.AccountSelection{
-			ModelID: modelID, ModelAccessScope: modelAccessScope, Method: service.pool.BidiMethod(modelID),
-		},
-		service.workers.WarmAccountIDs(),
-	)
-	if err != nil {
-		return nil, err
+	var cooled time.Duration
+	for {
+		groups, err := service.pool.ClassifyCandidates(
+			ctx,
+			aistudio.AccountSelection{
+				ModelID: modelID, ModelAccessScope: modelAccessScope, Method: service.pool.BidiMethod(modelID),
+			},
+			service.workers.WarmAccountIDs(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		warmAvailable := append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...)
+		candidates := service.preferBidiAccounts(warmAvailable, modelID, modelAccessScope)
+		candidates = append(candidates, service.preferBidiAccounts(groups.StandbyReady, modelID, modelAccessScope)...)
+		candidates = append(candidates, service.preferBidiAccounts(groups.WarmBusy, modelID, modelAccessScope)...)
+		candidates = append(candidates, service.preferBidiAccounts(groups.StandbyBusy, modelID, modelAccessScope)...)
+		if len(candidates) > 0 {
+			return candidates, nil
+		}
+		if err := waitAllCooling(ctx, modelID, groups.EarliestCooldown, &cooled); err != nil {
+			return nil, err
+		}
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	warmAvailable := append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...)
-	candidates := service.preferBidiAccounts(warmAvailable, modelID, modelAccessScope)
-	candidates = append(candidates, service.preferBidiAccounts(groups.StandbyReady, modelID, modelAccessScope)...)
-	candidates = append(candidates, service.preferBidiAccounts(groups.WarmBusy, modelID, modelAccessScope)...)
-	candidates = append(candidates, service.preferBidiAccounts(groups.StandbyBusy, modelID, modelAccessScope)...)
-	if len(candidates) == 0 {
-		return nil, aistudio.ErrNoEligibleAccount
-	}
-	return candidates, nil
 }
 
 // preferBidiAccounts 在实测资格分组内按账户策略排列候选
 func (service *trackedService) preferBidiAccounts(accountIDs []string, modelID string, modelAccessScope string) []string {
-	scope := strings.TrimSpace(modelAccessScope)
+	scope := modelAccessScope
 	if scope == "" {
-		scope = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+		scope = modelID
 	}
 	candidates := service.pool.OrderCandidates(accountIDs, scope)
-	if strings.TrimSpace(modelAccessScope) == "" {
+	if modelAccessScope == "" {
 		return candidates
 	}
 	states := service.pool.CandidateStatesForScope(candidates, modelID, modelAccessScope)
@@ -126,7 +130,7 @@ func (service *trackedService) bidiRequestContext(ctx context.Context) (context.
 	service.lifecycleMu.Lock()
 	if service.state.Load() != serviceRunning || service.dataContext == nil {
 		service.lifecycleMu.Unlock()
-		return nil, nil, &serviceStoppedError{launching: service.state.Load() == serviceLaunching}
+		return nil, nil, service.stoppedError()
 	}
 	requestCtx, cancel := context.WithCancel(ctx)
 	stopData := context.AfterFunc(service.dataContext, cancel)

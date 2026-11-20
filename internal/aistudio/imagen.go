@@ -3,7 +3,6 @@ package aistudio
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -39,21 +38,14 @@ type ImageProtectedTransport interface {
 
 var _ ImageProtectedTransport = (*WorkerProtectedTransport)(nil)
 
-// GenerateImage 以目录中有该模型 predict 方法的账户生成图片
+// GenerateImage 以目录中有该模型 predict 方法的账户生成图片，上游拒绝账户、额度用尽或服务端出错时换到其他账户
 func (s *PooledService) GenerateImage(ctx context.Context, request ImageRequest) ([]GeneratedImage, error) {
 	request.Model = strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
-	lease, owned, err := resolveAccountLease(ctx, s.pool, AccountSelection{
-		ModelID: request.Model, Method: "predict", AccountID: strings.TrimSpace(request.AccountID),
+	selection := AccountSelection{ModelID: request.Model, Method: "predict", AccountID: strings.TrimSpace(request.AccountID)}
+	return withAccountAttempts(ctx, s, selection, request.Model, func(ctx context.Context, accountID string) ([]GeneratedImage, error) {
+		request.AccountID = accountID
+		return s.client.GenerateImage(ctx, request)
 	})
-	if err != nil {
-		return nil, err
-	}
-	request.AccountID = lease.Account().ID
-	images, err := s.client.GenerateImage(ContextWithAccountLease(ctx, lease), request)
-	if owned {
-		err = errors.Join(err, lease.Release())
-	}
-	return images, err
 }
 
 // GenerateImage 按官网 Imagen 页发送 GenerateImage 并返回图片
@@ -65,7 +57,9 @@ func (c *Client) GenerateImage(ctx context.Context, request ImageRequest) ([]Gen
 	if !hasMethod(entry.model, "predict") {
 		return nil, fmt.Errorf("%w: 模型 %q 的实时目录没有 predict 方法", ErrInvalidArgument, entry.model.ID)
 	}
-	rpc := newRPCRequest("GenerateImage", request.AccountID, "", EncodeGenerateImageRequest(request), false)
+	body, proofAt := EncodeGenerateImageRequest(request)
+	rpc := newRPCRequest("GenerateImage", request.AccountID, "", body, false)
+	rpc.ProofAt = proofAt
 	c.applyBenefitTier(rpc.Method, request.AccountID, rpc.Header)
 	response, err := c.protected.(ImageProtectedTransport).DoProtectedImage(ctx, request, rpc)
 	if err != nil {
@@ -81,19 +75,19 @@ func (c *Client) GenerateImage(ctx context.Context, request ImageRequest) ([]Gen
 
 // DoProtectedImage 写入 GenerateImage fresh proof 后经 Worker 页面发送请求，binding 与页面输入框均为提示词
 func (t *WorkerProtectedTransport) DoProtectedImage(ctx context.Context, request ImageRequest, rpc RPCRequest) (*RPCResponse, error) {
-	return t.doPrepared(ctx, request.Prompt, request.Prompt, 3, AccountSelection{
+	return t.doPrepared(ctx, request.Prompt, request.Prompt, "", AccountSelection{
 		ModelID: request.Model, Method: "predict", AccountID: request.AccountID,
 	}, rpc)
 }
 
-// EncodeGenerateImageRequest 编码官网 GenerateImage 数组协议：模型、提示词、proof 位与图片数、反向提示词、宽高比、输出分辨率配置
-func EncodeGenerateImageRequest(request ImageRequest) []byte {
+// EncodeGenerateImageRequest 编码官网 GenerateImage 数组协议：模型、提示词、proof 位与图片数、反向提示词、宽高比、输出分辨率配置，返回正文与 proof 位在正文中的起始字节
+func EncodeGenerateImageRequest(request ImageRequest) ([]byte, int) {
 	config := []any{nullableInt(request.SampleCount), nullableString(request.NegativePrompt), nullableString(request.AspectRatio), nullableString(request.ImageSize)}
 	for len(config) > 0 && config[len(config)-1] == nil {
 		config = config[:len(config)-1]
 	}
-	body, _ := json.Marshal([]any{"models/" + request.Model, request.Prompt, nil, config})
-	return body
+	body, proofAt, _ := marshalWAAArray([]any{"models/" + request.Model, request.Prompt, nil, config}, 3)
+	return body, proofAt
 }
 
 // ParseGenerateImageResponse 解码 GenerateImage 响应字段 1 的图片：1 base64 数据、2 MIME、3 安全拦截原因

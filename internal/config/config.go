@@ -20,8 +20,10 @@ const (
 	defaultPreviewListenAddr  = "127.0.0.1:2050"
 	defaultInitTimeout        = 2 * time.Minute
 	defaultRequestTimeout     = 30 * time.Minute
-	defaultWarmWorkerLimit    = 5
-	defaultMaxActiveWorkers   = 10
+	defaultWarmWorkerLimit    = 10
+	defaultMaxActiveWorkers   = 20
+	camoufoxWarmWorkerLimit   = 5
+	camoufoxMaxActiveWorkers  = 10
 	defaultWarmConcurrency    = 5
 	defaultAccountConcurrency = 2
 )
@@ -40,14 +42,17 @@ var configKeys = [...]string{
 	"WARM_STARTUP_CONCURRENCY",
 	"PER_ACCOUNT_CONCURRENCY",
 	"ROUTING_STRATEGY",
+	"ACCOUNT_ORDER",
+	"MAX_ACCOUNT_SWITCHES",
 	"UPSTREAM_CHANNELS",
 	"MODEL_MAPPING",
 	"MODEL_CHANNELS",
-	"TEMPORARY_CHAT",
+	"MODEL_ACCOUNTS",
 	"WAA_BACKEND",
 	"MEDIA_OUTPUT",
 	"MEDIA_BASE_URL",
 	"AUTO_START",
+	"HIDE_DOCK_ICON",
 	"REQUEST_BODY_LOG",
 	"LOG_FILE",
 	"LOG_MAX_TOTAL_MB",
@@ -58,7 +63,9 @@ var configKeys = [...]string{
 	"NONSTREAM_KEEPALIVE",
 	"FAKE_STREAM",
 	"YOUTUBE_LINKS",
+	"STRIP_THOUGHT_SIGNATURES",
 	"SEARCH_MODEL_ALIASES",
+	"DISCOVER_HIDDEN_MODELS",
 	"GOOGLE_SEARCH",
 	"FIRST_EVENT_HEDGE",
 	"FIRST_EVENT_HEDGE_MODELS",
@@ -78,11 +85,17 @@ const WAABackendCamoufox = "camoufox"
 // WAABackendSpiderMonkey 表示由进程内的 SpiderMonkey 承担 WAA 生命周期
 const WAABackendSpiderMonkey = "spidermonkey"
 
+// WAAInterpreterCacheName 是账户状态目录中 SpiderMonkey 后端缓存 WAA 解释器的子目录名
+const WAAInterpreterCacheName = ".waa-interpreters"
+
 // FirstEventHedgeOff 表示首事件超时不发起备用请求
 const FirstEventHedgeOff = "off"
 
 // FirstEventHedgeAuto 表示按模型与通道近期原请求首事件等待的 p95 发起备用请求
 const FirstEventHedgeAuto = "auto"
+
+// DefaultMaxAccountSwitches 是 MAX_ACCOUNT_SWITCHES 的默认值
+const DefaultMaxAccountSwitches = 3
 
 // DefaultFirstEventHedgeModels 是 FIRST_EVENT_HEDGE_MODELS 的默认值
 const DefaultFirstEventHedgeModels = "gemini-4-argon"
@@ -99,6 +112,7 @@ const DefaultContinuationPrompt = "Continue the assistant response after the fol
 // Config 保存服务的全局配置
 type Config struct {
 	AutoStart              bool
+	HideDockIcon           bool
 	RequestBodyLog         bool
 	LogFile                bool
 	LogMaxTotalMB          int
@@ -109,7 +123,9 @@ type Config struct {
 	NonstreamKeepalive     bool
 	FakeStream             bool
 	YouTubeLinks           bool
+	StripThoughtSignatures bool
 	SearchModelAliases     bool
+	DiscoverHiddenModels   bool
 	GoogleSearch           bool
 	FirstEventHedge        string
 	FirstEventHedgeModels  string
@@ -128,10 +144,12 @@ type Config struct {
 	WarmStartupConcurrency int
 	PerAccountConcurrency  int
 	RoutingStrategy        string
+	AccountOrder           string
+	MaxAccountSwitches     int
 	UpstreamChannels       []string
 	ModelMapping           string
 	ModelChannels          string
-	TemporaryChat          bool
+	ModelAccounts          string
 	WAABackend             string
 	MediaOutput            string
 	MediaBaseURL           string
@@ -139,6 +157,18 @@ type Config struct {
 	Invalid []InvalidValue
 	// Environment 是取自进程环境变量、覆盖 .env 的配置键
 	Environment []string
+}
+
+// workerDefaultKeys 是默认值随 WAA 后端变化的键
+var workerDefaultKeys = []string{"WARM_WORKER_LIMIT", "MAX_ACTIVE_WORKERS"}
+
+// defaultsFor 返回 WAA 后端为 backend 时的默认配置，Camoufox 后端的常驻预热账户数与活动 Worker 上限较小
+func defaultsFor(backend string) Config {
+	cfg := Default()
+	if backend == WAABackendCamoufox {
+		cfg.WarmWorkerLimit, cfg.MaxActiveWorkers = camoufoxWarmWorkerLimit, camoufoxMaxActiveWorkers
+	}
+	return cfg
 }
 
 // Default 返回可直接启动的默认配置
@@ -150,7 +180,7 @@ func Default() Config {
 		BuildNativeNonstream:   true,
 		NonstreamKeepalive:     true,
 		SearchModelAliases:     true,
-		FirstEventHedge:        FirstEventHedgeAuto,
+		FirstEventHedge:        FirstEventHedgeOff,
 		FirstEventHedgeModels:  DefaultFirstEventHedgeModels,
 		ContinuationRewrite:    true,
 		ContinuationPrompt:     DefaultContinuationPrompt,
@@ -164,8 +194,9 @@ func Default() Config {
 		WarmStartupConcurrency: defaultWarmConcurrency,
 		PerAccountConcurrency:  defaultAccountConcurrency,
 		RoutingStrategy:        "round-robin",
+		MaxAccountSwitches:     DefaultMaxAccountSwitches,
 		UpstreamChannels:       []string{"playground"},
-		WAABackend:             WAABackendCamoufox,
+		WAABackend:             WAABackendSpiderMonkey,
 		MediaOutput:            MediaOutputInline,
 	}
 }
@@ -191,6 +222,7 @@ func invalidValue(key, value string, err error) InvalidValue {
 // configSetters 把每个配置键的文本值解析到 Config
 var configSetters = map[string]func(*Config, string) error{
 	"AUTO_START":               boolSetter("AUTO_START", func(c *Config) *bool { return &c.AutoStart }),
+	"HIDE_DOCK_ICON":           boolSetter("HIDE_DOCK_ICON", func(c *Config) *bool { return &c.HideDockIcon }),
 	"REQUEST_BODY_LOG":         boolSetter("REQUEST_BODY_LOG", func(c *Config) *bool { return &c.RequestBodyLog }),
 	"LOG_FILE":                 boolSetter("LOG_FILE", func(c *Config) *bool { return &c.LogFile }),
 	"ADMIN_AUTH_ENABLED":       boolSetter("ADMIN_AUTH_ENABLED", func(c *Config) *bool { return &c.AdminAuthEnabled }),
@@ -198,15 +230,17 @@ var configSetters = map[string]func(*Config, string) error{
 	"NONSTREAM_KEEPALIVE":      boolSetter("NONSTREAM_KEEPALIVE", func(c *Config) *bool { return &c.NonstreamKeepalive }),
 	"FAKE_STREAM":              boolSetter("FAKE_STREAM", func(c *Config) *bool { return &c.FakeStream }),
 	"SEARCH_MODEL_ALIASES":     boolSetter("SEARCH_MODEL_ALIASES", func(c *Config) *bool { return &c.SearchModelAliases }),
+	"DISCOVER_HIDDEN_MODELS":   boolSetter("DISCOVER_HIDDEN_MODELS", func(c *Config) *bool { return &c.DiscoverHiddenModels }),
 	"GOOGLE_SEARCH":            boolSetter("GOOGLE_SEARCH", func(c *Config) *bool { return &c.GoogleSearch }),
 	"YOUTUBE_LINKS":            boolSetter("YOUTUBE_LINKS", func(c *Config) *bool { return &c.YouTubeLinks }),
+	"STRIP_THOUGHT_SIGNATURES": boolSetter("STRIP_THOUGHT_SIGNATURES", func(c *Config) *bool { return &c.StripThoughtSignatures }),
 	"CONTINUATION_REWRITE":     boolSetter("CONTINUATION_REWRITE", func(c *Config) *bool { return &c.ContinuationRewrite }),
-	"TEMPORARY_CHAT":           boolSetter("TEMPORARY_CHAT", func(c *Config) *bool { return &c.TemporaryChat }),
 	"LOG_MAX_TOTAL_MB":         intSetter("LOG_MAX_TOTAL_MB", func(c *Config) *int { return &c.LogMaxTotalMB }),
 	"WARM_WORKER_LIMIT":        intSetter("WARM_WORKER_LIMIT", func(c *Config) *int { return &c.WarmWorkerLimit }),
 	"MAX_ACTIVE_WORKERS":       intSetter("MAX_ACTIVE_WORKERS", func(c *Config) *int { return &c.MaxActiveWorkers }),
 	"WARM_STARTUP_CONCURRENCY": intSetter("WARM_STARTUP_CONCURRENCY", func(c *Config) *int { return &c.WarmStartupConcurrency }),
 	"PER_ACCOUNT_CONCURRENCY":  intSetter("PER_ACCOUNT_CONCURRENCY", func(c *Config) *int { return &c.PerAccountConcurrency }),
+	"MAX_ACCOUNT_SWITCHES":     setMaxAccountSwitches,
 	"INIT_TIMEOUT":             durationSetter("INIT_TIMEOUT", func(c *Config) *time.Duration { return &c.InitTimeout }),
 	"REQUEST_TIMEOUT":          durationSetter("REQUEST_TIMEOUT", func(c *Config) *time.Duration { return &c.RequestTimeout }),
 	"ADMIN_USERNAME":           textSetter(func(c *Config) *string { return &c.AdminUsername }, strings.TrimSpace),
@@ -220,10 +254,12 @@ var configSetters = map[string]func(*Config, string) error{
 	"PROXY_API_KEY":            textSetter(func(c *Config) *string { return &c.ProxyAPIKey }, strings.TrimSpace),
 	"PROXY":                    textSetter(func(c *Config) *string { return &c.Proxy }, strings.TrimSpace),
 	"ROUTING_STRATEGY":         textSetter(func(c *Config) *string { return &c.RoutingStrategy }, strings.TrimSpace),
+	"ACCOUNT_ORDER":            textSetter(func(c *Config) *string { return &c.AccountOrder }, strings.TrimSpace),
 	"MODEL_MAPPING":            textSetter(func(c *Config) *string { return &c.ModelMapping }, strings.TrimSpace),
 	"MODEL_CHANNELS":           textSetter(func(c *Config) *string { return &c.ModelChannels }, strings.TrimSpace),
+	"MODEL_ACCOUNTS":           textSetter(func(c *Config) *string { return &c.ModelAccounts }, strings.TrimSpace),
 	"API_KEY_ACCOUNTS":         textSetter(func(c *Config) *string { return &c.APIKeyAccounts }, strings.TrimSpace),
-	"WAA_BACKEND":              textSetter(func(c *Config) *string { return &c.WAABackend }, lowerTrim),
+	"WAA_BACKEND":              setWAABackend,
 	"MEDIA_OUTPUT":             textSetter(func(c *Config) *string { return &c.MediaOutput }, lowerTrim),
 	"MEDIA_BASE_URL":           textSetter(func(c *Config) *string { return &c.MediaBaseURL }, strings.TrimSpace),
 	"UPSTREAM_CHANNELS": func(c *Config, value string) error {
@@ -274,6 +310,28 @@ func textSetter(field func(*Config) *string, normalize func(string) string) func
 
 func lowerTrim(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+// errMaxAccountSwitches 是 MAX_ACCOUNT_SWITCHES 取值无效的原因
+var errMaxAccountSwitches = fmt.Errorf("MAX_ACCOUNT_SWITCHES 必须是 0 或正整数")
+
+// setMaxAccountSwitches 设置非额度失败的换号次数，0 表示不换号
+func setMaxAccountSwitches(c *Config, value string) error {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return errMaxAccountSwitches
+	}
+	c.MaxAccountSwitches = parsed
+	return nil
+}
+
+// setWAABackend 设置 WAA 后端，camoufox 以外的取值都使用 spidermonkey
+func setWAABackend(c *Config, value string) error {
+	c.WAABackend = WAABackendSpiderMonkey
+	if lowerTrim(value) == WAABackendCamoufox {
+		c.WAABackend = WAABackendCamoufox
+	}
+	return nil
 }
 
 // configCheck 是一条配置校验与校验失败时改回默认值的键
@@ -345,6 +403,12 @@ var configChecks = []configCheck{
 		}
 		return nil
 	}},
+	{[]string{"MAX_ACCOUNT_SWITCHES"}, func(c Config) error {
+		if c.MaxAccountSwitches < 0 {
+			return errMaxAccountSwitches
+		}
+		return nil
+	}},
 	{[]string{"UPSTREAM_CHANNELS"}, func(c Config) error { return validateUpstreamChannels(c.UpstreamChannels) }},
 	{[]string{"MODEL_MAPPING"}, func(c Config) error {
 		_, err := ParseModelMapping(c.ModelMapping)
@@ -352,6 +416,10 @@ var configChecks = []configCheck{
 	}},
 	{[]string{"MODEL_CHANNELS"}, func(c Config) error {
 		_, err := ParseModelChannels(c.ModelChannels)
+		return err
+	}},
+	{[]string{"MODEL_ACCOUNTS"}, func(c Config) error {
+		_, err := ParseModelAccounts(c.ModelAccounts)
 		return err
 	}},
 	{[]string{"API_KEY_ACCOUNTS"}, func(c Config) error {
@@ -392,7 +460,7 @@ var configChecks = []configCheck{
 	}},
 }
 
-// Load 从指定 env 文件和进程环境加载配置，取值无效的项改用默认值并记入 Invalid
+// Load 从指定 env 文件和进程环境加载配置，取值无效的项改用默认值并记入 Invalid，没写的常驻预热账户数与启动并发取默认值且不超过活动 Worker 上限，两者都没有 WAA 后端时按账户状态目录确定后端并追加到文件
 func Load(path string) (Config, error) {
 	values, commented, err := readEnvFile(path)
 	if err != nil {
@@ -417,7 +485,26 @@ func Load(path string) (Config, error) {
 			}
 		}
 	}
-	defaults := Default().envValues()
+	if _, ok := values["WAA_BACKEND"]; !ok {
+		if camoufoxOnlyAccounts(cfg.AuthStates) {
+			cfg.WAABackend = WAABackendCamoufox
+		}
+		if err := appendEnv(path, "WAA_BACKEND", cfg.WAABackend); err != nil {
+			return Config{}, err
+		}
+	}
+	defaults := defaultsFor(cfg.WAABackend).envValues()
+	for _, key := range workerDefaultKeys {
+		if _, ok := values[key]; !ok {
+			configSetters[key](&cfg, defaults[key])
+		}
+	}
+	if _, ok := values["WARM_WORKER_LIMIT"]; !ok {
+		cfg.WarmWorkerLimit = min(cfg.WarmWorkerLimit, cfg.MaxActiveWorkers)
+	}
+	if _, ok := values["WARM_STARTUP_CONCURRENCY"]; !ok {
+		cfg.WarmStartupConcurrency = min(cfg.WarmStartupConcurrency, cfg.MaxActiveWorkers)
+	}
 	for failed := true; failed; {
 		failed = false
 		for _, check := range configChecks {
@@ -444,10 +531,10 @@ func Load(path string) (Config, error) {
 // legacyEnvKeys 是 v0.2.18 及之前的版本保存设置时总会写出的键
 var legacyEnvKeys = []string{
 	"AISTUDIO_AUTH_STATES", "LISTEN_ADDR", "PROXY_API_KEY", "PROXY", "INIT_TIMEOUT", "REQUEST_TIMEOUT", "WARM_WORKER_LIMIT",
-	"MAX_ACTIVE_WORKERS", "WARM_STARTUP_CONCURRENCY", "PER_ACCOUNT_CONCURRENCY", "ROUTING_STRATEGY", "UPSTREAM_CHANNELS", "TEMPORARY_CHAT", "WAA_BACKEND",
+	"MAX_ACTIVE_WORKERS", "WARM_STARTUP_CONCURRENCY", "PER_ACCOUNT_CONCURRENCY", "ROUTING_STRATEGY", "UPSTREAM_CHANNELS", "WAA_BACKEND",
 }
 
-// upgradeEnv 改写旧版本写出的没有注释的全量 .env：四项旧值改为当前值，删去等于默认值的键，返回是否改写
+// upgradeEnv 改写旧版本写出的没有注释的全量 .env：上游通道与请求超时的旧默认值改为当前值，WAA 后端保留为当前取值，删去其余等于默认值的键，返回是否改写
 func upgradeEnv(values map[string]string) bool {
 	if slices.ContainsFunc(legacyEnvKeys, func(key string) bool {
 		_, ok := values[key]
@@ -466,18 +553,29 @@ func upgradeEnv(values map[string]string) bool {
 	if timeout, err := time.ParseDuration(strings.TrimSpace(values["REQUEST_TIMEOUT"])); err == nil && timeout == 5*time.Minute {
 		delete(values, "REQUEST_TIMEOUT")
 	}
-	if lowerTrim(values["FIRST_EVENT_HEDGE"]) == FirstEventHedgeOff {
-		delete(values, "FIRST_EVENT_HEDGE")
-	}
-	if lowerTrim(values["WAA_BACKEND"]) == "go" {
-		values["WAA_BACKEND"] = WAABackendSpiderMonkey
-	}
+	backend := Default()
+	configSetters["WAA_BACKEND"](&backend, values["WAA_BACKEND"])
+	values["WAA_BACKEND"] = backend.WAABackend
 	for key, value := range values {
-		if isDefault(key, value) {
+		if key != "WAA_BACKEND" && isDefault(key, value) {
 			delete(values, key)
 		}
 	}
 	return true
+}
+
+// camoufoxOnlyAccounts 判断账户状态目录中已有账户而都没有 SpiderMonkey 的解释器缓存，即账户只在 Camoufox 后端下运行过
+func camoufoxOnlyAccounts(authStates string) bool {
+	found := false
+	for _, directory := range strings.Split(authStates, ",") {
+		directory = strings.TrimSpace(directory)
+		if _, err := os.Stat(filepath.Join(directory, WAAInterpreterCacheName)); err == nil {
+			return false
+		}
+		accounts, _ := filepath.Glob(filepath.Join(directory, "*", "account.json"))
+		found = found || len(accounts) > 0
+	}
+	return found
 }
 
 // KeepEnvironment 返回把进程环境变量决定的项及其无效记录取 saved 中的值后的配置
@@ -495,6 +593,7 @@ func (c Config) KeepEnvironment(saved Config) Config {
 func (c Config) envValues() map[string]string {
 	return map[string]string{
 		"AUTO_START":               strconv.FormatBool(c.AutoStart),
+		"HIDE_DOCK_ICON":           strconv.FormatBool(c.HideDockIcon),
 		"REQUEST_BODY_LOG":         strconv.FormatBool(c.RequestBodyLog),
 		"LOG_FILE":                 strconv.FormatBool(c.LogFile),
 		"LOG_MAX_TOTAL_MB":         strconv.Itoa(c.LogMaxTotalMB),
@@ -505,7 +604,9 @@ func (c Config) envValues() map[string]string {
 		"NONSTREAM_KEEPALIVE":      strconv.FormatBool(c.NonstreamKeepalive),
 		"FAKE_STREAM":              strconv.FormatBool(c.FakeStream),
 		"YOUTUBE_LINKS":            strconv.FormatBool(c.YouTubeLinks),
+		"STRIP_THOUGHT_SIGNATURES": strconv.FormatBool(c.StripThoughtSignatures),
 		"SEARCH_MODEL_ALIASES":     strconv.FormatBool(c.SearchModelAliases),
+		"DISCOVER_HIDDEN_MODELS":   strconv.FormatBool(c.DiscoverHiddenModels),
 		"GOOGLE_SEARCH":            strconv.FormatBool(c.GoogleSearch),
 		"FIRST_EVENT_HEDGE":        c.FirstEventHedge,
 		"FIRST_EVENT_HEDGE_MODELS": c.FirstEventHedgeModels,
@@ -523,18 +624,20 @@ func (c Config) envValues() map[string]string {
 		"WARM_STARTUP_CONCURRENCY": strconv.Itoa(c.WarmStartupConcurrency),
 		"PER_ACCOUNT_CONCURRENCY":  strconv.Itoa(c.PerAccountConcurrency),
 		"ROUTING_STRATEGY":         c.RoutingStrategy,
+		"ACCOUNT_ORDER":            c.AccountOrder,
+		"MAX_ACCOUNT_SWITCHES":     strconv.Itoa(c.MaxAccountSwitches),
 		"UPSTREAM_CHANNELS":        strings.Join(c.UpstreamChannels, ","),
 		"MODEL_MAPPING":            c.ModelMapping,
 		"MODEL_CHANNELS":           c.ModelChannels,
+		"MODEL_ACCOUNTS":           c.ModelAccounts,
 		"API_KEY_ACCOUNTS":         c.APIKeyAccounts,
-		"TEMPORARY_CHAT":           strconv.FormatBool(c.TemporaryChat),
 		"WAA_BACKEND":              c.WAABackend,
 		"MEDIA_OUTPUT":             c.MediaOutput,
 		"MEDIA_BASE_URL":           c.MediaBaseURL,
 	}
 }
 
-// Save 将与默认值不同的配置原子写入指定 env 文件，进程环境变量决定的项保留文件中原有的值
+// Save 将 WAA 后端与其余和默认值不同的配置原子写入指定 env 文件，进程环境变量决定的项保留文件中原有的值；文件中没有的常驻预热账户数与活动 Worker 上限仍等于原后端的默认值时不写入，随后端取默认值
 func (c Config) Save(path string) error {
 	if err := c.Validate(); err != nil {
 		return err
@@ -543,14 +646,24 @@ func (c Config) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	values, defaults := c.envValues(), Default().envValues()
+	values, defaults := c.envValues(), defaultsFor(c.WAABackend).envValues()
+	previous := Default()
+	if value, ok := saved["WAA_BACKEND"]; ok {
+		_ = configSetters["WAA_BACKEND"](&previous, value)
+	}
+	previousDefaults := defaultsFor(previous.WAABackend).envValues()
 	file := make(map[string]string)
 	for _, key := range configKeys {
-		if slices.Contains(c.Environment, key) {
-			if value, ok := saved[key]; ok {
-				file[key] = value
+		_, inFile := saved[key]
+		switch {
+		case slices.Contains(c.Environment, key):
+			if inFile {
+				file[key] = saved[key]
 			}
-		} else if values[key] != defaults[key] {
+		case key == "WAA_BACKEND":
+			file[key] = values[key]
+		case slices.Contains(workerDefaultKeys, key) && !inFile && values[key] == previousDefaults[key]:
+		case values[key] != defaults[key]:
 			file[key] = values[key]
 		}
 	}
@@ -569,6 +682,18 @@ func writeEnv(path string, values map[string]string) error {
 		}
 	}
 	return atomicWrite(path, []byte(output.String()), 0o600)
+}
+
+// appendEnv 在 env 文件末尾原子追加一个键，文件不存在时创建
+func appendEnv(path, key, value string) error {
+	content, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("读取配置文件: %w", err)
+	}
+	if len(content) > 0 && content[len(content)-1] != '\n' {
+		content = append(content, '\n')
+	}
+	return atomicWrite(path, append(content, key+"="+formatEnvValue(value)+"\n"...), 0o600)
 }
 
 // Validate 校验配置值是否能用于服务启动
@@ -627,12 +752,7 @@ func ParseAPIKeyAccounts(value string, apiKeys string) (map[string][]string, err
 		}
 		index := strings.LastIndexByte(item, ':')
 		key := strings.TrimSpace(item[:max(index, 0)])
-		var ids []string
-		for id := range strings.SplitSeq(item[index+1:], "|") {
-			if id = strings.TrimSpace(id); id != "" {
-				ids = append(ids, id)
-			}
-		}
+		ids := accountIDs(item[index+1:])
 		if index < 0 || key == "" || len(ids) == 0 {
 			return nil, fmt.Errorf("API_KEY_ACCOUNTS 的每一项写成 API key:账户|账户")
 		}
@@ -645,6 +765,39 @@ func ParseAPIKeyAccounts(value string, apiKeys string) (map[string][]string, err
 		accounts[key] = ids
 	}
 	return accounts, nil
+}
+
+// ParseModelAccounts 解析逗号分隔的 模型 ID:账户|账户，以最后一个冒号分隔，返回每个模型可用的账户 ID
+func ParseModelAccounts(value string) (map[string][]string, error) {
+	accounts := make(map[string][]string)
+	for item := range strings.SplitSeq(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		index := strings.LastIndexByte(item, ':')
+		model := strings.TrimPrefix(strings.TrimSpace(item[:max(index, 0)]), "models/")
+		ids := accountIDs(item[index+1:])
+		if index < 0 || model == "" || len(ids) == 0 {
+			return nil, fmt.Errorf("MODEL_ACCOUNTS 的每一项写成 模型 ID:账户|账户，%q 不符合", item)
+		}
+		if _, exists := accounts[model]; exists {
+			return nil, fmt.Errorf("MODEL_ACCOUNTS 中模型 %s 重复", model)
+		}
+		accounts[model] = ids
+	}
+	return accounts, nil
+}
+
+// accountIDs 返回以 | 分隔、去掉空白的各个账户 ID
+func accountIDs(value string) []string {
+	var ids []string
+	for id := range strings.SplitSeq(value, "|") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // APIKeys 返回 PROXY_API_KEY 中逗号分隔、去掉空白的各个 key
@@ -827,9 +980,6 @@ func parseEnvValue(value string) (string, error) {
 }
 
 func formatEnvValue(value string) string {
-	if value == "" {
-		return ""
-	}
 	if strings.ContainsAny(value, " \t\r\n#\"'") {
 		return strconv.Quote(value)
 	}

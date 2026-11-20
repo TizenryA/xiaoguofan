@@ -3,15 +3,19 @@ import { keepPage } from '@/desktop'
 import type {
   Account,
   AccountDraft,
+  AccountExit,
   AccountLoginInput,
   AccountRefresh,
+  AccountTask,
   AdminEvent,
   ChromeImportInput,
+  CookieAccountsInput,
   CookieBrowser,
   CookieImportInput,
   FirstEventLatency,
   ChromeImportProfile,
   PairingToken,
+  PathListing,
   Model,
   PromptInput,
   PromptSummary,
@@ -23,6 +27,7 @@ import type {
   ServiceConfig,
   ServiceStatus,
   UpdateStatus,
+  UsagePair,
   UsageRecordPage,
   UsageReport,
 } from '@/types'
@@ -31,8 +36,8 @@ interface AccountsResponse {
   accounts: Account[]
 }
 
-interface AccountResponse {
-  account: Account
+interface AccountTaskResponse {
+  task: AccountTask
 }
 
 interface ChromeProfilesResponse {
@@ -55,13 +60,6 @@ export interface AdminSession {
   enabled: boolean
   authenticated: boolean
   username: string
-}
-
-// checkSessionResponse 通知页面清理失效会话中的管理数据
-function checkSessionResponse(path: string, response: Response): void {
-  if (response.status === 401 && !path.startsWith('/api/auth/')) {
-    window.dispatchEvent(new Event('admin-session-expired'))
-  }
 }
 
 export class ApiError extends Error {
@@ -96,15 +94,17 @@ export function jsonBody(value: unknown): Blob {
 const writes = ref(0)
 keepPage(() => writes.value > 0)
 
-// send 发出管理端请求并保留服务端错误语义，写请求进行中时计入 writes
+// send 发出管理端请求并保留服务端错误语义，管理登录失效时通知页面清理管理数据，写请求进行中时计入 writes
 async function send(path: string, init?: RequestInit): Promise<Response> {
   const write = init?.method !== undefined && init.method !== 'GET'
   if (write) writes.value++
   try {
     const response = await fetch(path, init)
-    checkSessionResponse(path, response)
     if (!response.ok) {
-      throw await responseError(response)
+      const error = await responseError(response)
+      if (error.code === 'admin_login_required')
+        window.dispatchEvent(new Event('admin-session-expired'))
+      throw error
     }
     return response
   } finally {
@@ -135,32 +135,43 @@ export const api = {
     requestJSON<UpdateStatus>(refresh ? '/api/update?refresh=1' : '/api/update'),
   applyUpdate: () => requestJSON<UpdateStatus>('/api/update', { method: 'POST' }),
   accounts: async () => (await requestJSON<AccountsResponse>('/api/accounts')).accounts,
+  accountExits: async () =>
+    (await requestJSON<{ exits: AccountExit[] }>('/api/accounts/exits')).exits,
   models: async () => (await requestJSON<ModelsResponse>('/api/models')).models,
   cooldowns: async () => (await requestJSON<CooldownsResponse>('/api/cooldowns')).cooldowns,
   requests: async () => (await requestJSON<RequestsResponse>('/api/requests')).requests,
   config: () => requestJSON<ServiceConfig>('/api/config'),
   usage: (query: URLSearchParams, signal: AbortSignal) =>
     requestJSON<UsageReport>(`/api/usage?${query.toString()}`, { signal }),
+  usagePairs: async (query: URLSearchParams) =>
+    (await requestJSON<{ pairs: UsagePair[] }>(`/api/usage/pairs?${query.toString()}`)).pairs,
   usageRecords: (query: URLSearchParams, signal: AbortSignal) =>
     requestJSON<UsageRecordPage>(`/api/usage/records?${query.toString()}`, { signal }),
   usageExportURL: (query: URLSearchParams) => `/api/usage/records.csv?${query.toString()}`,
   requestBody: (id: string) =>
     requestJSON<RequestBody>(`/api/requests/${encodeURIComponent(id)}/body`),
-  createAccount: (input: AccountLoginInput, view: string, signal: AbortSignal) =>
-    requestJSON<AccountResponse>('/api/accounts', {
-      method: 'POST',
-      body: jsonBody({ ...input, view }),
-      signal,
-    }),
+  createAccount: async (input: AccountLoginInput, view: string) =>
+    (
+      await requestJSON<AccountTaskResponse>('/api/accounts', {
+        method: 'POST',
+        body: jsonBody({ ...input, view }),
+      })
+    ).task,
   chromeImportProfiles: async () =>
     (await requestJSON<ChromeProfilesResponse>('/api/accounts/import/chrome')).profiles,
-  importChromeAccounts: (input: ChromeImportInput) =>
-    requestJSON<AccountsResponse>('/api/accounts/import/chrome', {
-      method: 'POST',
-      body: jsonBody(input),
-    }),
-  cookieBrowsers: async () =>
-    (await requestJSON<{ browsers: CookieBrowser[] }>('/api/accounts/import/browsers')).browsers,
+  importChromeAccounts: async (input: ChromeImportInput) =>
+    (
+      await requestJSON<AccountTaskResponse>('/api/accounts/import/chrome', {
+        method: 'POST',
+        body: jsonBody(input),
+      })
+    ).task,
+  cookieBrowsers: async (proxy: string) =>
+    (
+      await requestJSON<{ browsers: CookieBrowser[] }>(
+        `/api/accounts/import/browsers?${new URLSearchParams({ proxy })}`,
+      )
+    ).browsers,
   discoverCookieAccounts: async (input: CookieImportInput) =>
     (
       await requestJSON<{ accounts: CookieBrowser[] }>('/api/accounts/import/cookies/discover', {
@@ -168,11 +179,16 @@ export const api = {
         body: jsonBody(input),
       })
     ).accounts,
-  importCookieAccount: (input: CookieImportInput) =>
-    requestJSON<AccountResponse>('/api/accounts/import/cookies', {
-      method: 'POST',
-      body: jsonBody(input),
-    }),
+  importCookieAccounts: async (input: CookieAccountsInput) =>
+    (
+      await requestJSON<AccountTaskResponse>('/api/accounts/import/cookies', {
+        method: 'POST',
+        body: jsonBody(input),
+      })
+    ).task,
+  dismissAccountTask: (id: string) =>
+    requestCommand(`/api/accounts/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  activePairing: () => requestJSON<PairingToken>('/api/pairing'),
   createPairing: () => requestJSON<PairingToken>('/api/pairing', { method: 'POST' }),
   updateAccount: (id: string, draft: AccountDraft) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}`, {
@@ -181,20 +197,23 @@ export const api = {
     }),
   deleteAccount: (id: string, keepalive: boolean) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}`, { method: 'DELETE', keepalive }),
-  loginAccount: (id: string, view: string, signal: AbortSignal) =>
-    requestCommand(`/api/accounts/${encodeURIComponent(id)}/login`, {
-      method: 'POST',
-      body: jsonBody({ view }),
-      signal,
-    }),
+  loginAccount: async (id: string, view: string) =>
+    (
+      await requestJSON<AccountTaskResponse>(`/api/accounts/${encodeURIComponent(id)}/login`, {
+        method: 'POST',
+        body: jsonBody({ view }),
+      })
+    ).task,
   loginViewURL: (view: string) =>
     `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/login-view/${encodeURIComponent(view)}`,
+  paths: (path: string) => requestJSON<PathListing>(`/api/paths?path=${encodeURIComponent(path)}`),
   refreshAccount: (id: string) =>
     requestJSON<AccountRefresh>(`/api/accounts/${encodeURIComponent(id)}/refresh`, {
       method: 'POST',
     }),
   startService: () => requestJSON<ServiceStatus>('/api/control/start', { method: 'POST' }),
   stopService: () => requestJSON<ServiceStatus>('/api/control/stop', { method: 'POST' }),
+  downloadCamoufox: () => requestJSON<ServiceStatus>('/api/camoufox/download', { method: 'POST' }),
   clearLogs: () => requestCommand('/api/logs', { method: 'DELETE' }),
   firstEventLatency: async () =>
     (await requestJSON<{ latencies: FirstEventLatency[] }>('/api/first-event-latency')).latencies,

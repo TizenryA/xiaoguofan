@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import App from './App.vue'
+import { afterTask } from './lazy'
 
 declare module 'vue-router' {
   // RouteMeta 中 studio 表示 API 试用页，其余路由为管理端主页面
@@ -18,49 +19,51 @@ const routes: RouteRecordRaw[] = [
   {
     path: '/prompts/new_chat',
     name: 'prompt',
-    component: () => import('@/playground/PlaygroundPage.vue'),
+    component: () => import('@/playground/PlaygroundPage.vue').then(afterTask),
     meta: studio,
   },
   {
     path: '/prompts/new_image',
     name: 'image',
-    component: () => import('@/playground/media/ImageRoute.vue'),
+    component: () => import('@/playground/media/ImageRoute.vue').then(afterTask),
     meta: studio,
   },
+  // 视频页与官网一样转到对话页，以目录别名 omni-featured 选中当前的 Omni 模型
   {
     path: '/prompts/new_video',
-    name: 'video',
-    component: () => import('@/playground/media/VideoPage.vue'),
-    meta: studio,
+    redirect: (to) => ({
+      path: '/prompts/new_chat',
+      query: { ...to.query, model: 'omni-featured' },
+    }),
   },
   {
     path: '/generate-speech',
     name: 'speech',
-    component: () => import('@/playground/media/SpeechPage.vue'),
+    component: () => import('@/playground/media/SpeechPage.vue').then(afterTask),
     meta: studio,
   },
   {
     path: '/new_music',
     name: 'music',
-    component: () => import('@/playground/media/MusicPage.vue'),
+    component: () => import('@/playground/media/MusicPage.vue').then(afterTask),
     meta: studio,
   },
   {
     path: '/live',
     name: 'live',
-    component: () => import('@/playground/media/LivePage.vue'),
+    component: () => import('@/playground/media/LivePage.vue').then(afterTask),
     meta: studio,
   },
   {
     path: '/library',
     name: 'library',
-    component: () => import('@/playground/LibraryPage.vue'),
+    component: () => import('@/playground/LibraryPage.vue').then(afterTask),
     meta: studio,
   },
   {
     path: '/prompts/:id',
     name: 'saved',
-    component: () => import('@/playground/PromptRoute.vue'),
+    component: () => import('@/playground/PromptRoute.vue').then(afterTask),
     meta: studio,
   },
   { path: '/:pathMatch(.*)*', redirect: '/' },

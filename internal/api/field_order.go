@@ -1,9 +1,10 @@
 package api
 
 import (
-	"bytes"
 	_ "embed"
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"maps"
 	"slices"
 	"strings"
@@ -62,7 +63,15 @@ type anthropicStartUsage struct {
 	InputTokens              int64 `json:"input_tokens"`
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-	OutputTokens             int64 `json:"output_tokens"`
+	// CacheCreation、ServerToolUse、ServiceTier 与 InferenceGeo 是 Usage 必有、可为 null 的成员
+	CacheCreation struct {
+		Ephemeral5mInputTokens int64 `json:"ephemeral_5m_input_tokens"`
+		Ephemeral1hInputTokens int64 `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
+	OutputTokens  int64   `json:"output_tokens"`
+	ServerToolUse any     `json:"server_tool_use"`
+	ServiceTier   string  `json:"service_tier"`
+	InferenceGeo  *string `json:"inference_geo"`
 }
 
 // officialOrder 将响应投影为固定字段结构与动态字段对象
@@ -134,28 +143,23 @@ func (order *fieldOrder) value(value any, parent string) any {
 	return value
 }
 
-// MarshalJSON 只排列当前动态对象的键，字段值由 encoding/json 编码
-func (o orderedJSON) MarshalJSON() ([]byte, error) {
+// MarshalJSONTo 只排列当前动态对象的键，字段值由 encoding/json 编码
+func (o orderedJSON) MarshalJSONTo(encoder *jsontext.Encoder) error {
 	keys := slices.Collect(maps.Keys(o.fields))
 	ranks := o.order.ranksFor(o.fields, o.parent)
 	slices.SortFunc(keys, func(a, b string) int { return o.order.compare(ranks, a, b) })
-	var buffer bytes.Buffer
-	buffer.WriteByte('{')
-	for index, key := range keys {
-		if index > 0 {
-			buffer.WriteByte(',')
-		}
-		name, _ := json.Marshal(key)
-		item, err := json.Marshal(o.fields[key])
-		if err != nil {
-			return nil, err
-		}
-		buffer.Write(name)
-		buffer.WriteByte(':')
-		buffer.Write(item)
+	if err := encoder.WriteToken(jsontext.BeginObject); err != nil {
+		return err
 	}
-	buffer.WriteByte('}')
-	return buffer.Bytes(), nil
+	for _, key := range keys {
+		if err := encoder.WriteToken(jsontext.String(key)); err != nil {
+			return err
+		}
+		if err := jsonv2.MarshalEncode(encoder, o.fields[key]); err != nil {
+			return err
+		}
+	}
+	return encoder.WriteToken(jsontext.EndObject)
 }
 
 // object 返回固定响应的具名结构体或动态字段对象
@@ -222,7 +226,9 @@ func (order *fieldOrder) object(fields map[string]any, parent string) any {
 				Model:                fields["model"],
 				StopReason:           fields["stop_reason"],
 				StopSequence:         fields["stop_sequence"],
+				StopDetails:          fields["stop_details"],
 				Usage:                fields["usage"],
+				Container:            fields["container"],
 				ContextManagement:    fields["context_management"],
 				ProviderFinishReason: fields["provider_finish_reason"],
 				ProviderModel:        fields["provider_model"],
@@ -241,11 +247,13 @@ func (order *fieldOrder) object(fields map[string]any, parent string) any {
 				IncompleteDetails:    fields["incomplete_details"],
 				Instructions:         fields["instructions"],
 				MaxOutputTokens:      fields["max_output_tokens"],
+				MaxToolCalls:         fields["max_tool_calls"],
 				Model:                fields["model"],
 				Output:               fields["output"],
 				ParallelToolCalls:    fields["parallel_tool_calls"],
 				PreviousResponseID:   fields["previous_response_id"],
 				Reasoning:            fields["reasoning"],
+				ServiceTier:          fields["service_tier"],
 				Temperature:          fields["temperature"],
 				Text:                 fields["text"],
 				ToolChoice:           fields["tool_choice"],
@@ -262,14 +270,16 @@ func (order *fieldOrder) object(fields map[string]any, parent string) any {
 	case "interactions":
 		if mapString(fields, "object") == "interaction" {
 			return interactionJSON{
-				Created: fields["created"],
-				ID:      fields["id"],
-				Model:   fields["model"],
-				Object:  fields["object"],
-				Status:  fields["status"],
-				Steps:   fields["steps"],
-				Updated: fields["updated"],
-				Usage:   fields["usage"],
+				Created:               fields["created"],
+				EnvironmentID:         fields["environment_id"],
+				ID:                    fields["id"],
+				Model:                 fields["model"],
+				Object:                fields["object"],
+				PreviousInteractionID: fields["previous_interaction_id"],
+				Status:                fields["status"],
+				Steps:                 fields["steps"],
+				Updated:               fields["updated"],
+				Usage:                 fields["usage"],
 			}
 		}
 	case "openai":
@@ -356,7 +366,9 @@ type anthropicMessageJSON struct {
 	Model                any `json:"model,omitempty"`
 	StopReason           any `json:"stop_reason,omitempty"`
 	StopSequence         any `json:"stop_sequence,omitempty"`
+	StopDetails          any `json:"stop_details,omitempty"`
 	Usage                any `json:"usage,omitempty"`
+	Container            any `json:"container,omitempty"`
 	ContextManagement    any `json:"context_management,omitempty"`
 	ProviderFinishReason any `json:"provider_finish_reason,omitempty"`
 	ProviderModel        any `json:"provider_model,omitempty"`
@@ -374,11 +386,13 @@ type responsesJSON struct {
 	IncompleteDetails    any `json:"incomplete_details,omitempty"`
 	Instructions         any `json:"instructions,omitempty"`
 	MaxOutputTokens      any `json:"max_output_tokens,omitempty"`
+	MaxToolCalls         any `json:"max_tool_calls,omitempty"`
 	Model                any `json:"model,omitempty"`
 	Output               any `json:"output,omitempty"`
 	ParallelToolCalls    any `json:"parallel_tool_calls,omitempty"`
 	PreviousResponseID   any `json:"previous_response_id,omitempty"`
 	Reasoning            any `json:"reasoning,omitempty"`
+	ServiceTier          any `json:"service_tier,omitempty"`
 	Temperature          any `json:"temperature,omitempty"`
 	Text                 any `json:"text,omitempty"`
 	ToolChoice           any `json:"tool_choice,omitempty"`
@@ -394,14 +408,17 @@ type responsesJSON struct {
 
 // interactionJSON 是 Interactions 响应资源
 type interactionJSON struct {
-	Created any `json:"created,omitempty"`
-	ID      any `json:"id,omitempty"`
-	Model   any `json:"model,omitempty"`
-	Object  any `json:"object,omitempty"`
-	Status  any `json:"status,omitempty"`
-	Steps   any `json:"steps,omitempty"`
-	Updated any `json:"updated,omitempty"`
-	Usage   any `json:"usage,omitempty"`
+	Created       any `json:"created,omitempty"`
+	EnvironmentID any `json:"environment_id,omitempty"`
+	ID            any `json:"id,omitempty"`
+	Model         any `json:"model,omitempty"`
+	Object        any `json:"object,omitempty"`
+	// PreviousInteractionID 是续接的前序交互
+	PreviousInteractionID any `json:"previous_interaction_id,omitempty"`
+	Status                any `json:"status,omitempty"`
+	Steps                 any `json:"steps,omitempty"`
+	Updated               any `json:"updated,omitempty"`
+	Usage                 any `json:"usage,omitempty"`
 }
 
 // openAIModelJSON 是 OpenAI 模型资源

@@ -1,6 +1,7 @@
 package aistudio
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,7 +33,7 @@ const (
 	assistantProofField = 2
 	// assistantDefaultThinkingLevel 是 Build 对话默认的 high 思考强度
 	assistantDefaultThinkingLevel = 3
-	// assistantCleanupTimeout 是取消生成与删除临时应用的期限
+	// assistantCleanupTimeout 是取消未完成任务与发送回复后伴随请求的期限
 	assistantCleanupTimeout = time.Minute
 	// assistantFence 是 Markdown 代码块的围栏
 	assistantFence = "```"
@@ -39,23 +41,56 @@ const (
 	assistantCallFence = assistantFence + "function_calls"
 	// assistantResultFence 是转录函数结果的代码块开头
 	assistantResultFence = assistantFence + "function_results"
-	// assistantToolProtocol 是写入自定义指令的客户端函数说明，%s 为函数声明 JSON
-	assistantToolProtocol = "You can call the following client functions. They run on the user's machine, not in this workspace, and are the only way to read or change the user's files, run the user's commands or reach the user's services.\n%s\n" +
-		"To call functions, reply with only one fenced block and no other text:\n" + assistantCallFence + "\n[{\"name\": \"<function name>\", \"arguments\": {<arguments>}}]\n```\n" +
-		"Function results arrive in a later user turn as a fenced function_results block. Never write a function_results block yourself; stop after the function_calls block and wait for the results. Answer normally when no function is needed."
+	// assistantToolProtocol 是自定义指令中的客户端函数说明，%s 为函数声明 JSON
+	assistantToolProtocol = "You can call the following client functions. " + assistantToolScope + "\n%s\n" + assistantCallProtocol
+	// assistantFileToolProtocol 是函数声明写在说明文件中时自定义指令中的客户端函数说明
+	assistantFileToolProtocol = "You can call the client functions declared in the instructions file. " + assistantToolScope + "\n" + assistantCallProtocol
+	// assistantToolScope 是客户端函数的运行位置与用途
+	assistantToolScope = "They run on the user's machine, not in this workspace, and are the only way to read or change the user's files, run the user's commands or reach the user's services."
+	// assistantCallProtocol 是写出函数调用代码块并以 ask_question 交回调用的格式
+	assistantCallProtocol = "To call functions, write one fenced block:\n" + assistantCallFence + "\n[{\"name\": \"<function name>\", \"arguments\": {<arguments>}}]\n```\n" +
+		"Right after the block, call your ask_question tool once with the question \"" + assistantCallQuestion + "\" and write nothing more. The user's machine runs the calls and the results arrive as the answer in a fenced function_results block. Never write a function_results block yourself. Answer normally when no function is needed."
+	// assistantCallQuestion 是模型写出调用代码块后以 ask_question 交回调用的问题
+	assistantCallQuestion = "Run these function calls and send me their results."
+	// assistantQuestionTool 是写代码助手向用户提问并结束本轮生成的内置工具
+	assistantQuestionTool = "ask_question"
 	// assistantWorkspaceRule 是写在自定义指令开头、禁止调用写代码助手内置工具的说明，%s 为禁止的工具名
 	assistantWorkspaceRule = "The tools listed earlier in your instructions (%s) act on an empty remote applet workspace that has nothing to do with this conversation or the user's machine. You are strictly forbidden to call any of them: do not create, view, edit or delete workspace files, run workspace commands, compile, install, deploy or generate images there. Reply to the user directly in your answer."
 	// assistantSearchRule 是请求允许网页搜索时接在禁止说明之后的说明
 	assistantSearchRule = " The only exception is search_web, which you may call to search the web."
-	// assistantTurnOpen 与 assistantTurnClose 包住以 user 轮发送的模型历史轮
-	assistantTurnOpen  = "<assistant_turn>\n"
-	assistantTurnClose = "\n</assistant_turn>"
+	// assistantHistoryOpen 与 assistantHistoryClose 包住转录在自定义指令末尾的对话历史
+	assistantHistoryOpen  = "<conversation_history>\n"
+	assistantHistoryClose = "</conversation_history>"
+	// assistantHistoryTurn 是对话历史中的一轮，依次为标签、正文与标签
+	assistantHistoryTurn = "<%s>\n%s\n</%s>\n"
+	// assistantAttachmentLabel 是对话历史中附件的编号
+	assistantAttachmentLabel = "[attachment %d]"
 	// assistantSearchTranscript 是模型历史轮中补回的一次 search_web 结果，依次为查询与摘要
 	assistantSearchTranscript = "search_web results for %q:\n%s"
 	// assistantSearchHistoryLimit 是保存 search_web 结果的模型回复数上限
 	assistantSearchHistoryLimit = 1000
-	// assistantHistoryRule 是对话含模型历史轮时写入自定义指令的说明
-	assistantHistoryRule = "Your own earlier replies in this conversation, including your function_calls blocks, appear in the user message between <assistant_turn> and </assistant_turn>. Continue from the latest content and never write these tags yourself."
+	// assistantInstructionsRule 是写在自定义指令中、说明本轮用户轮开头的说明文件的说明
+	assistantInstructionsRule = "A user message of this chat may start with an attached plain-text instructions file from the user's client. It holds what the client sent that does not fit in these instructions: its system instructions, the client functions you can call or the conversation before this chat. Follow it as your system instructions. A later instructions file replaces the earlier one."
+	// assistantInstructionsSystem 是说明文件中客户端系统提示词的标题
+	assistantInstructionsSystem = "System instructions:\n"
+	// assistantInstructionsFunctions 是说明文件中函数声明的标题
+	assistantInstructionsFunctions = "Client functions:\n"
+	// assistantHistoryRule 是转录了对话历史时的说明，依次为转录所在的位置与附件之前的说明文件
+	assistantHistoryRule = "The conversation before the first user message of this chat is transcribed at the end of %s between <conversation_history> and </conversation_history>: user turns between <user_turn> and </user_turn>, and your own earlier replies, including your function_calls blocks, between <assistant_turn> and </assistant_turn>. Attachments in it are numbered like [attachment 1] and are attached in the same order %sat the start of the first user message of this chat. Continue the conversation from the latest message and never write these tags yourself."
+	// assistantInstructionLimit 是上游不截断的自定义指令字节数，超过时上游截到 24KB 并加截断标记
+	assistantInstructionLimit = 24000
+	// assistantTurnTokenLimit 是最后一组留在 field 1 提交的本地 Token 数上限，超过时与之前的对话一起转录在自定义指令中
+	assistantTurnTokenLimit = 24576
+	// assistantLatestPrompt 是对话全部转录时提交的用户轮，%s 为转录所在的位置
+	assistantLatestPrompt = "Continue the conversation from the last turn of the conversation history at the end of %s."
+	// assistantEmptyReplyPrompt 是模型一轮结束时没有正文与函数调用后在同一 trajectory 中追加的用户轮
+	assistantEmptyReplyPrompt = "Your last turn ended without any visible reply. Continue now and give your reply."
+	// assistantCallFormat 是要求重写调用时附带的 function_calls 代码块格式与交回调用的说明
+	assistantCallFormat = assistantCallFence + "\n[{\"name\": \"<function name>\", \"arguments\": {<arguments>}}]\n```\nRight after the block, call your " + assistantQuestionTool + " tool once with the question \"" + assistantCallQuestion + "\" and write nothing more."
+	// assistantMalformedCallPrompt 是模型未写出 function_calls 代码块或代码块 JSON 无效时在同一 trajectory 中追加的用户轮
+	assistantMalformedCallPrompt = "Your last function_calls block was missing or contained invalid JSON. Output only a valid " + assistantCallFence + " fenced JSON block:\n" + assistantCallFormat
+	// assistantInvalidToolPrompt 是模型调用了被禁止的远程工作区内置工具而非客户端函数时在同一 trajectory 中追加的用户轮
+	assistantInvalidToolPrompt = "You called a forbidden remote workspace tool instead of a client function. Never call remote workspace tools. Output only a valid " + assistantCallFence + " fenced JSON block for the client function call(s):\n" + assistantCallFormat
 )
 
 // assistantWorkspaceTools 是写代码助手服务端指令声明的工作区内置工具，search_web 在最后
@@ -96,20 +131,30 @@ func assistantModelEntry(base modelEntry) modelEntry {
 			model.Methods = append(model.Methods, method)
 		}
 	}
-	// 函数调用经自定义指令与代码块转录完成，网页搜索由写代码助手内置的 search_web 完成
-	model.Capabilities = map[string]bool{"assistant_route": true, "function_declarations": true, "google_search": true}
-	for _, name := range []string{"chat_model", "thinking", "thinking_level"} {
-		if base.model.Capabilities[name] {
+	// 系统指令写入自定义指令，函数调用经自定义指令与代码块转录完成，网页搜索由写代码助手内置的 search_web 完成
+	codes := []int64{8, 10, 12}
+	for _, code := range []int64{1, 25, 52} {
+		if base.model.Capabilities["capability_code_"+strconv.FormatInt(code, 10)] {
+			codes = append(codes, code)
+		}
+	}
+	model.Capabilities = map[string]bool{"assistant_route": true}
+	for _, code := range codes {
+		model.Capabilities["capability_code_"+strconv.FormatInt(code, 10)] = true
+		if name, ok := capabilityNames[code]; ok {
 			model.Capabilities[name] = true
 		}
 	}
 	model.CapabilityOptions = nil
+	// Build 设置面板只提供 high、medium、low 与 minimal 四档思考强度
+	levels := slices.DeleteFunc(slices.Clone(base.defaults.ThinkingLevels), func(level int64) bool { return level > 4 })
+	model.ThinkingLevels = slices.DeleteFunc(model.ThinkingLevels, func(name string) bool { return name == buildThinkingLevels[5] })
 	if len(model.ThinkingLevels) > 0 {
-		model.DefaultThinkingLevel = buildThinkingLevels[closestSupportedThinkingLevel(assistantDefaultThinkingLevel, base.defaults.ThinkingLevels)]
+		model.DefaultThinkingLevel = buildThinkingLevels[closestSupportedThinkingLevel(assistantDefaultThinkingLevel, levels)]
 	}
 	return modelEntry{model: model, defaults: GenerationDefaults{
 		MaxOutputTokens: base.defaults.MaxOutputTokens, Thinking: true, ThinkingLevel: true,
-		DefaultThinkingLevel: assistantDefaultThinkingLevel, ThinkingLevels: base.defaults.ThinkingLevels,
+		DefaultThinkingLevel: assistantDefaultThinkingLevel, ThinkingLevels: levels,
 	}}
 }
 
@@ -132,26 +177,38 @@ func assistantThinkingLevel(config GenerationConfig, defaults GenerationDefaults
 		level = 1
 	case "medium":
 		level = 2
-	case "high":
+	case "high", "xhigh", "extra_high", "max":
 		level = 3
 	default:
-		return 0, fmt.Errorf("reasoning effort 必须是 none、minimal、low、medium、high、xhigh 或 max")
+		return 0, fmt.Errorf("reasoning effort 必须是 none、minimal、low、medium、high、xhigh、extra_high 或 max")
 	}
 	return closestSupportedThinkingLevel(level, defaults.ThinkingLevels), nil
 }
 
-// EncodeAssistantRequest 编码 CodeAssistantOffline：field 1 对话轮、6 模式、8 模型、9 自定义指令、12 应用、14 框架、16、19 思考配置、29 请求 ID，field 2 由 WAA proof 写入
-func EncodeAssistantRequest(request GenerateRequest, defaults GenerationDefaults, applet string, requestID string) ([]byte, error) {
+// assistantTarget 是 CodeAssistantOffline 提交到的应用与 trajectory：trajectory 为空且 fresh 为假时是新应用的第一段对话，fresh 为真时在应用中开启新 trajectory，否则续接 trajectory
+type assistantTarget struct {
+	applet     string
+	trajectory string
+	fresh      bool
+}
+
+// created 表示提交到新应用的第一段对话
+func (target assistantTarget) created() bool {
+	return target.trajectory == "" && !target.fresh
+}
+
+// EncodeAssistantRequest 编码 CodeAssistantOffline：field 1 对话轮、6 模式、8 模型、9 自定义指令、12 应用、14 框架、16、19 思考配置、21 续接的 trajectory、23 开启新 trajectory、29 请求 ID，field 2 由 WAA proof 写入；新应用的第一段对话模式为 1、框架为 [2,null,2]，其余模式为 2、框架为 [2]
+func EncodeAssistantRequest(request GenerateRequest, defaults GenerationDefaults, target assistantTarget, requestID string) ([]byte, int, error) {
 	contents, err := encodeContents(request.Contents)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if len(contents) == 0 {
-		return nil, fmt.Errorf("CodeAssistantOffline contents 不能为空")
+		return nil, 0, fmt.Errorf("CodeAssistantOffline contents 不能为空")
 	}
 	level, err := assistantThinkingLevel(request.Config, defaults)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	wire := make([]any, 29)
 	wire[0] = contents
@@ -160,37 +217,62 @@ func EncodeAssistantRequest(request GenerateRequest, defaults GenerationDefaults
 	if system := SystemText(request.System); system != "" {
 		wire[8] = system
 	}
-	wire[11] = applet
+	wire[11] = target.applet
 	wire[13] = []any{int64(2), nil, int64(2)}
+	if !target.created() {
+		wire[5] = int64(2)
+		wire[13] = []any{int64(2)}
+	}
+	if target.fresh {
+		wire[22] = int64(1)
+	} else if target.trajectory != "" {
+		wire[20] = target.trajectory
+	}
 	wire[15] = int64(1)
 	wire[18] = []any{int64(1), nil, nil, level}
 	wire[28] = requestID
-	return json.Marshal(wire)
+	return marshalWAAArray(wire, assistantProofField)
 }
 
-// assistantToolPrompt 把禁止调用内置工具的说明与函数声明写在自定义指令开头，把对话中的函数调用与函数结果改写为 function_calls 与 function_results 代码块；写代码助手只读取 user 轮，模型历史轮去掉思考后包上标记以 user 轮发送
-func assistantToolPrompt(request GenerateRequest) (GenerateRequest, error) {
+// assistantContext 返回请求的系统提示词与函数声明 JSON，tool choice 为 none 时没有函数声明
+func assistantContext(request GenerateRequest) (string, string, error) {
+	if len(request.Tools.Functions) == 0 || request.Tools.ToolConfig.Mode == "none" {
+		return SystemText(request.System), "", nil
+	}
+	declarations, err := scriptJSON(request.Tools.Functions)
+	return SystemText(request.System), declarations, err
+}
+
+// assistantContextDigest 返回请求的系统提示词与函数声明的 SHA-256 十六进制摘要
+func assistantContextDigest(request GenerateRequest) (string, error) {
+	system, declarations, err := assistantContext(request)
+	sum := sha256.Sum256([]byte(system + "\x00" + declarations))
+	return fmt.Sprintf("%x", sum), err
+}
+
+// assistantToolPrompt 改写写代码助手的一轮请求，返回是否用了说明文件：自定义指令以禁止调用内置工具的说明开头，对话中的函数调用与函数结果改写为 function_calls 与 function_results 代码块，前 transcriptEnd 轮去掉思考后转录，只提交 start 起的对话轮，全部转录时提交请模型从最后一轮继续的用户轮，start 等于 transcriptEnd 时转录中的附件按编号放在提交的第一轮开头；file 为假且自定义指令依次写入函数声明、系统提示词与转录后不超过 assistantInstructionLimit 时都写在自定义指令中，否则自定义指令只有说明与函数声明（函数声明放不下时只有说明），context 为真时的系统提示词、放不下的函数声明与转录写成一个 text/plain 说明文件，放在提交的第一轮开头、转录中的附件之前
+func assistantToolPrompt(request GenerateRequest, transcriptEnd int, start int, file bool, context bool) (GenerateRequest, bool, error) {
+	system, declarations, err := assistantContext(request)
+	if err != nil {
+		return request, false, err
+	}
 	forbidden := assistantWorkspaceTools
 	if request.Tools.GoogleSearch != nil {
 		forbidden = forbidden[:len(forbidden)-1]
+	}
+	if declarations != "" {
+		forbidden = slices.DeleteFunc(slices.Clone(forbidden), func(name string) bool { return name == assistantQuestionTool })
 	}
 	prompt := fmt.Sprintf(assistantWorkspaceRule, strings.Join(forbidden, ", "))
 	if request.Tools.GoogleSearch != nil {
 		prompt += assistantSearchRule
 	}
-	if len(request.Tools.Functions) > 0 && request.Tools.ToolConfig.Mode != "none" {
-		declarations, err := scriptJSON(request.Tools.Functions)
-		if err != nil {
-			return request, err
-		}
-		prompt += "\n\n" + fmt.Sprintf(assistantToolProtocol, declarations)
-	}
-	contents := make([]Content, 0, len(request.Contents))
+	turns := make([][]Part, 0, len(request.Contents))
 	var pending []FunctionCall
 	for index, content := range request.Contents {
 		linked, err := linkFunctionResults(content, &pending)
 		if err != nil {
-			return request, fmt.Errorf("contents[%d]: %w", index, err)
+			return request, false, fmt.Errorf("contents[%d]: %w", index, err)
 		}
 		parts := make([]Part, 0, len(linked.Parts))
 		fence := ""
@@ -217,7 +299,7 @@ func assistantToolPrompt(request GenerateRequest) (GenerateRequest, error) {
 			}
 			if next != fence {
 				if err := flush(); err != nil {
-					return request, err
+					return request, false, err
 				}
 				fence = next
 			}
@@ -228,54 +310,221 @@ func assistantToolPrompt(request GenerateRequest) (GenerateRequest, error) {
 			block = append(block, entry)
 		}
 		if err := flush(); err != nil {
-			return request, err
+			return request, false, err
 		}
-		if linked.Role == RoleAssistant {
-			parts = assistantTurn(parts)
-			if !strings.Contains(prompt, assistantHistoryRule) {
-				prompt += "\n\n" + assistantHistoryRule
-			}
+		turns = append(turns, parts)
+	}
+	var transcript string
+	var attachments []Part
+	if transcriptEnd > 0 {
+		transcript, attachments = assistantTranscript(request.Contents[:transcriptEnd], turns)
+	}
+	tools := ""
+	if declarations != "" {
+		tools = "\n\n" + fmt.Sprintf(assistantToolProtocol, declarations)
+	}
+	instructions := prompt + tools
+	if transcriptEnd > 0 {
+		instructions += "\n\n" + fmt.Sprintf(assistantHistoryRule, "these instructions", "")
+	}
+	if system != "" {
+		instructions += "\n\n" + system
+	}
+	if transcriptEnd > 0 {
+		instructions += "\n\n" + transcript
+	}
+	file = file || len(instructions) > assistantInstructionLimit
+	latest := "your instructions"
+	var sections []string
+	if file {
+		instructions = prompt + tools + "\n\n" + assistantInstructionsRule
+		filed := len(instructions) > assistantInstructionLimit
+		if filed {
+			instructions = prompt + "\n\n" + assistantFileToolProtocol + "\n\n" + assistantInstructionsRule
 		}
+		if context && system != "" {
+			sections = append(sections, assistantInstructionsSystem+system)
+		}
+		if context && filed {
+			sections = append(sections, assistantInstructionsFunctions+declarations)
+		}
+		if transcriptEnd > 0 {
+			sections = append(sections, fmt.Sprintf(assistantHistoryRule, "this file", "after this file "), transcript)
+		}
+		latest = "the instructions file"
+	}
+	request.System = []string{instructions}
+	contents := make([]Content, 0, len(turns)-start+1)
+	for _, parts := range turns[start:] {
 		contents = append(contents, Content{Role: RoleUser, Parts: parts})
 	}
-	if len(request.System) > 0 {
-		prompt += "\n\n"
+	if len(contents) == 0 {
+		contents = append(contents, Content{Role: RoleUser, Parts: []Part{{Text: fmt.Sprintf(assistantLatestPrompt, latest)}}})
 	}
-	request.System = append([]string{prompt}, request.System...)
+	if start == transcriptEnd && len(attachments) > 0 {
+		contents[0].Parts = append(attachments, contents[0].Parts...)
+	}
+	if len(sections) > 0 {
+		instructionsFile := Part{InlineData: &Blob{MIME: "text/plain", Data: []byte(strings.Join(sections, "\n\n"))}}
+		contents[0].Parts = append([]Part{instructionsFile}, contents[0].Parts...)
+	}
 	request.Contents = contents
-	return request, nil
+	return request, file, nil
 }
 
-// assistantTurn 去掉模型历史轮的思考与空 Part，首尾加上模型轮标记
-func assistantTurn(parts []Part) []Part {
-	turn := []Part{{Text: assistantTurnOpen}}
-	for _, part := range parts {
-		if part.Thought || !part.payload() {
-			continue
+// assistantTranscript 返回 contents 转录成的对话历史与其中的附件：各轮取 turns 中同一位置改写后的 Part，去掉思考与空 Part，附件写为编号，附件依次以编号文本 Part 与附件 Part 返回
+func assistantTranscript(contents []Content, turns [][]Part) (string, []Part) {
+	var transcript strings.Builder
+	var attachments []Part
+	transcript.WriteString(assistantHistoryOpen)
+	for index, content := range contents {
+		tag := "user_turn"
+		if content.Role == RoleAssistant {
+			tag = "assistant_turn"
 		}
-		turn = append(turn, part)
+		var texts []string
+		for _, part := range turns[index] {
+			switch {
+			case part.Thought || !part.payload():
+			case part.textOnly():
+				texts = append(texts, part.Text)
+			default:
+				label := fmt.Sprintf(assistantAttachmentLabel, len(attachments)/2+1)
+				attachments = append(attachments, Part{Text: label}, part)
+				texts = append(texts, label)
+			}
+		}
+		fmt.Fprintf(&transcript, assistantHistoryTurn, tag, strings.Join(texts, "\n"), tag)
 	}
-	return append(turn, Part{Text: assistantTurnClose})
+	transcript.WriteString(assistantHistoryClose)
+	return transcript.String(), attachments
 }
 
-// scriptJSON 按页面脚本 JSON.stringify 的形式编码，保留 HTML 字符原样、不带结尾换行
-func scriptJSON(value any) (string, error) {
-	var buffer strings.Builder
-	encoder := json.NewEncoder(&buffer)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(value); err != nil {
-		return "", err
-	}
-	return strings.TrimSuffix(buffer.String(), "\n"), nil
+// assistantTurn 是一轮写代码助手请求提交的目标与改写后的请求
+type assistantTurn struct {
+	request GenerateRequest
+	target  assistantTarget
+	// previous 是续接的 trajectory 在本轮之前的续接位置，开启新 trajectory 时为空
+	previous string
+	// historyGroups 是 trajectory 转录在自定义指令中的开头分组数
+	historyGroups int
+	// context 是 trajectory 中最近一个说明文件的系统提示词与函数声明摘要，trajectory 没有说明文件时为空
+	context string
 }
 
-// sendAssistant 新建临时应用并提交 Build 写代码助手生成任务，返回任务流；流关闭后取消未完成的任务并删除应用
+// assistantLatest 表示最后一组也要转录在说明文件中：最后一组是模型轮，或本地 Token 数超过 assistantTurnTokenLimit
+func assistantLatest(contents []Content, links []turnLink) bool {
+	count := len(links)
+	if count == 0 {
+		return false
+	}
+	tail := 0
+	if count > 1 {
+		tail = links[count-2].end
+	}
+	var parts []Part
+	for _, content := range contents[tail:] {
+		parts = append(parts, content.Parts...)
+	}
+	return links[count-1].model || localPartsTokens(parts) > assistantTurnTokenLimit
+}
+
+// planAssistantTurn 按续接的 trajectory 改写请求，返回本轮之后 trajectory 转录在自定义指令中的开头分组数与说明文件摘要：续接没有说明文件的 trajectory 时沿用开启时转录的开头分组，续接有说明文件的 trajectory 时只在系统提示词或函数声明改变时提交新的说明文件；开启新 trajectory 时最后一组之前的对话转录，最后一组也要转录时全部转录；用了说明文件时转录随说明文件存入 trajectory，开头分组数为 0
+func planAssistantTurn(request GenerateRequest, links []turnLink, trajectory *assistantTrajectory, start int) (GenerateRequest, int, string, error) {
+	context, err := assistantContextDigest(request)
+	if err != nil {
+		return request, 0, "", err
+	}
+	groups := 0
+	switch {
+	case trajectory != nil:
+		groups = trajectory.HistoryGroups
+	case assistantLatest(request.Contents, links):
+		groups = len(links)
+		start = len(request.Contents)
+	case len(links) > 1:
+		groups = len(links) - 1
+		start = links[groups-1].end
+	}
+	transcribed := 0
+	if groups > 0 {
+		transcribed = links[groups-1].end
+	}
+	filed := trajectory != nil && trajectory.Context != ""
+	prepared, file, err := assistantToolPrompt(request, transcribed, start, filed, !filed || trajectory.Context != context)
+	if !file {
+		return prepared, groups, "", err
+	}
+	return prepared, 0, context, err
+}
+
+// assistantPromptText 返回提交轮次中的正文，以换行连接，作为新建应用的首条提示
+func assistantPromptText(contents []Content) string {
+	var texts []string
+	for _, content := range contents {
+		for _, part := range content.Parts {
+			if part.Text != "" && !part.Thought {
+				texts = append(texts, part.Text)
+			}
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+// prepareAssistantTurn 决定本轮提交到的 trajectory 并改写请求：对话续接得上账户应用中保存的 trajectory 时只提交续接位置之后的轮次，否则在应用中开启新 trajectory，账户没有应用或应用已被删除时照官网新建应用；附件与说明文件的上传和新建应用、开启新 trajectory 的请求同时进行
+func (c *Client) prepareAssistantTurn(ctx context.Context, lease *AccountLease, request GenerateRequest, links []turnLink, apiKey string) (assistantTurn, error) {
+	applet := lease.assistantAppletID()
+	if applet != "" {
+		if _, err := c.openAssistantApplet(ctx, lease, applet, request.Model); errors.Is(err, errAssistantAppletGone) {
+			applet = ""
+		} else if err != nil {
+			return assistantTurn{}, err
+		}
+	}
+	var trajectory *assistantTrajectory
+	start := 0
+	if applet != "" && !assistantLatest(request.Contents, links) {
+		trajectory, start = lease.findAssistantTrajectory(apiKey, links)
+	}
+	prepared, groups, context, err := planAssistantTurn(request, links, trajectory, start)
+	if err != nil {
+		return assistantTurn{}, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	turn := assistantTurn{historyGroups: groups, context: context}
+	contents := prepared.Contents
+	var uploaded sync.WaitGroup
+	var uploadErr error
+	uploaded.Go(func() { prepared.Contents, uploadErr = c.uploadAssistantAttachments(ctx, request.AccountID, contents) })
+	switch {
+	case applet == "":
+		applet, err = c.createAssistantApplet(ctx, lease, request.Model, assistantPromptText(contents))
+		turn.target = assistantTarget{applet: applet}
+	case trajectory != nil:
+		turn.target = assistantTarget{applet: applet, trajectory: trajectory.ID}
+		turn.previous = trajectory.Tip
+	default:
+		c.startAssistantTrajectory(ctx, request.AccountID, applet)
+		turn.target = assistantTarget{applet: applet, fresh: true}
+	}
+	uploaded.Wait()
+	if err = cmp.Or(err, uploadErr); err != nil {
+		return assistantTurn{}, err
+	}
+	turn.request = prepared
+	return turn, nil
+}
+
+// sendAssistant 在账户的 Build 应用中提交本轮并返回任务流：续接得上已保存的 trajectory 时只提交新增轮次，否则开启新 trajectory；CodeAssistantOffline 以 404 报告应用不存在时新建应用重新提交一次。本轮结束时没有任何回复、调用块写坏或调用了被禁止的工作区工具，且客户端尚未收到正文与函数调用的，在同一 trajectory 中追加用户轮请模型重答；回复完整结束时保存 trajectory 的续接位置并发送伴随请求，否则取消未完成的任务并放弃续接位置
 func (c *Client) sendAssistant(ctx context.Context, request GenerateRequest, entry modelEntry) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
 	reason := ""
 	if request.Unary {
 		reason = "Build 写代码助手使用服务端流，收集完成后返回"
 	}
-	reportUpstreamMode(ctx, assistantOfflineMethod, "stream", reason)
+	reportUpstreamMode(ctx, assistantOfflineMethod, "stream", 0, reason)
+	lease, ok := AccountLeaseFromContext(ctx)
+	if !ok {
+		return nil, nil, fmt.Errorf("Build 写代码助手请求缺少账户租约")
+	}
 	var functions []string
 	if request.Tools.ToolConfig.Mode != "none" {
 		for _, function := range request.Tools.Functions {
@@ -283,65 +532,172 @@ func (c *Client) sendAssistant(ctx context.Context, request GenerateRequest, ent
 		}
 	}
 	apiKey, _ := ctx.Value(apiKeyContextKey{}).(string)
-	history := assistantHistoryDigest(request.Contents)
+	historyDigest := assistantHistoryDigest(request.Contents)
+	links := turnLinks(request.Contents)
 	request.Contents = assistantSearches.restore(apiKey, request.Contents)
-	request, err := assistantToolPrompt(request)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	cleanup := &assistantCleanup{client: c, ctx: context.WithoutCancel(ctx), lease: lease, release: lease.Retain()}
+	var streamBody []byte
+	var stream *RPCResponse
+	for recreated := false; ; recreated = true {
+		turn, err := c.prepareAssistantTurn(ctx, lease, request, links, apiKey)
+		if err != nil {
+			cleanup.run()
+			return nil, nil, err
+		}
+		cleanup.turn = turn
+		var generation assistantGeneration
+		generation, streamBody, stream, err = c.openAssistantGeneration(ctx, turn.request, entry, turn.target)
+		cleanup.generation.Store(&generation)
+		var failure *RPCError
+		if err != nil && !recreated && generation.task == "" && !turn.target.created() && errors.As(err, &failure) && failure.StatusCode == http.StatusNotFound {
+			// 应用或 trajectory 已不存在：重新打开应用，应用已删除时新建，续接的 trajectory 不再续接
+			c.assistants.forget(request.AccountID)
+			if turn.previous == "" {
+				continue
+			}
+			if err = lease.dropAssistantTrajectory(turn.previous); err == nil {
+				continue
+			}
+		}
+		if err != nil {
+			cleanup.run()
+			return nil, nil, err
+		}
+		break
 	}
-	contents, err := c.uploadAssistantAttachments(ctx, request.AccountID, request.Contents)
-	if err != nil {
-		return nil, nil, err
+	turn := cleanup.turn
+	if turn.target.created() {
+		release := lease.Retain()
+		go func() {
+			defer func() {
+				if err := release(); err != nil {
+					slog.Warn("账户租约释放失败", "account", request.AccountID, "error", err)
+				}
+			}()
+			c.afterAssistantCreated(cleanup.ctx, request.AccountID, turn.target.applet)
+		}()
 	}
-	request.Contents = contents
-	applet, err := c.createAssistantApplet(ctx, request.AccountID)
+	stream.Body = &assistantStreamBody{ReadCloser: stream.Body, cleanup: cleanup}
+	return stream, func(source io.Reader, emit func(Event) error) error {
+		newDecoder := func(streamBody []byte) *AssistantStreamDecoder {
+			return &AssistantStreamDecoder{Functions: functions, Reopen: func() (io.ReadCloser, error) {
+				reopened, err := c.do(ctx, assistantStreamMethod, request.AccountID, request.ID, streamBody, true)
+				if err != nil {
+					return nil, err
+				}
+				return reopened.Body, nil
+			}}
+		}
+		var answer strings.Builder
+		var reply []Part
+		var usage *Usage
+		var finish *Event
+		record := func(event Event) error {
+			switch event.Kind {
+			case EventText:
+				answer.WriteString(event.Text)
+				reply = append(reply, Part{Text: event.Text})
+			case EventToolCall:
+				reply = append(reply, Part{FunctionCall: event.FunctionCall})
+			case EventUsage:
+				if usage != nil {
+					merged := mergeContinuedUsage(*usage, *event.Usage)
+					event.Usage = &merged
+				}
+				usage = event.Usage
+			case EventFinish:
+				value := event
+				finish = &value
+				return nil
+			}
+			return emit(event)
+		}
+		decoder := newDecoder(streamBody)
+		err := DecodeAssistantStream(source, decoder, record)
+		// searches 是之前各任务完成的 search_web
+		var searches []string
+		for followed := 0; followed < regenerations && err == nil && len(reply) == 0 && (decoder.malformed || decoder.invalidTool || !decoder.stopped); followed++ {
+			prompt := assistantEmptyReplyPrompt
+			switch {
+			case decoder.malformed:
+				prompt = assistantMalformedCallPrompt
+			case decoder.invalidTool:
+				prompt = assistantInvalidToolPrompt
+				// 任务在被禁止的工作区工具处截断时上游仍在运行，追加用户轮之前取消
+				if err = cleanup.cancel(ctx); err != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+			searches = append(searches, decoder.searches...)
+			followUp := turn.request
+			followUp.Contents = []Content{{Role: RoleUser, Parts: []Part{{Text: prompt}}}}
+			current := cleanup.generation.Load()
+			next, nextBody, follow, openErr := c.openAssistantGeneration(ctx, followUp, entry, assistantTarget{applet: turn.target.applet, trajectory: current.trajectory})
+			cleanup.generation.Store(&next)
+			decoder = newDecoder(nextBody)
+			if err = openErr; err != nil {
+				break
+			}
+			err = errors.Join(DecodeAssistantStream(follow.Body, decoder, record), follow.Body.Close())
+		}
+		cleanup.completed.Store(decoder.failed || err == nil && decoder.finished && !decoder.stopped)
+		if err != nil {
+			return err
+		}
+		assistantSearches.store(apiKey, historyDigest, answer.String(), append(searches, decoder.searches...))
+		if decoder.finished && !decoder.stopped && !decoder.malformed && !decoder.invalidTool {
+			cleanup.record.Store(&assistantTrajectory{
+				Tip: assistantTip(apiKey, turnLinkDigest(links[len(links)-1].digest, true, reply)), ID: cleanup.generation.Load().trajectory, HistoryGroups: turn.historyGroups, Context: turn.context,
+			})
+			history := append(slices.Clone(request.Contents), Content{Role: RoleAssistant, Parts: []Part{{Text: answer.String()}}})
+			cleanup.history.Store(&history)
+		}
+		if !decoder.called && (decoder.malformed || decoder.invalidTool) {
+			if finish == nil {
+				finish = &Event{Kind: EventFinish}
+			}
+			finish.FinishReason = decodeFinishReason(10)
+		}
+		if finish != nil {
+			return emit(*finish)
+		}
+		return nil
+	}, nil
+}
+
+// assistantGeneration 是 CodeAssistantOffline 返回的任务与所在 trajectory
+type assistantGeneration struct {
+	task       string
+	trajectory string
+}
+
+// openAssistantGeneration 把请求的对话轮提交到 target 并打开任务流，返回任务、任务流请求正文与任务流；任务流请求的第 4 项为应用 ID
+func (c *Client) openAssistantGeneration(ctx context.Context, request GenerateRequest, entry modelEntry, target assistantTarget) (assistantGeneration, []byte, *RPCResponse, error) {
+	body, proofAt, err := EncodeAssistantRequest(request, entry.defaults, target, strings.ToUpper(uuid.NewString()))
 	if err != nil {
-		return nil, nil, err
-	}
-	cleanup := &assistantCleanup{client: c, accountID: request.AccountID, applet: applet}
-	body, err := EncodeAssistantRequest(request, entry.defaults, applet, strings.ToUpper(uuid.NewString()))
-	if err != nil {
-		cleanup.run()
-		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+		return assistantGeneration{}, nil, nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 	rpc := newRPCRequest(assistantOfflineMethod, request.AccountID, request.ID, body, false)
+	rpc.ProofAt = proofAt
 	c.applyBenefitTier(rpc.Method, request.AccountID, rpc.Header)
 	response, err := c.protected.DoProtected(ctx, request, rpc)
 	if err == nil {
 		response, err = validateRPCResponse(assistantOfflineMethod, response)
 	}
 	if err != nil {
-		cleanup.run()
-		return nil, nil, fmt.Errorf("发送 AI Studio %s: %w", assistantOfflineMethod, err)
+		return assistantGeneration{}, nil, nil, fmt.Errorf("发送 AI Studio %s: %w", assistantOfflineMethod, err)
 	}
-	cleanup.generation, err = decodeAssistantGeneration(response.Body)
+	generation, err := decodeAssistantGeneration(response.Body)
 	response.Body.Close()
 	if err != nil {
-		cleanup.run()
-		return nil, nil, err
+		return assistantGeneration{}, nil, nil, err
 	}
-	streamBody, _ := json.Marshal([]any{cleanup.generation, nil, nil, applet})
+	streamBody, _ := json.Marshal([]any{generation.task, nil, nil, target.applet})
 	stream, err := c.do(ctx, assistantStreamMethod, request.AccountID, request.ID, streamBody, true)
-	if err != nil {
-		cleanup.run()
-		return nil, nil, err
-	}
-	stream.Body = &assistantStreamBody{ReadCloser: stream.Body, cleanup: cleanup}
-	return stream, func(source io.Reader, emit func(Event) error) error {
-		decoder := &AssistantStreamDecoder{Functions: functions}
-		var answer strings.Builder
-		err := DecodeAssistantStream(source, decoder, func(event Event) error {
-			if event.Kind == EventText {
-				answer.WriteString(event.Text)
-			}
-			return emit(event)
-		})
-		if err == nil {
-			cleanup.completed.Store(!decoder.overran)
-			assistantSearches.store(apiKey, history, answer.String(), decoder.searches)
-		}
-		return err
-	}, nil
+	return generation, streamBody, stream, err
 }
 
 // assistantSearches 是本进程写代码助手回复的 search_web 结果
@@ -366,7 +722,7 @@ func assistantHistoryDigest(contents []Content) string {
 			}
 			part.ThoughtSignature = ""
 			if part.InlineData != nil {
-				sum := sha256.Sum256(part.InlineData.Data)
+				sum := part.InlineData.SHA256()
 				part.InlineData = &Blob{MIME: part.InlineData.MIME, Data: sum[:]}
 			}
 			encoded, _ := json.Marshal(part)
@@ -459,79 +815,104 @@ func (c *Client) uploadAssistantAttachments(ctx context.Context, accountID strin
 	return rewritten, nil
 }
 
-// createAssistantApplet 新建承载一次写代码助手对话的应用
-func (c *Client) createAssistantApplet(ctx context.Context, accountID string) (string, error) {
-	body, _ := json.Marshal([]any{nil, []any{"Untitled", "Generated by Gemini.", nil, nil, "default"}, nil, nil, int64(1)})
-	response, err := c.do(ctx, "CreateApplet", accountID, "", body, false)
-	if err != nil {
-		return "", err
-	}
-	defer response.Body.Close()
-	raw, err := io.ReadAll(response.Body)
-	if err != nil {
-		return "", fmt.Errorf("读取 AI Studio CreateApplet: %w", err)
-	}
-	values, err := rawArray(raw, "$", raw)
-	if err != nil {
-		return "", withMethod(err, "CreateApplet")
-	}
-	applet, err := rawString(rawAt(values, 0), "$[0]", raw)
-	if err != nil || applet == "" {
-		return "", &ProtocolEvidenceError{Method: "CreateApplet", Path: "$[0]", Detail: "缺少应用 ID", Raw: cloneRaw(raw)}
-	}
-	return applet, nil
-}
-
-// decodeAssistantGeneration 读取 CodeAssistantOffline 响应 [任务 ID, 应用 ID] 中的任务 ID
-func decodeAssistantGeneration(source io.Reader) (string, error) {
+// decodeAssistantGeneration 读取 CodeAssistantOffline 响应 [任务 ID, trajectory ID]
+func decodeAssistantGeneration(source io.Reader) (assistantGeneration, error) {
 	raw, err := io.ReadAll(source)
 	if err != nil {
-		return "", fmt.Errorf("读取 AI Studio %s: %w", assistantOfflineMethod, err)
+		return assistantGeneration{}, fmt.Errorf("读取 AI Studio %s: %w", assistantOfflineMethod, err)
 	}
 	values, err := rawArray(raw, "$", raw)
 	if err != nil {
-		return "", withMethod(err, assistantOfflineMethod)
+		return assistantGeneration{}, withMethod(err, assistantOfflineMethod)
 	}
-	generation, err := rawString(rawAt(values, 0), "$[0]", raw)
-	if err != nil || generation == "" {
-		return "", &ProtocolEvidenceError{Method: assistantOfflineMethod, Path: "$[0]", Detail: "缺少任务 ID", Raw: cloneRaw(raw)}
+	task, err := rawString(rawAt(values, 0), "$[0]", raw)
+	if err != nil || task == "" {
+		return assistantGeneration{}, &ProtocolEvidenceError{Method: assistantOfflineMethod, Path: "$[0]", Detail: "缺少任务 ID", Raw: cloneRaw(raw)}
 	}
-	return generation, nil
+	trajectory, err := rawString(rawAt(values, 1), "$[1]", raw)
+	if err != nil || trajectory == "" {
+		return assistantGeneration{}, &ProtocolEvidenceError{Method: assistantOfflineMethod, Path: "$[1]", Detail: "缺少 trajectory ID", Raw: cloneRaw(raw)}
+	}
+	return assistantGeneration{task: task, trajectory: trajectory}, nil
 }
 
-// assistantCleanup 在请求结束后取消未完成的生成任务并删除临时应用
+// assistantCleanup 在任务流关闭后按本轮是否完整结束保存或放弃 trajectory 的续接位置，取消未完成的任务或发送回复后的伴随请求，完成后归还请求开始时保留的账户租约
 type assistantCleanup struct {
-	client     *Client
-	accountID  string
-	applet     string
-	generation string
+	client *Client
+	// ctx 是不随请求取消、带有账户租约的请求上下文
+	ctx   context.Context
+	lease *AccountLease
+	turn  assistantTurn
+	// generation 是 trajectory 中最近提交的任务
+	generation atomic.Pointer[assistantGeneration]
 	completed  atomic.Bool
-	once       sync.Once
+	// record 是本轮回复完整结束后 trajectory 的续接位置
+	record atomic.Pointer[assistantTrajectory]
+	// history 是本轮回复完整结束后包含回复的对话
+	history atomic.Pointer[[]Content]
+	release func() error
+	once    sync.Once
 }
 
-// run 在后台以独立期限执行一次清理
-func (cleanup *assistantCleanup) run() {
-	cleanup.once.Do(func() {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), assistantCleanupTimeout)
-			defer cancel()
-			if cleanup.generation != "" && !cleanup.completed.Load() {
-				cleanup.call(ctx, "CancelCodeAssistantOfflineGeneration", []any{cleanup.generation, cleanup.applet})
-			}
-			cleanup.call(ctx, "DeleteApplet", []any{cleanup.applet})
-		}()
-	})
-}
-
-func (cleanup *assistantCleanup) call(ctx context.Context, method string, value []any) {
-	body, _ := json.Marshal(value)
-	response, err := cleanup.client.do(ctx, method, cleanup.accountID, "", body, false)
+// cancel 取消 trajectory 中最近提交的任务，正文为 [任务 ID, 应用 ID]；任务已在上游结束时上游返回 FAILED_PRECONDITION，同样视为已停止
+func (cleanup *assistantCleanup) cancel(ctx context.Context) error {
+	body, _ := json.Marshal([]any{cleanup.generation.Load().task, cleanup.turn.target.applet})
+	response, err := cleanup.client.do(ctx, "CancelCodeAssistantOfflineGeneration", cleanup.lease.Account().ID, "", body, false)
 	if err == nil {
 		_, err = io.Copy(io.Discard, response.Body)
 		err = errors.Join(err, response.Body.Close())
 	}
-	if err != nil {
-		slog.Warn("Build 写代码助手清理失败", "account", cleanup.accountID, "method", method, "applet", cleanup.applet, "error", err)
+	if failure := (*RPCError)(nil); errors.As(err, &failure) && failure.Code == 9 {
+		return nil
+	}
+	return err
+}
+
+// run 执行一次清理：保存或放弃续接位置，未完成的任务与回复后的伴随请求在后台以独立期限发送，之后归还租约；只剩伴随请求时账户立即可接其他 -build 请求
+func (cleanup *assistantCleanup) run() {
+	cleanup.once.Do(func() {
+		accountID := cleanup.lease.Account().ID
+		generation := cleanup.generation.Load()
+		started := generation != nil && generation.task != ""
+		record := cleanup.record.Load()
+		var err error
+		switch {
+		case record != nil:
+			err = cleanup.lease.storeAssistantTrajectory(cleanup.turn.target.applet, *record)
+		case started && cleanup.turn.previous != "":
+			err = cleanup.lease.dropAssistantTrajectory(cleanup.turn.previous)
+		}
+		if err != nil {
+			slog.Warn("保存 Build 写代码助手续接位置失败", "account", accountID, "error", err)
+		}
+		cancel := started && !cleanup.completed.Load()
+		if record == nil && !cancel {
+			cleanup.finish()
+			return
+		}
+		if !cancel {
+			cleanup.lease.finishAssistantGeneration()
+		}
+		go func() {
+			defer cleanup.finish()
+			ctx, stop := context.WithTimeout(cleanup.ctx, assistantCleanupTimeout)
+			defer stop()
+			if !cancel {
+				defer afterServiceStop(ctx, stop)()
+				cleanup.client.afterAssistantTurn(ctx, accountID, cleanup.turn.request.Model, cleanup.turn.target, *cleanup.history.Load())
+				return
+			}
+			if err := cleanup.cancel(ctx); err != nil {
+				slog.Warn("Build 写代码助手取消任务失败", "account", accountID, "method", "CancelCodeAssistantOfflineGeneration", "applet", cleanup.turn.target.applet, "error", err)
+			}
+		}()
+	})
+}
+
+// finish 归还请求开始时保留的账户租约
+func (cleanup *assistantCleanup) finish() {
+	if err := cleanup.release(); err != nil {
+		slog.Warn("账户租约释放失败", "account", cleanup.lease.Account().ID, "error", err)
 	}
 }
 
@@ -541,497 +922,9 @@ type assistantStreamBody struct {
 	cleanup *assistantCleanup
 }
 
-// Close 关闭任务流并清理临时应用
+// Close 关闭任务流并清理
 func (body *assistantStreamBody) Close() error {
 	err := body.ReadCloser.Close()
 	body.cleanup.run()
 	return err
-}
-
-// AssistantStreamDecoder 把写代码助手的步骤快照解码为增量事件
-type AssistantStreamDecoder struct {
-	// Functions 是请求声明的函数名，不为空时正文中的调用代码块解码为函数调用
-	Functions []string
-	emitted   map[int64][]string
-	usage     map[int64]Usage
-	searched  map[int64]bool
-	grounding *GroundingMetadata
-	// searches 是已完成的 search_web 的查询与摘要，供下一轮补回对话历史
-	searches []string
-	// held 是扣下的正文：可能的代码块围栏开头，或尚未结束的调用候选代码块
-	held string
-	// block 表示 held 以调用候选代码块开头，other 表示正处在其他代码块内
-	block bool
-	other bool
-	// called 表示已输出函数调用，malformed 表示 function_calls 代码块无法解码
-	called    bool
-	malformed bool
-	lastStep  int64
-	wroteText bool
-	finished  bool
-	// answered 表示最近解码的步骤是已完成、含正文且没有工具动作的模型步骤，即本轮回复结束
-	answered bool
-	// overran 表示函数调用之后模型继续输出正文，本轮回复在调用处结束
-	overran bool
-}
-
-// DecodeAssistantStream 解码 StreamCodeAssistantOfflineGeneration 响应：field 1 为消息列表，其后可带 google.rpc 状态；本轮回复结束或函数调用之后模型继续输出正文时不再读取上游
-func DecodeAssistantStream(source io.Reader, decoder *AssistantStreamDecoder, emit func(Event) error) error {
-	reader := &streamReadRecorder{source: source}
-	stream := json.NewDecoder(newSparseJSONReader(reader))
-	stream.UseNumber()
-	index := 0
-	fail := func(path string, detail string) error {
-		return reader.failure(assistantStreamMethod, index, &ProtocolEvidenceError{Method: assistantStreamMethod, Path: path, Detail: detail})
-	}
-	if token, err := stream.Token(); err != nil || token != json.Delim('[') {
-		return fail("$", "根值不是数组")
-	}
-	if !stream.More() {
-		return fail("$", "根数组缺少消息列表")
-	}
-	if token, err := stream.Token(); err != nil || token != json.Delim('[') {
-		return fail("$[0]", "消息列表不是数组")
-	}
-	for ; !decoder.answered && !decoder.overran && stream.More(); index++ {
-		var raw json.RawMessage
-		if err := stream.Decode(&raw); err != nil {
-			return fail(fmt.Sprintf("$[0][%d]", index), err.Error())
-		}
-		events, err := decoder.Decode(raw, fmt.Sprintf("$[0][%d]", index))
-		if err != nil {
-			return err
-		}
-		for _, event := range events {
-			if err := emit(event); err != nil {
-				return err
-			}
-		}
-	}
-	if !decoder.answered && !decoder.overran {
-		if token, err := stream.Token(); err != nil || token != json.Delim(']') {
-			return fail("$[0]", "消息列表没有正常结束")
-		}
-		for stream.More() {
-			var raw json.RawMessage
-			if err := stream.Decode(&raw); err != nil {
-				return fail("$", err.Error())
-			}
-			if err := trailerError(assistantStreamMethod, raw); err != nil {
-				return err
-			}
-		}
-	}
-	if err := reader.failure(assistantStreamMethod, index, nil); err != nil {
-		return err
-	}
-	events, err := decoder.End()
-	if err != nil {
-		return err
-	}
-	for _, event := range events {
-		if err := emit(event); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// Decode 解码一条消息 [null, null, [步骤...], 应用 ID]：步骤 field 1 为对话轮、6 为失败原因、10 为工具动作、12 为序号、13 为状态（1 完成、2 进行中、4 失败）、16 为用量
-func (d *AssistantStreamDecoder) Decode(raw json.RawMessage, path string) ([]Event, error) {
-	if d.emitted == nil {
-		d.emitted = make(map[int64][]string)
-		d.usage = make(map[int64]Usage)
-		d.searched = make(map[int64]bool)
-	}
-	message, err := rawArray(raw, path, raw)
-	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
-	}
-	stepsRaw := rawAt(message, 2)
-	if isJSONNull(stepsRaw) {
-		return nil, nil
-	}
-	steps, err := rawArray(stepsRaw, path+"[2]", raw)
-	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
-	}
-	var events []Event
-	for stepIndex, stepRaw := range steps {
-		stepPath := fmt.Sprintf("%s[2][%d]", path, stepIndex)
-		stepEvents, err := d.decodeStep(stepRaw, stepPath, raw)
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, stepEvents...)
-	}
-	return events, nil
-}
-
-func (d *AssistantStreamDecoder) decodeStep(raw json.RawMessage, path string, evidence json.RawMessage) ([]Event, error) {
-	d.answered = false
-	step, err := rawArray(raw, path, evidence)
-	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
-	}
-	number, err := rawInt64(rawAt(step, 11), path+"[11]", evidence)
-	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
-	}
-	status, err := rawInt64(rawAt(step, 12), path+"[12]", evidence)
-	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
-	}
-	if failure := rawAt(step, 5); !isJSONNull(failure) {
-		values, err := rawArray(failure, path+"[5]", evidence)
-		if err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
-		}
-		message, err := rawString(rawAt(values, 0), path+"[5][0]", evidence)
-		if err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
-		}
-		return nil, &RPCError{Method: assistantStreamMethod, StatusCode: http.StatusBadGateway, Message: "生成步骤失败: " + message}
-	}
-	if usageRaw := rawAt(step, 15); !isJSONNull(usageRaw) && status == 1 {
-		usage, err := decodeAssistantUsage(usageRaw, path+"[15]", evidence)
-		if err != nil {
-			return nil, err
-		}
-		d.usage[number] = usage
-	}
-	if actionRaw := rawAt(step, 9); !isJSONNull(actionRaw) && status == 1 && !d.searched[number] {
-		if err := d.decodeSearch(actionRaw, path+"[9]", evidence); err != nil {
-			return nil, err
-		}
-		d.searched[number] = true
-	}
-	contentsRaw := rawAt(step, 0)
-	if isJSONNull(contentsRaw) {
-		return nil, nil
-	}
-	contents, err := rawArray(contentsRaw, path+"[0]", evidence)
-	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
-	}
-	var events []Event
-	partOffset := 0
-	for contentIndex, contentRaw := range contents {
-		contentPath := fmt.Sprintf("%s[0][%d]", path, contentIndex)
-		content, err := rawArray(contentRaw, contentPath, evidence)
-		if err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
-		}
-		role, err := rawString(rawAt(content, 1), contentPath+"[1]", evidence)
-		if err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
-		}
-		if role != "model" {
-			continue
-		}
-		parts, err := rawArray(rawAt(content, 0), contentPath+"[0]", evidence)
-		if err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
-		}
-		for partIndex, partRaw := range parts {
-			partEvents, err := d.decodePart(number, partOffset+partIndex, partRaw, fmt.Sprintf("%s[0][%d]", contentPath, partIndex), evidence)
-			if err != nil {
-				return nil, err
-			}
-			events = append(events, partEvents...)
-		}
-		partOffset += len(parts)
-		if status == 1 {
-			d.finished = true
-		}
-	}
-	d.answered = status == 1 && isJSONNull(rawAt(step, 9)) && d.wroteText && d.lastStep == number
-	return events, nil
-}
-
-// decodePart 返回模型 part 文本相对上一次快照新增的部分
-func (d *AssistantStreamDecoder) decodePart(step int64, index int, raw json.RawMessage, path string, evidence json.RawMessage) ([]Event, error) {
-	part, err := rawArray(raw, path, evidence)
-	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
-	}
-	textRaw := rawAt(part, 1)
-	if isJSONNull(textRaw) {
-		return nil, nil
-	}
-	text, err := rawString(textRaw, path+"[1]", evidence)
-	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
-	}
-	thought := false
-	if thoughtRaw := rawAt(part, 12); !isJSONNull(thoughtRaw) {
-		thought, err = rawBool(thoughtRaw, path+"[12]", evidence)
-		if err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
-		}
-	}
-	emitted := d.emitted[step]
-	for len(emitted) <= index {
-		emitted = append(emitted, "")
-	}
-	previous := emitted[index]
-	if !strings.HasPrefix(text, previous) {
-		return nil, &ProtocolEvidenceError{Method: assistantStreamMethod, Path: path + "[1]", Detail: "步骤正文不是上一次快照的延续", Raw: cloneRaw(raw)}
-	}
-	emitted[index] = text
-	d.emitted[step] = emitted
-	delta := text[len(previous):]
-	if delta == "" {
-		return nil, nil
-	}
-	if thought {
-		return []Event{{Kind: EventReasoning, Text: delta, Thought: true}}, nil
-	}
-	if d.wroteText && previous == "" && step != d.lastStep {
-		delta = "\n\n" + delta
-	}
-	d.wroteText = true
-	d.lastStep = step
-	return d.text(delta), nil
-}
-
-// text 返回正文增量的事件；声明了函数时扣下调用候选代码块，代码块结束后解码，函数调用之后的正文与模型自写的 function_results 代码块不输出
-func (d *AssistantStreamDecoder) text(delta string) []Event {
-	if len(d.Functions) == 0 {
-		return []Event{{Kind: EventText, Text: delta}}
-	}
-	if d.called {
-		d.overran = d.overran || strings.TrimSpace(delta) != ""
-		return nil
-	}
-	d.held += delta
-	var events []Event
-	emit := func(text string) {
-		if text != "" {
-			events = append(events, Event{Kind: EventText, Text: text})
-		}
-	}
-	for !d.called {
-		switch {
-		case d.other:
-			end := strings.Index(d.held, "\n"+assistantFence)
-			if end < 0 {
-				keep := min(len(d.held), len(assistantFence))
-				emit(d.held[:len(d.held)-keep])
-				d.held = d.held[len(d.held)-keep:]
-				return events
-			}
-			end += 1 + len(assistantFence)
-			emit(d.held[:end])
-			d.held = d.held[end:]
-			d.other = false
-		case d.block:
-			opening := strings.IndexByte(d.held, '\n')
-			end := strings.Index(d.held[opening:], "\n"+assistantFence)
-			if end < 0 {
-				return events
-			}
-			end += opening + 1 + len(assistantFence)
-			block := d.held[:end]
-			d.held = d.held[end:]
-			d.block = false
-			events = append(events, d.callBlock(block)...)
-		default:
-			start := strings.Index(d.held, assistantFence)
-			if start < 0 {
-				keep := len(d.held) - len(strings.TrimRight(d.held, "`"))
-				emit(d.held[:len(d.held)-keep])
-				d.held = d.held[len(d.held)-keep:]
-				return events
-			}
-			emit(d.held[:start])
-			d.held = d.held[start:]
-			newline := strings.IndexByte(d.held, '\n')
-			if newline < 0 {
-				return events
-			}
-			if assistantCallFences[strings.TrimSpace(d.held[len(assistantFence):newline])] {
-				d.block = true
-				continue
-			}
-			emit(d.held[:newline+1])
-			d.held = d.held[newline+1:]
-			d.other = true
-		}
-	}
-	d.overran = strings.TrimSpace(d.held) != ""
-	d.held = ""
-	return events
-}
-
-// callBlock 解码一个调用候选代码块：调用解码为函数调用，function_results 代码块丢弃，无法解码的 function_calls 代码块记为格式错误的函数调用，其余代码块按正文输出
-func (d *AssistantStreamDecoder) callBlock(block string) []Event {
-	opening := strings.IndexByte(block, '\n')
-	info := strings.TrimSpace(block[len(assistantFence):opening])
-	body := block[opening+1 : len(block)-len(assistantFence)]
-	if info == "function_results" {
-		return nil
-	}
-	if calls, ok := assistantCalls(body, info == "function_calls", d.Functions); ok {
-		d.called = true
-		return calls
-	}
-	if info == "function_calls" {
-		d.malformed = true
-		return nil
-	}
-	return []Event{{Kind: EventText, Text: block}}
-}
-
-// assistantCalls 把代码块中的第一个 JSON 值解码为函数调用事件：不合法的转义按字面反斜杠解码，值为调用数组或单个调用对象，anyName 为假时调用的函数必须已声明，不是调用时返回 false
-func assistantCalls(body string, anyName bool, functions []string) ([]Event, bool) {
-	var value json.RawMessage
-	if json.NewDecoder(strings.NewReader(body)).Decode(&value) != nil && json.NewDecoder(strings.NewReader(literalInvalidEscapes(body))).Decode(&value) != nil {
-		return nil, false
-	}
-	var calls []assistantCall
-	if json.Unmarshal(value, &calls) != nil {
-		var call assistantCall
-		if json.Unmarshal(value, &call) != nil {
-			return nil, false
-		}
-		calls = []assistantCall{call}
-	}
-	if len(calls) == 0 {
-		return nil, false
-	}
-	events := make([]Event, 0, len(calls))
-	for _, call := range calls {
-		if call.Name == "" || !anyName && !slices.Contains(functions, call.Name) {
-			return nil, false
-		}
-		arguments := call.Arguments
-		if isJSONNull(arguments) {
-			arguments = json.RawMessage(`{}`)
-		}
-		events = append(events, Event{Kind: EventToolCall, FunctionCall: &FunctionCall{ID: uuid.NewString(), Name: call.Name, Arguments: arguments}})
-	}
-	return events, true
-}
-
-// literalInvalidEscapes 把 JSON 中不合法的转义（如模型按 Python 写出的 \x27）改为字面反斜杠
-func literalInvalidEscapes(body string) string {
-	var repaired strings.Builder
-	for index := 0; index < len(body); index++ {
-		repaired.WriteByte(body[index])
-		if body[index] != '\\' || index+1 == len(body) {
-			continue
-		}
-		index++
-		if !strings.ContainsRune(`"\/bfnrtu`, rune(body[index])) {
-			repaired.WriteByte('\\')
-		}
-		repaired.WriteByte(body[index])
-	}
-	return repaired.String()
-}
-
-// decodeSearch 把完成的 search_web 工具动作（field 19：查询、域名、摘要、[标题, 链接] 列表）并入搜索来源，查询与摘要记入 searches
-func (d *AssistantStreamDecoder) decodeSearch(raw json.RawMessage, path string, evidence json.RawMessage) error {
-	action, err := rawArray(raw, path, evidence)
-	if err != nil {
-		return withMethod(err, assistantStreamMethod)
-	}
-	searchRaw := rawAt(action, 18)
-	if isJSONNull(searchRaw) {
-		return nil
-	}
-	search, err := rawArray(searchRaw, path+"[18]", evidence)
-	if err != nil {
-		return withMethod(err, assistantStreamMethod)
-	}
-	query, err := rawString(rawAt(search, 0), path+"[18][0]", evidence)
-	if err != nil {
-		return withMethod(err, assistantStreamMethod)
-	}
-	if d.grounding == nil {
-		d.grounding = &GroundingMetadata{}
-	}
-	d.grounding.WebSearchQueries = append(d.grounding.WebSearchQueries, query)
-	if summaryRaw := rawAt(search, 2); !isJSONNull(summaryRaw) {
-		summary, err := rawString(summaryRaw, path+"[18][2]", evidence)
-		if err != nil {
-			return withMethod(err, assistantStreamMethod)
-		}
-		d.searches = append(d.searches, fmt.Sprintf(assistantSearchTranscript, query, summary))
-	}
-	if resultsRaw := rawAt(search, 3); !isJSONNull(resultsRaw) {
-		results, err := rawArray(resultsRaw, path+"[18][3]", evidence)
-		if err != nil {
-			return withMethod(err, assistantStreamMethod)
-		}
-		for index, resultRaw := range results {
-			resultPath := fmt.Sprintf("%s[18][3][%d]", path, index)
-			result, err := rawArray(resultRaw, resultPath, evidence)
-			if err != nil {
-				return withMethod(err, assistantStreamMethod)
-			}
-			title, err := rawString(rawAt(result, 0), resultPath+"[0]", evidence)
-			if err != nil {
-				return withMethod(err, assistantStreamMethod)
-			}
-			uri, err := rawString(rawAt(result, 1), resultPath+"[1]", evidence)
-			if err != nil {
-				return withMethod(err, assistantStreamMethod)
-			}
-			d.grounding.Chunks = append(d.grounding.Chunks, GroundingChunk{Source: "web", URI: uri, Title: title})
-		}
-	}
-	return nil
-}
-
-// End 在本轮回复结束、函数调用之后模型继续输出正文或流结束时返回扣下的正文或函数调用、搜索来源、各步骤用量之和与完成事件
-func (d *AssistantStreamDecoder) End() ([]Event, error) {
-	if !d.finished && !d.overran {
-		return nil, &ProtocolEvidenceError{Method: assistantStreamMethod, Path: "$", Detail: "流结束前没有完成的模型回复"}
-	}
-	var total Usage
-	for _, usage := range d.usage {
-		total.InputTokens += usage.InputTokens
-		total.CachedTokens += usage.CachedTokens
-		total.OutputTokens += usage.OutputTokens
-		total.TotalTokens += usage.TotalTokens
-	}
-	var events []Event
-	switch {
-	case d.block:
-		events = d.callBlock(d.held + "\n" + assistantFence)
-	case !d.called && d.held != "":
-		events = []Event{{Kind: EventText, Text: d.held}}
-	}
-	if d.grounding != nil {
-		events = append(events, Event{Kind: EventGrounding, Grounding: d.grounding})
-	}
-	if len(d.usage) > 0 {
-		events = append(events, Event{Kind: EventUsage, Usage: &total})
-	}
-	finish := decodeFinishReason(1)
-	if d.malformed {
-		finish = decodeFinishReason(10)
-	}
-	return append(events, Event{Kind: EventFinish, FinishReason: finish}), nil
-}
-
-// decodeAssistantUsage 解码步骤用量 [未命中缓存的输入, 输出, 缓存命中]
-func decodeAssistantUsage(raw json.RawMessage, path string, evidence json.RawMessage) (Usage, error) {
-	values, err := rawArray(raw, path, evidence)
-	if err != nil {
-		return Usage{}, withMethod(err, assistantStreamMethod)
-	}
-	numbers := make([]int64, 3)
-	for index := range numbers {
-		if value := rawAt(values, index); !isJSONNull(value) {
-			numbers[index], err = rawInt64(value, fmt.Sprintf("%s[%d]", path, index), evidence)
-			if err != nil {
-				return Usage{}, withMethod(err, assistantStreamMethod)
-			}
-		}
-	}
-	input := numbers[0] + numbers[2]
-	return Usage{InputTokens: input, CachedTokens: numbers[2], OutputTokens: numbers[1], TotalTokens: input + numbers[1]}, nil
 }

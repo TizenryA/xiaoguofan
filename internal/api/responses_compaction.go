@@ -246,7 +246,7 @@ func compactionItemTokens(raw json.RawMessage) int {
 	return (len(encoded) + 3) / 4
 }
 
-// compactionItemSide 把条目分为 user 消息、工具输出、指令与模型侧条目
+// compactionItemSide 把条目分为 user 轮（user 消息与 agent_message）、工具输出、指令与模型侧条目
 func compactionItemSide(raw json.RawMessage) string {
 	var head struct {
 		Type string `json:"type"`
@@ -254,7 +254,7 @@ func compactionItemSide(raw json.RawMessage) string {
 	}
 	_ = json.Unmarshal(raw, &head)
 	switch {
-	case (head.Type == "" || head.Type == "message") && head.Role == "user":
+	case (head.Type == "" || head.Type == "message") && head.Role == "user", head.Type == "agent_message":
 		return "user"
 	case (head.Type == "" || head.Type == "message") && (head.Role == "system" || head.Role == "developer"):
 		return "instruction"
@@ -322,7 +322,7 @@ func truncateMiddle(text string, tokens int) string {
 // compactResponses 摘要原样保留部分之前的历史，返回 compaction 项、原样保留部分之前的 user 消息、其中的 developer 与 system 消息和摘要用量
 func (s *server) compactResponses(ctx context.Context, request responsesRequest, previous responseHistory, id string) (map[string]any, []json.RawMessage, []json.RawMessage, *aistudio.Usage, error) {
 	var items []json.RawMessage
-	for _, item := range slices.Concat(previous.Items, responsesInputItems(request.Input, id)) {
+	for _, item := range slices.Concat(previous.Items, responsesInputItems(request.inputItems(), id)) {
 		items = append(items, item.Raw)
 	}
 	if len(items) > 0 && responsesItemType(items[len(items)-1]) == "compaction_trigger" {
@@ -424,17 +424,16 @@ func (s *server) handleResponsesCompact(w http.ResponseWriter, r *http.Request) 
 	for _, message := range retained {
 		output = append(output, message)
 	}
-	response := map[string]any{"id": id, "object": "response.compaction", "created_at": time.Now().Unix(), "output": append(output, item)}
-	if usage != nil {
-		response["usage"] = responsesUsage(usage)
+	if usage == nil {
+		usage = &aistudio.Usage{}
 	}
+	response := map[string]any{"id": id, "object": "response.compaction", "created_at": time.Now().Unix(), "output": append(output, item), "usage": responsesUsage(usage)}
 	writeJSON(w, http.StatusOK, officialOrder("responses", response))
 }
 
 // responsesCompactionTrigger 返回输入是否以 compaction_trigger 项结尾
-func responsesCompactionTrigger(raw json.RawMessage) bool {
-	var items []json.RawMessage
-	return json.Unmarshal(raw, &items) == nil && len(items) > 0 && responsesItemType(items[len(items)-1]) == "compaction_trigger"
+func responsesCompactionTrigger(input splitInput) bool {
+	return len(input.heads) > 0 && input.heads[len(input.heads)-1].Type == "compaction_trigger"
 }
 
 // handleCompactionTrigger 返回只含一个 compaction 项的响应，流式时依次发送 created、in_progress、compaction 项的 added 与 done、completed 事件
@@ -442,15 +441,18 @@ func (s *server) handleCompactionTrigger(w http.ResponseWriter, r *http.Request,
 	created := time.Now().Unix()
 	var writer *responsesStreamWriter
 	if request.Stream {
-		if err := streamHeaders(w); err != nil {
+		stream, err := openStream(w, sseHeartbeat)
+		defer stream.stop()
+		if err != nil {
 			return
 		}
-		writer = newResponsesWriter(w, id, created, request)
+		writer = newResponsesWriter(stream, id, created, request)
 		for _, eventType := range []string{"response.created", "response.in_progress"} {
 			if err := writer.emit(eventType, map[string]any{"response": responseShell(id, created, "in_progress", request)}); err != nil {
 				return
 			}
 		}
+		stream.setFrame(writer.progressFrame)
 		if err := writer.emit("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"id": "cmp_" + id, "type": "compaction", "encrypted_content": ""}}); err != nil {
 			return
 		}
@@ -490,13 +492,14 @@ func (s *server) handleCompactionTrigger(w http.ResponseWriter, r *http.Request,
 func (s *server) storeCompaction(ctx context.Context, id string, request responsesRequest, prepared responsesPreparation, item map[string]any, retained []json.RawMessage, response map[string]any) {
 	encodedItem, _ := json.Marshal(item)
 	window, _ := json.Marshal(append(slices.Clone(retained), encodedItem))
-	contents, inlineInstructions, err := responsesContents(window)
+	input := splitResponsesInput(window)
+	contents, inlineInstructions, err := responsesContents(input)
 	if err != nil || inlineRemoteMedia(ctx, contents) != nil {
 		return
 	}
 	prepared.contents = contents
 	prepared.inlineInstructions = append(slices.Clone(prepared.previous.InlineInstructions), inlineInstructions...)
-	prepared.input = responsesInputItems(window, id)
+	prepared.input = responsesInputItems(input, id)
 	prepared.previous = responseHistory{}
 	s.storeResponse(id, request, prepared, generationResult{}, response)
 }

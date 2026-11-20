@@ -31,12 +31,6 @@ const blocks = computed(() => (props.raw ? [] : engine.render(props.text)))
   overflow-wrap: anywhere;
 }
 
-/* 顶层块离开视口时跳过渲染，含 Mermaid 图的块除外 */
-.cmark-node > :deep(:not(.ms-mermaid, :has(.ms-mermaid))) {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 100px;
-}
-
 .cmark-node :deep(:is(p, li, td, th, blockquote, dt)) {
   font-size: 14px;
   line-height: 21px;
@@ -120,7 +114,7 @@ const blocks = computed(() => (props.raw ? [] : engine.render(props.text)))
   border-radius: 4px;
   background: light-dark(var(--color-v3-surface-container-high), var(--color-v3-button-container));
   color: var(--color-v3-text-on-button);
-  font-family: 'DM Mono', monospace;
+  font-family: 'DM Mono', var(--font-mono);
   font-size: 1em;
 }
 

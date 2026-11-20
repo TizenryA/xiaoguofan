@@ -12,9 +12,11 @@ const { status, serviceState, startPending, stopPending, startService, stopServi
 const version = computed(() => status.value?.version || '—')
 // stateLabel 是生成服务状态在当前语言下的文案
 const stateLabel = computed(() => t(`state.${serviceState.value}`))
+// serviceStates 是标题栏徽标可能显示的服务状态，各状态文案叠放在同一格，徽标宽度取最长的一项
+const serviceStates = ['running', 'launching', 'stopped', 'unavailable'] as const
 // avatarPalette 是 Google 账户默认头像的底色
 const avatarPalette = ['#1a73e8', '#e8710a', '#188038', '#d93025', '#9334e6', '#e52592', '#12b5cb']
-// name 是账户按钮与面板显示的名称，管理登录关闭时为产品名
+// name 是头像取字的名称，管理登录关闭时为产品名
 const name = computed(() => props.adminUsername || 'AIStudio2API')
 // avatar 是按名称首字母生成的头像文字与底色
 const avatar = computed(() => ({
@@ -34,10 +36,25 @@ const avatar = computed(() => ({
       <span class="avatar" :style="{ backgroundColor: avatar.color }" aria-hidden="true">{{
         avatar.letter
       }}</span>
-      <span class="account-switcher-text">{{ name }}</span>
-      <span class="navbar-badge"
-        ><span class="status-dot" :class="serviceState"></span>{{ stateLabel }}</span
-      >
+      <span class="account-switcher-labels">
+        <span
+          v-if="adminUsername"
+          v-tooltip.overflow="adminUsername"
+          class="account-switcher-text"
+          >{{ adminUsername }}</span
+        >
+        <span class="navbar-badge"
+          ><span class="status-dot" :class="serviceState"></span
+          ><span class="badge-labels"
+            ><span
+              v-for="state in serviceStates"
+              :key="state"
+              :class="{ inactive: state !== serviceState }"
+              >{{ t(`state.${state}`) }}</span
+            ></span
+          ></span
+        >
+      </span>
     </PopoverTrigger>
     <PopoverPortal>
       <PopoverContent side="top" align="start" :side-offset="8" class="account-panel">
@@ -118,9 +135,19 @@ const avatar = computed(() => ({
   background-color: var(--color-v3-hover);
 }
 
+.account-switcher-labels {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
 .account-switcher-text {
   display: block;
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   color: var(--color-v3-text-var);
   font-size: 12px;
@@ -143,6 +170,18 @@ const avatar = computed(() => ({
   font-weight: 400;
   line-height: 18px;
   text-transform: uppercase;
+}
+
+.badge-labels {
+  display: grid;
+}
+
+.badge-labels > span {
+  grid-area: 1 / 1;
+}
+
+.badge-labels > .inactive {
+  visibility: hidden;
 }
 
 .avatar {

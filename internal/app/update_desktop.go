@@ -1,4 +1,4 @@
-//go:build desktop
+//go:build desktop && !linux
 
 package app
 
@@ -13,14 +13,12 @@ import (
 
 	"github.com/wailsapp/wails/v3/pkg/updater"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/desktop"
 )
 
-// platformUpdateMode 返回桌面版的更新方式：Windows 与 macOS 原地更新，Linux 桌面包下载新版本安装
+// platformUpdateMode 返回 Windows 与 macOS 桌面版的更新方式：原地更新
 func platformUpdateMode() string {
-	if runtime.GOOS == "linux" {
-		return "download"
-	}
 	return "binary"
 }
 
@@ -30,11 +28,11 @@ func (u *selfUpdater) install(ctx context.Context, release *githubRelease) error
 }
 
 // updateRestart 返回在线更新完成后的重启动作：更新器启动辅助进程并退出桌面应用，辅助进程替换文件后启动新版本
-func updateRestart(_ func(), _ *atomic.Bool, log func(level, message string)) func() {
+func updateRestart(_ func(), _ *atomic.Bool, log func(level, message string, attrs ...any)) func() {
 	return func() {
 		go func() {
 			if err := desktop.Restart(); err != nil {
-				log("ERROR", "在线更新重启失败 | 错误="+err.Error())
+				log("ERROR", "在线更新重启失败", "error", err)
 			}
 		}()
 	}
@@ -76,7 +74,8 @@ func (p *releaseProvider) Download(ctx context.Context, _ *updater.Release, dst 
 			return err
 		}
 	}
-	p.updater.log("INFO", "在线更新 | 2/2 | 暂存新版本 | 版本="+p.release.TagName)
+	p.updater.setStage("install")
+	p.updater.requests.logStage("service", "INFO", api.LogStage{Name: "在线更新", Step: 2, Steps: 2}, "暂存新版本", "version", p.release.TagName)
 	written, err := io.Copy(dst, bytes.NewReader(payload))
 	onProgress(written, int64(len(payload)))
 	if err != nil {

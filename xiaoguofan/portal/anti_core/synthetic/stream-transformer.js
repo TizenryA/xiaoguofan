@@ -49,14 +49,35 @@ export class StreamTransformer {
 
     let loggedSyntheticDecode = false;
 
-    const writeSSE = (data) => {
-      const payload = `data: ${JSON.stringify(data)}\n\n`;
-      res.write(payload);
-      stats.bytesWritten += Buffer.byteLength(payload);
-      stats.downstreamSSECount++;
-      if (typeof res.flush === 'function') {
-        res.flush();
+    const writePayload = async (payload) => {
+      // Bridge sinks return a promise; Node responses use drain for backpressure.
+      const written = res.write(payload);
+      if (written === false && typeof res.once === 'function') {
+        await new Promise((resolve, reject) => {
+          const cleanup = () => {
+            res.removeListener('drain', onDrain);
+            res.removeListener('error', onError);
+            res.removeListener('close', onClose);
+          };
+          const onDrain = () => { cleanup(); resolve(); };
+          const onError = (error) => { cleanup(); reject(error); };
+          const onClose = () => { cleanup(); reject(new Error('downstream closed')); };
+          res.once('drain', onDrain);
+          res.once('error', onError);
+          res.once('close', onClose);
+        });
+      } else {
+        await written;
       }
+      stats.bytesWritten += Buffer.byteLength(payload);
+      if (typeof res.flush === 'function') {
+        await res.flush();
+      }
+    };
+
+    const writeSSE = async (data) => {
+      await writePayload(`data: ${JSON.stringify(data)}\n\n`);
+      stats.downstreamSSECount++;
     };
 
     // Helper to read all chunks from either Web ReadableStream or Node.js Stream
@@ -83,6 +104,7 @@ export class StreamTransformer {
 
     const utf8Decoder = new TextDecoder('utf-8');
     let pendingLine = '';
+    let pendingComments = '';
 
     for await (const chunk of getChunksIterator(readableStream, signal)) {
       stats.upstreamChunksCount++;
@@ -106,7 +128,16 @@ export class StreamTransformer {
 
       for (const rawLine of lines) {
         const line = rawLine.trim();
-        if (!line || line.startsWith(':')) continue;
+        if (rawLine.startsWith(':')) {
+          pendingComments += rawLine + '\n';
+          continue;
+        }
+        if (pendingComments) {
+          // Preserve upstream heartbeat text and LF/CRLF, even before tool args arrive.
+          await writePayload(pendingComments + (!line ? rawLine + '\n' : '\n'));
+          pendingComments = '';
+        }
+        if (!line) continue;
         if (!line.startsWith('data:')) continue;
 
         const dataContent = line.slice(5).trim();
@@ -121,7 +152,7 @@ export class StreamTransformer {
           continue;
         }
 
-        if (chunkObj.error) { writeSSE(chunkObj); continue; }
+        if (chunkObj.error) { await writeSSE(chunkObj); continue; }
         if (chunkObj.id) lastChunkInfo.id = chunkObj.id;
         if (chunkObj.created) lastChunkInfo.created = chunkObj.created;
         if (chunkObj.model) lastChunkInfo.model = chunkObj.model;
@@ -129,7 +160,7 @@ export class StreamTransformer {
         if (!Array.isArray(chunkObj.choices) || chunkObj.choices.length === 0) {
           // Pass through chunk (e.g. usage only)
           if (chunkObj.usage) {
-            writeSSE(chunkObj);
+            await writeSSE(chunkObj);
           }
           continue;
         }
@@ -139,7 +170,7 @@ export class StreamTransformer {
 
           // 1. Emit role chunk if present
           if (c.delta?.role && !state.roleEmitted) {
-            writeSSE({
+            await writeSSE({
               id: chunkObj.id,
               object: 'chat.completion.chunk',
               created: chunkObj.created,
@@ -161,7 +192,7 @@ export class StreamTransformer {
             const reasoningContent = state.thoughtReplacer ? state.thoughtReplacer.feed(rawReasoning) : rawReasoning;
             if (reasoningContent) {
               stats.accumulatedThought += reasoningContent;
-              writeSSE({
+              await writeSSE({
                 id: chunkObj.id,
                 object: 'chat.completion.chunk',
                 created: chunkObj.created,
@@ -230,7 +261,7 @@ export class StreamTransformer {
                       if (state.activeWrapTag) {
                         const closing = `\n</${state.activeWrapTag}>\n\n`;
                         stats.accumulatedContent += closing;
-                        writeSSE({
+                        await writeSSE({
                           id: chunkObj.id,
                           object: 'chat.completion.chunk',
                           created: chunkObj.created,
@@ -250,7 +281,7 @@ export class StreamTransformer {
                         state.activeWrapTag = tag;
                         const prefix = `<${tag}>\n`;
                         stats.accumulatedContent += prefix;
-                        writeSSE({
+                        await writeSSE({
                           id: chunkObj.id,
                           object: 'chat.completion.chunk',
                           created: chunkObj.created,
@@ -270,7 +301,7 @@ export class StreamTransformer {
                     if (emitted) {
                       if (item.field === 'thought') stats.accumulatedThought += emitted;
                       stats.accumulatedContent += emitted;
-                      writeSSE({
+                      await writeSSE({
                         id: chunkObj.id,
                         object: 'chat.completion.chunk',
                         created: chunkObj.created,
@@ -311,7 +342,7 @@ export class StreamTransformer {
             }
 
             if (realToolCallsToEmit.length > 0) {
-              writeSSE({
+              await writeSSE({
                 id: chunkObj.id,
                 object: 'chat.completion.chunk',
                 created: chunkObj.created,
@@ -347,7 +378,7 @@ export class StreamTransformer {
                   }
                   if (toEmit) {
                     stats.accumulatedContent += toEmit;
-                    writeSSE({
+                    await writeSSE({
                       id: chunkObj.id,
                       object: 'chat.completion.chunk',
                       created: chunkObj.created,
@@ -376,7 +407,7 @@ export class StreamTransformer {
                 const closing = `\n</${state.activeWrapTag}>\n\n`;
                 state.activeWrapTag = '';
                 stats.accumulatedContent += closing;
-                writeSSE({
+                await writeSSE({
                   id: chunkObj.id,
                   object: 'chat.completion.chunk',
                   created: chunkObj.created,
@@ -398,7 +429,7 @@ export class StreamTransformer {
               }
               if (rem) {
                 stats.accumulatedContent += rem;
-                writeSSE({
+                await writeSSE({
                   id: chunkObj.id,
                   object: 'chat.completion.chunk',
                   created: chunkObj.created,
@@ -429,7 +460,7 @@ export class StreamTransformer {
                 }
                 if (out) {
                   stats.accumulatedContent += out;
-                  writeSSE({
+                  await writeSSE({
                     id: chunkObj.id,
                     object: 'chat.completion.chunk',
                     created: chunkObj.created,
@@ -462,11 +493,13 @@ export class StreamTransformer {
             if (chunkObj.usage) {
               finalChunk.usage = chunkObj.usage;
             }
-            writeSSE(finalChunk);
+            await writeSSE(finalChunk);
           }
         }
       }
     }
+
+    if (pendingComments) await writePayload(pendingComments + '\n');
 
     // Flush any remaining buffers across all states before emitting [DONE]
     for (const [, state] of states) {
@@ -475,7 +508,7 @@ export class StreamTransformer {
         if (state.activeWrapTag) {
           const closing = `\n</${state.activeWrapTag}>\n\n`;
           state.activeWrapTag = '';
-          writeSSE({
+          await writeSSE({
             id: lastChunkInfo.id,
             object: 'chat.completion.chunk',
             created: lastChunkInfo.created,
@@ -491,7 +524,7 @@ export class StreamTransformer {
         }
         const rem = state.syntheticDecoder.finish(this.cfg.maxResponseBytes);
         if (rem) {
-          writeSSE({
+          await writeSSE({
             id: lastChunkInfo.id,
             object: 'chat.completion.chunk',
             created: lastChunkInfo.created,
@@ -515,7 +548,7 @@ export class StreamTransformer {
           }
           if (out) {
             stats.accumulatedContent += out;
-            writeSSE({
+            await writeSSE({
               id: lastChunkInfo.id,
               object: 'chat.completion.chunk',
               created: lastChunkInfo.created,
@@ -535,11 +568,7 @@ export class StreamTransformer {
 
     // Emit [DONE]
     const donePayload = 'data: [DONE]\n\n';
-    res.write(donePayload);
-    stats.bytesWritten += Buffer.byteLength(donePayload);
-    if (typeof res.flush === 'function') {
-      res.flush();
-    }
+    await writePayload(donePayload);
 
     const totalDurationMs = Date.now() - streamStartTime;
     logger.info(`[流式传输完成] 上游接收Chunk数: ${stats.upstreamChunksCount}, 向下游推送SSE块数: ${stats.downstreamSSECount}, 总耗时: ${totalDurationMs}ms, 累计下发字节: ${stats.bytesWritten} bytes`, {

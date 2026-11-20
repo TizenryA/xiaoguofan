@@ -16,17 +16,21 @@ import (
 
 	"github.com/brainplusplus/go-browserforge/fingerprints"
 	bfheaders "github.com/brainplusplus/go-browserforge/headers"
+
+	"github.com/Mag1cFall/AIStudio2API/internal/waa/rhythm"
 )
 
 var firefoxVersionPattern = regexp.MustCompile(`\b1[0-9]{2}\.0\b`)
 
-const camoufoxFirefoxMajor = 152
+const camoufoxFirefoxMajor = 158
 
 type savedFingerprint struct {
 	FirefoxVersion int            `json:"firefox_version"`
 	Locale         string         `json:"locale"`
 	Timezone       string         `json:"timezone"`
 	Config         map[string]any `json:"config"`
+	// Rhythm 是账户点击与粘贴的事件节奏
+	Rhythm *rhythm.Rhythm `json:"rhythm,omitempty"`
 }
 
 // PersistAccountFingerprint 将隔离登录指纹保存到账户目录
@@ -54,12 +58,6 @@ func buildCamoufoxConfig(ffVersion int, locale string, timezone string) (map[str
 	locale = normalizeLocale(locale)
 	locales := localeValues(locale)
 	fingerprint, err := fingerprints.Generate(fingerprints.Options{
-		Screen: &fingerprints.Screen{
-			MinWidth:  1280,
-			MaxWidth:  1920,
-			MinHeight: 720,
-			MaxHeight: 1200,
-		},
 		Headers: bfheaders.Options{
 			Browsers:         []bfheaders.Browser{{Name: "firefox", HTTPVersion: "2"}},
 			OperatingSystems: []string{"windows"},
@@ -74,7 +72,6 @@ func buildCamoufoxConfig(ffVersion int, locale string, timezone string) (map[str
 	version := fmt.Sprintf("%d.0", ffVersion)
 	userAgent := replaceFirefoxVersion(fingerprint.Navigator.UserAgent, version)
 	appVersion := replaceFirefoxVersion(fingerprint.Navigator.AppVersion, version)
-	screen := fingerprint.Screen
 	config := make(map[string]any)
 	for key, value := range map[string]any{
 		"navigator.userAgent":           userAgent,
@@ -83,24 +80,10 @@ func buildCamoufoxConfig(ffVersion int, locale string, timezone string) (map[str
 		"navigator.appVersion":          appVersion,
 		"navigator.oscpu":               fingerprint.Navigator.Oscpu,
 		"navigator.platform":            fingerprint.Navigator.Platform,
-		"navigator.hardwareConcurrency": fingerprint.Navigator.HardwareConcurrency,
+		"navigator.hardwareConcurrency": firefoxHardwareConcurrency(),
 		"navigator.product":             fingerprint.Navigator.Product,
-		"navigator.maxTouchPoints":      fingerprint.Navigator.MaxTouchPoints,
-		"screen.availHeight":            nonNegative(screen.AvailHeight),
-		"screen.availWidth":             nonNegative(screen.AvailWidth),
-		"screen.availTop":               nonNegative(screen.AvailTop),
-		"screen.availLeft":              nonNegative(screen.AvailLeft),
-		"screen.height":                 nonNegative(screen.Height),
-		"screen.width":                  nonNegative(screen.Width),
-		"screen.colorDepth":             nonNegative(screen.ColorDepth),
-		"screen.pixelDepth":             nonNegative(screen.PixelDepth),
-		"screen.pageXOffset":            screen.PageXOffset,
-		"screen.pageYOffset":            screen.PageYOffset,
-		"window.outerHeight":            screen.OuterHeight,
-		"window.outerWidth":             screen.OuterWidth,
-		"window.innerHeight":            screen.InnerHeight,
-		"window.innerWidth":             screen.InnerWidth,
-		"window.screenX":                screen.ScreenX,
+		"screen.colorDepth":             nonNegative(fingerprint.Screen.ColorDepth),
+		"screen.pixelDepth":             nonNegative(fingerprint.Screen.PixelDepth),
 		"headers.User-Agent":            userAgent,
 		"headers.Accept-Encoding":       headerValue(fingerprint.Headers, "accept-encoding"),
 	} {
@@ -108,15 +91,7 @@ func buildCamoufoxConfig(ffVersion int, locale string, timezone string) (map[str
 			config[key] = value
 		}
 	}
-	applyScreenXY(config, screen)
-	if fingerprint.Navigator.DoNotTrack != nil && truthy(*fingerprint.Navigator.DoNotTrack) {
-		config["navigator.doNotTrack"] = *fingerprint.Navigator.DoNotTrack
-	}
-	if fingerprint.Navigator.ExtraProperties != nil {
-		if value, ok := fingerprint.Navigator.ExtraProperties["globalPrivacyControl"].(bool); ok && value {
-			config["navigator.globalPrivacyControl"] = value
-		}
-	}
+	applyWindowsDisplay(config)
 	for key, target := range map[string]string{
 		"charging":        "battery:charging",
 		"chargingTime":    "battery:chargingTime",
@@ -128,8 +103,8 @@ func buildCamoufoxConfig(ffVersion int, locale string, timezone string) (map[str
 	}
 	config["allowMainWorld"] = true
 	config["showcursor"] = false
-	config["fonts"] = windowsFontSubset()
-	config["fonts:spacing_seed"] = randomSeed()
+	config["fonts"] = windowsFontSubset(locale)
+	maps.Copy(config, windowsWebGLByVendor())
 	applyLocaleTimezone(config, locale, timezone)
 	normalizeCamoufoxConfig(config)
 	return config, nil
@@ -149,7 +124,8 @@ func loadAccountCamoufoxConfig(storageStatePath string, ffVersion int, locale st
 		if buildErr != nil {
 			return nil, buildErr
 		}
-		if writeErr := writeAccountCamoufoxConfig(path, savedFingerprint{FirefoxVersion: ffVersion, Locale: locale, Timezone: timezone, Config: config}); writeErr != nil {
+		account := rhythm.New()
+		if writeErr := writeAccountCamoufoxConfig(path, savedFingerprint{FirefoxVersion: ffVersion, Locale: locale, Timezone: timezone, Config: config, Rhythm: &account}); writeErr != nil {
 			return nil, writeErr
 		}
 		return config, nil
@@ -165,6 +141,11 @@ func loadAccountCamoufoxConfig(storageStatePath string, ffVersion int, locale st
 		return nil, fmt.Errorf("账户 Camoufox 指纹为空")
 	}
 	changed := false
+	if saved.Rhythm == nil {
+		account := rhythm.New()
+		saved.Rhythm = &account
+		changed = true
+	}
 	if saved.FirefoxVersion != ffVersion {
 		version := fmt.Sprintf("%d.0", ffVersion)
 		for _, key := range []string{"navigator.userAgent", "navigator.appVersion", "headers.User-Agent"} {
@@ -230,6 +211,7 @@ func applyLocaleTimezone(config map[string]any, locale string, timezone string) 
 	}
 	config["locale:all"] = strings.Join(localeValues(locale), ", ")
 	config["timezone"] = timezone
+	config["voices"] = windowsVoices(locale)
 }
 
 func writeAccountCamoufoxConfig(path string, saved savedFingerprint) error {
@@ -243,6 +225,9 @@ func writeAccountCamoufoxConfig(path string, saved savedFingerprint) error {
 	return nil
 }
 
+// sessionVariables 是 Firefox 以 root 运行时检查属主的环境变量
+var sessionVariables = []string{"HOME", "XDG_RUNTIME_DIR", "XAUTHORITY"}
+
 // camoufoxEnvironment 将指纹 JSON 分片写入 Camoufox 环境变量
 func camoufoxEnvironment(config map[string]any) ([]string, error) {
 	encoded, err := json.Marshal(config)
@@ -252,7 +237,7 @@ func camoufoxEnvironment(config map[string]any) ([]string, error) {
 	values := make(map[string]string)
 	for _, item := range os.Environ() {
 		name, value, ok := strings.Cut(item, "=")
-		if ok && !strings.HasPrefix(name, "CAMOU_CONFIG_") {
+		if ok && !strings.HasPrefix(name, "CAMOU_CONFIG_") && (!slices.Contains(sessionVariables, name) || !foreignUserPath(value)) {
 			values[name] = value
 		}
 	}
@@ -291,20 +276,14 @@ func headerValue(headers map[string]string, name string) string {
 	return ""
 }
 
-// randomSeed 返回 Camoufox 噪声种子的非零 uint32
-func randomSeed() int64 {
-	return int64(rand.Uint32N(math.MaxUint32)) + 1
-}
-
-// windowsProfileJSON 为 Camoufox 官方启动器的 Windows 字体与语音清单
+// windowsProfileJSON 为 Camoufox 官方启动器的 Windows 字体清单
 //
 //go:embed windows_profile.json
 var windowsProfileJSON []byte
 
-// windowsProfileData 为解析后的 Windows 字体与语音清单
+// windowsProfileData 为解析后的 Windows 字体清单
 type windowsProfileData struct {
-	Fonts  []string `json:"fonts"`
-	Voices []string `json:"voices"`
+	Fonts []string `json:"fonts"`
 }
 
 var windowsProfile = func() windowsProfileData {
@@ -333,24 +312,6 @@ var windowsWebGLProfiles = func() []windowsWebGLProfile {
 	}
 	return profiles
 }()
-
-// windowsWebGL 按官方启动器的权重抽取一组 Windows WebGL 配置
-func windowsWebGL() map[string]any {
-	total := 0.0
-	for _, profile := range windowsWebGLProfiles {
-		total += profile.Weight
-	}
-	point := rand.Float64() * total
-	selected := windowsWebGLProfiles[len(windowsWebGLProfiles)-1]
-	for _, profile := range windowsWebGLProfiles {
-		if point < profile.Weight {
-			selected = profile
-			break
-		}
-		point -= profile.Weight
-	}
-	return maps.Clone(selected.Config)
-}
 
 // windowsFontsJSON 为 Windows 版 Firefox 字体偏好、Camoufox 发行包 Windows 字体的字体族名分组与 Windows 字体替换表
 //
@@ -403,18 +364,20 @@ func windowsFontAliases(fonts []string) []string {
 	return slices.DeleteFunc(names, func(name string) bool { return !allowed[strings.ToLower(name)] })
 }
 
-// windowsEssentialFonts 为 Windows 字体子集必须包含的字体
+// windowsEssentialFonts 为 Windows 字体子集必须包含的字体，含各语言版本 Windows 都预装的东亚界面字体
 var windowsEssentialFonts = []string{
 	"Arial", "Times New Roman", "Courier New", "Verdana", "Georgia",
 	"Trebuchet MS", "Tahoma", "Segoe UI", "Calibri", "Cambria Math",
 	"Nirmala UI", "Consolas",
+	"Microsoft JhengHei", "Microsoft JhengHei UI", "Microsoft YaHei", "Microsoft YaHei UI", "SimSun", "NSimSun", "PMingLiU-ExtB",
+	"Yu Gothic", "Yu Gothic UI", "MS Gothic", "MS PGothic", "MS UI Gothic", "Malgun Gothic", "Segoe UI Emoji", "Segoe UI Symbol",
 }
 
 // windowsMarkerFonts 为识别 Windows 系统的标记字体
 var windowsMarkerFonts = []string{"Segoe UI", "Tahoma", "Cambria Math", "Nirmala UI"}
 
-// windowsFontSubset 按官方启动器规则生成必需字体加 30% 至 78% 其余字体的子集
-func windowsFontSubset() []string {
+// windowsFontSubset 按官方启动器规则生成必需字体加 30% 至 78% 其余字体的子集，再加上该语言 Windows 自动安装的补充字体
+func windowsFontSubset(locale string) []string {
 	var result, rest []string
 	for _, font := range windowsProfile.Fonts {
 		if slices.Contains(windowsEssentialFonts, font) {
@@ -432,7 +395,17 @@ func windowsFontSubset() []string {
 			result = append(result, font)
 		}
 	}
-	return result
+	return append(result, localeFonts(locale)...)
+}
+
+// withWindowsEssentialFonts 在字体列表末尾补上缺少的 Windows 必有字体与标记字体
+func withWindowsEssentialFonts(fonts []string) []string {
+	for _, font := range slices.Concat(windowsEssentialFonts, windowsMarkerFonts) {
+		if !slices.Contains(fonts, font) {
+			fonts = append(fonts, font)
+		}
+	}
+	return fonts
 }
 
 // fontList 读取配置中的字体名列表
@@ -450,24 +423,83 @@ func fontList(value any) []string {
 	return fonts
 }
 
-// windowsFonts 判断字体列表是否全部来自官方 Windows 字体清单
-func windowsFonts(value any) bool {
+// windowsFonts 判断字体列表是否全部来自官方 Windows 字体清单或该语言的 Windows 补充字体
+func windowsFonts(value any, locale string) bool {
 	fonts := fontList(value)
 	if len(fonts) == 0 {
 		return false
 	}
 	for _, font := range fonts {
-		if !slices.Contains(windowsProfile.Fonts, font) {
+		if !slices.Contains(windowsProfile.Fonts, font) && !slices.Contains(localeFonts(locale), font) {
 			return false
 		}
 	}
 	return true
 }
 
-// windowsVoices 返回完整 SAPI 语音列表，并把与语言匹配的语音设为默认
+// windowsVoiceListsJSON 为真实 Windows Firefox 指纹中的语音清单及其出现次数
+//
+//go:embed windows_voices.json
+var windowsVoiceListsJSON []byte
+
+// windowsVoiceList 为一台 Windows 上 Firefox 列出的全部语音（名称:语言:local）与它在真实指纹中的出现次数
+type windowsVoiceList struct {
+	Weight float64  `json:"weight"`
+	Voices []string `json:"voices"`
+}
+
+var windowsVoiceLists = func() []windowsVoiceList {
+	var lists []windowsVoiceList
+	if err := json.Unmarshal(windowsVoiceListsJSON, &lists); err != nil {
+		panic(err)
+	}
+	return lists
+}()
+
+// voiceLanguages 返回语音清单所属系统的小写语言标签，各语言系统都带的 Zira Desktop 不计，只有它或为空的清单属于英文系统
+func voiceLanguages(list windowsVoiceList) []string {
+	var languages []string
+	for _, entry := range list.Voices {
+		parts := strings.Split(entry, ":")
+		language := strings.ToLower(parts[len(parts)-2])
+		if !strings.HasPrefix(entry, "Microsoft Zira Desktop ") && !slices.Contains(languages, language) {
+			languages = append(languages, language)
+		}
+	}
+	if len(languages) == 0 {
+		return []string{"en-us"}
+	}
+	return languages
+}
+
+// windowsVoices 按出现次数从含账户语言语音的真实 Windows Firefox 语音清单中抽取一份：先找同一语言标签，再找同一语言，都没有时取只有英文语音的清单；Firefox 158 不标默认语音
 func windowsVoices(locale string) []map[string]any {
-	voices := make([]map[string]any, 0, len(windowsProfile.Voices))
-	for _, entry := range windowsProfile.Voices {
+	tag := strings.ToLower(locale)
+	prefix, _, _ := strings.Cut(tag, "-")
+	english := func(language string) bool { return strings.HasPrefix(language, "en-") }
+	matches := []func([]string) bool{
+		func(languages []string) bool { return slices.Contains(languages, tag) },
+		func(languages []string) bool {
+			return slices.ContainsFunc(languages, func(language string) bool { return strings.HasPrefix(language, prefix+"-") })
+		},
+		func(languages []string) bool {
+			return !slices.ContainsFunc(languages, func(language string) bool { return !english(language) })
+		},
+	}
+	var lists []weighted[windowsVoiceList]
+	for _, match := range matches {
+		for _, list := range windowsVoiceLists {
+			if match(voiceLanguages(list)) {
+				lists = append(lists, weighted[windowsVoiceList]{list, list.Weight})
+			}
+		}
+		if len(lists) > 0 {
+			break
+		}
+	}
+	list := draw(lists)
+	voices := make([]map[string]any, 0, len(list.Voices))
+	for _, entry := range list.Voices {
 		last := strings.LastIndex(entry, ":")
 		separator := strings.LastIndex(entry[:last], ":")
 		name, language := entry[:separator], entry[separator+1:last]
@@ -479,23 +511,6 @@ func windowsVoices(locale string) []map[string]any {
 			"isLocalService": entry[last+1:] == "local",
 		})
 	}
-	prefix, _, _ := strings.Cut(strings.ToLower(locale), "-")
-	if prefix == "" {
-		prefix = "en"
-	}
-	index := slices.IndexFunc(voices, func(voice map[string]any) bool {
-		return locale != "" && strings.EqualFold(voice["lang"].(string), locale)
-	})
-	if index < 0 {
-		index = slices.IndexFunc(voices, func(voice map[string]any) bool {
-			language, _, _ := strings.Cut(strings.ToLower(voice["lang"].(string)), "-")
-			return language == prefix
-		})
-	}
-	if index < 0 {
-		index = 0
-	}
-	voices[index]["isDefault"] = true
 	return voices
 }
 
@@ -521,29 +536,7 @@ func truthy(value any) bool {
 	}
 }
 
-// applyScreenXY 按 BrowserForge 的 screenX 推导窗口位置
-func applyScreenXY(config map[string]any, screen fingerprints.ScreenFingerprint) {
-	screenX := screen.ScreenX
-	if screenX == 0 {
-		config["window.screenX"] = 0
-		config["window.screenY"] = 0
-		return
-	}
-	if screenX >= -50 && screenX <= 50 {
-		config["window.screenY"] = screenX
-		return
-	}
-	switch screenY := screen.AvailHeight - screen.OuterHeight; {
-	case screenY == 0:
-		config["window.screenY"] = 0
-	case screenY > 0:
-		config["window.screenY"] = rand.IntN(screenY)
-	default:
-		config["window.screenY"] = screenY + rand.IntN(-screenY)
-	}
-}
-
-// normalizeCamoufoxConfig 按官方启动器修正指纹中的空值、窗口几何、字体、语音、WebGL、媒体设备与噪声种子
+// normalizeCamoufoxConfig 按官方启动器修正指纹中的空值、隐私信号、窗口几何、字体、WebGL 与媒体设备，删除 Camoufox 已移除的配置项；指纹为没有触屏、窗口在主屏上的 Windows 桌面，可用区域取 Firefox 158 指纹保护报告的值，字体含 Windows 必有字体
 func normalizeCamoufoxConfig(config map[string]any) {
 	for key, value := range config {
 		derived := strings.HasPrefix(key, "navigator.") || strings.HasPrefix(key, "screen.") ||
@@ -552,33 +545,28 @@ func normalizeCamoufoxConfig(config map[string]any) {
 			delete(config, key)
 		}
 	}
-	for _, key := range []string{"window.history.length", "canvas:aaOffset", "canvas:aaCapOffset"} {
+	for _, key := range []string{"window.history.length", "canvas:aaOffset", "canvas:aaCapOffset", "canvas:seed", "audio:seed", "fonts:spacing_seed", "navigator.doNotTrack", "navigator.globalPrivacyControl"} {
 		delete(config, key)
 	}
-	if !windowsFonts(config["fonts"]) {
-		config["fonts"] = windowsFontSubset()
-	}
 	language, _ := config["navigator.language"].(string)
-	config["voices"] = windowsVoices(language)
+	if !windowsFonts(config["fonts"], language) {
+		config["fonts"] = windowsFontSubset(language)
+	}
+	config["fonts"] = withWindowsEssentialFonts(fontList(config["fonts"]))
+	delete(config, "navigator.maxTouchPoints")
+	delete(config, "screen.availLeft")
+	delete(config, "screen.availTop")
 	if _, ok := config["webGl:renderer"]; !ok {
-		maps.Copy(config, windowsWebGL())
+		maps.Copy(config, windowsWebGLByVendor())
 	}
 	hasMediaDevices := false
 	for key := range config {
 		hasMediaDevices = hasMediaDevices || strings.HasPrefix(key, "mediaDevices:")
 	}
 	if !hasMediaDevices {
-		config["mediaDevices:enabled"] = true
-		config["mediaDevices:micros"] = 1
-		config["mediaDevices:webcams"] = 1
-		config["mediaDevices:speakers"] = 0
+		maps.Copy(config, windowsMediaDevices())
 	}
-	for _, key := range []string{"fonts:spacing_seed", "audio:seed", "canvas:seed"} {
-		if !truthy(config[key]) {
-			config[key] = randomSeed()
-		}
-	}
-	fixScreenNoTaskbar(config)
+	reportAvailArea(config)
 	clampWindowDimensions(config)
 	clampWindowPosition(config)
 }
@@ -589,42 +577,42 @@ func integer(config map[string]any, key string) (int, bool) {
 	return int(value), ok
 }
 
-// fixScreenNoTaskbar 为可用区域等于屏幕的指纹留出 Windows 任务栏高度
-func fixScreenNoTaskbar(config map[string]any) {
+// reportAvailArea 按 Firefox 158 在 Windows 上的指纹保护写入可用区域：宽为屏幕宽，高为屏幕高减 firefoxTaskbar
+func reportAvailArea(config map[string]any) {
 	width, _ := integer(config, "screen.width")
 	height, _ := integer(config, "screen.height")
-	availWidth, hasAvailWidth := integer(config, "screen.availWidth")
-	availHeight, hasAvailHeight := integer(config, "screen.availHeight")
-	if width == 0 || height == 0 || !hasAvailWidth || !hasAvailHeight || availWidth != width || availHeight != height {
+	if width == 0 || height == 0 {
 		return
 	}
-	available := height - 40
-	config["screen.availHeight"] = available
-	outer, _ := integer(config, "window.outerHeight")
-	if outer <= available {
-		return
-	}
-	inner, _ := integer(config, "window.innerHeight")
-	config["window.outerHeight"] = available
-	if inner != 0 {
-		config["window.innerHeight"] = available - (outer - inner)
-	}
+	config["screen.availWidth"] = width
+	config["screen.availHeight"] = height - firefoxTaskbar
 }
 
-// clampWindowDimensions 保证两个方向上 inner 不大于 outer、outer 不大于可用区域、可用区域不大于屏幕
+// windowBorder 返回 Firefox 窗口 9 个物理像素边框按 devicePixelRatio 折算的 CSS 像素数，没有 devicePixelRatio 时为 0
+func windowBorder(config map[string]any) int {
+	ratio, ok := number(config["window.devicePixelRatio"])
+	if !ok || ratio <= 0 {
+		return 0
+	}
+	return int(math.Round(9 / ratio))
+}
+
+// windowsTaskbarMin 是 Windows 任务栏以 DIP 计的最小高度（Windows 10）
+const windowsTaskbarMin = 40
+
+// clampWindowDimensions 保证两个方向上 inner 不大于 outer、outer 不大于 Windows 工作区加两侧边框：工作区宽为屏幕宽，高最多为屏幕高减 windowsTaskbarMin
 func clampWindowDimensions(config map[string]any) {
+	border := windowBorder(config)
 	for _, axis := range []string{"Width", "Height"} {
 		screen, _ := integer(config, "screen."+strings.ToLower(axis))
-		avail, hasAvail := integer(config, "screen.avail"+axis)
 		outer, _ := integer(config, "window.outer"+axis)
 		inner, _ := integer(config, "window.inner"+axis)
-		if screen != 0 && avail != 0 && avail > screen {
-			config["screen.avail"+axis] = screen
-			avail = screen
-		}
-		outerCap := screen
-		if hasAvail {
-			outerCap = avail
+		outerCap := 0
+		if screen != 0 {
+			outerCap = screen + 2*border
+			if axis == "Height" {
+				outerCap -= windowsTaskbarMin
+			}
 		}
 		if outer != 0 && outerCap != 0 && outer > outerCap {
 			chrome := 0
@@ -644,8 +632,9 @@ func clampWindowDimensions(config map[string]any) {
 	}
 }
 
-// clampWindowPosition 保证窗口位于所报告的屏幕内
+// clampWindowPosition 保证窗口除两侧边框外位于所报告的屏幕内
 func clampWindowPosition(config map[string]any) {
+	border := windowBorder(config)
 	for axis, key := range map[string]string{"Width": "window.screenX", "Height": "window.screenY"} {
 		screen, _ := integer(config, "screen."+strings.ToLower(axis))
 		outer, _ := integer(config, "window.outer"+axis)
@@ -653,6 +642,6 @@ func clampWindowPosition(config map[string]any) {
 		if !ok || screen == 0 || outer == 0 {
 			continue
 		}
-		config[key] = max(0, min(position, screen-outer))
+		config[key] = max(-border, min(position, screen-outer+border))
 	}
 }

@@ -15,19 +15,23 @@ import (
 
 // interactionRequest 表示公开 Interactions 创建请求
 type interactionRequest struct {
-	Model      string                     `json:"model"`
-	Agent      string                     `json:"agent"`
-	Input      json.RawMessage            `json:"input"`
-	System     string                     `json:"system_instruction"`
-	Stream     bool                       `json:"stream"`
-	Background bool                       `json:"background"`
-	Store      *bool                      `json:"store"`
-	PreviousID string                     `json:"previous_interaction_id"`
-	Formats    json.RawMessage            `json:"response_format"`
-	MIME       string                     `json:"response_mime_type"`
-	Modalities []string                   `json:"response_modalities"`
-	Safety     []interactionSafetySetting `json:"safety_settings"`
-	Tools      []interactionTool          `json:"tools"`
+	Model string `json:"model"`
+	Agent string `json:"agent"`
+	// AgentConfig 是 agent 的运行配置，Antigravity 为所用模型与 token 上限，Deep Research 为思考摘要、可视化与协作规划
+	AgentConfig *interactionAgentConfig `json:"agent_config"`
+	// Environment 是 agent 的远程环境配置对象，或已有环境的 ID
+	Environment json.RawMessage            `json:"environment"`
+	Input       json.RawMessage            `json:"input"`
+	System      string                     `json:"system_instruction"`
+	Stream      bool                       `json:"stream"`
+	Background  bool                       `json:"background"`
+	Store       *bool                      `json:"store"`
+	PreviousID  string                     `json:"previous_interaction_id"`
+	Formats     json.RawMessage            `json:"response_format"`
+	MIME        string                     `json:"response_mime_type"`
+	Modalities  []string                   `json:"response_modalities"`
+	Safety      []interactionSafetySetting `json:"safety_settings"`
+	Tools       []interactionTool          `json:"tools"`
 	// CachedContent 是显式缓存的资源名
 	CachedContent string            `json:"cached_content"`
 	ServiceTier   string            `json:"service_tier"`
@@ -54,6 +58,111 @@ type interactionRequest struct {
 		} `json:"video_config"`
 		Transcription *interactionTranscriptionConfig `json:"transcription_config"`
 	} `json:"generation_config"`
+	// stream 是后台交互的事件记录，下标加一即 event_id
+	stream *streamLog
+	// cache 是 cached_content 引用的显式缓存
+	cache *geminiCache
+}
+
+// interactionAgentConfig 是公开请求的 agent_config，max_total_tokens 按官方 REST 为字符串，也接受数字
+type interactionAgentConfig struct {
+	Type                  string      `json:"type"`
+	Model                 string      `json:"model"`
+	MaxTotalTokens        json.Number `json:"max_total_tokens"`
+	ThinkingSummaries     string      `json:"thinking_summaries"`
+	Visualization         string      `json:"visualization"`
+	CollaborativePlanning bool        `json:"collaborative_planning"`
+}
+
+// config 校验 agent_config 的取值并转为生成请求的 agent 配置，type 与 agent 是否一致在找到 agent 后核对
+func (config interactionAgentConfig) config() (*aistudio.AgentConfig, error) {
+	if config.ThinkingSummaries != "" && config.ThinkingSummaries != "auto" && config.ThinkingSummaries != "none" {
+		return nil, fmt.Errorf("agent_config.thinking_summaries must be auto or none")
+	}
+	if config.Visualization != "" && config.Visualization != "auto" && config.Visualization != "off" {
+		return nil, fmt.Errorf("agent_config.visualization must be auto or off")
+	}
+	result := &aistudio.AgentConfig{Type: config.Type, Model: config.Model, ThinkingSummaries: config.ThinkingSummaries, Visualization: config.Visualization, CollaborativePlanning: config.CollaborativePlanning}
+	if config.MaxTotalTokens != "" {
+		tokens, err := config.MaxTotalTokens.Int64()
+		if err != nil || tokens <= 0 {
+			return nil, fmt.Errorf("agent_config.max_total_tokens must be a positive integer")
+		}
+		result.MaxTotalTokens = tokens
+	}
+	return result, nil
+}
+
+// interactionEnvironment 是公开请求的 environment 对象
+type interactionEnvironment struct {
+	Type          string                       `json:"type"`
+	Sources       []aistudio.EnvironmentSource `json:"sources"`
+	Network       json.RawMessage              `json:"network"`
+	EnvironmentID string                       `json:"environment_id"`
+}
+
+// interactionEgressRule 是 network.allowlist 的一条规则
+type interactionEgressRule struct {
+	Domain     string            `json:"domain"`
+	Transform  map[string]string `json:"transform"`
+	Credential string            `json:"credential"`
+}
+
+// agentEnvironment 把 environment 转为生成请求的 agent 环境：字符串为已有环境 ID，对象为远程环境的源、出站白名单与要更新的环境 ID
+func agentEnvironment(raw json.RawMessage) (*aistudio.AgentEnvironment, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var id string
+	if json.Unmarshal(raw, &id) == nil {
+		if strings.TrimSpace(id) == "" {
+			return nil, fmt.Errorf("environment must be a non-empty environment ID")
+		}
+		return &aistudio.AgentEnvironment{ID: strings.TrimSpace(id)}, nil
+	}
+	var config interactionEnvironment
+	if err := json.Unmarshal(raw, &config); err != nil {
+		return nil, fmt.Errorf("environment must be an object or an environment ID: %w", err)
+	}
+	if config.Type != "" && config.Type != "remote" {
+		return nil, fmt.Errorf("environment.type must be remote")
+	}
+	environment := &aistudio.AgentEnvironment{ID: strings.TrimSpace(config.EnvironmentID), Sources: config.Sources}
+	if len(config.Network) == 0 || string(config.Network) == "null" {
+		return environment, nil
+	}
+	var disabled string
+	if json.Unmarshal(config.Network, &disabled) == nil {
+		if disabled != "disabled" {
+			return nil, fmt.Errorf("environment.network must be disabled or an allowlist object")
+		}
+		environment.NetworkDisabled = true
+		return environment, nil
+	}
+	var network struct {
+		Allowlist json.RawMessage `json:"allowlist"`
+	}
+	if err := json.Unmarshal(config.Network, &network); err != nil {
+		return nil, fmt.Errorf("environment.network must be disabled or an allowlist object: %w", err)
+	}
+	if json.Unmarshal(network.Allowlist, &disabled) == nil {
+		if disabled != "disabled" {
+			return nil, fmt.Errorf("environment.network.allowlist must be disabled or an array of rules")
+		}
+		environment.NetworkDisabled = true
+		return environment, nil
+	}
+	var rules []interactionEgressRule
+	if err := json.Unmarshal(network.Allowlist, &rules); err != nil {
+		return nil, fmt.Errorf("environment.network.allowlist must be disabled or an array of rules: %w", err)
+	}
+	for index, rule := range rules {
+		if strings.TrimSpace(rule.Domain) == "" {
+			return nil, fmt.Errorf("environment.network.allowlist[%d].domain is required", index)
+		}
+		environment.Allowlist = append(environment.Allowlist, aistudio.EgressRule{Domain: strings.TrimSpace(rule.Domain), Headers: rule.Transform, Credential: rule.Credential})
+	}
+	return environment, nil
 }
 
 // interactionTool 表示 Interactions 工具声明，在 Responses 工具字段之外带有内置工具的设置
@@ -202,6 +311,14 @@ func (request interactionRequest) toGenerateRequest(id string) (aistudio.Generat
 		return generate, fmt.Errorf("model or agent is required")
 	}
 	var err error
+	if request.AgentConfig != nil {
+		if generate.AgentConfig, err = request.AgentConfig.config(); err != nil {
+			return generate, err
+		}
+	}
+	if generate.Environment, err = agentEnvironment(request.Environment); err != nil {
+		return generate, err
+	}
 	generate.Contents, err = interactionContents(request.Input)
 	if err != nil {
 		return generate, err
@@ -336,6 +453,7 @@ func (request interactionRequest) toGenerateRequest(id string) (aistudio.Generat
 	if err != nil {
 		return generate, err
 	}
+	generate.Tools.Explicit = request.Tools != nil
 	if search := builtin.GoogleSearch; search != nil {
 		if search.WebSearch {
 			generate.Tools.Google = appendUnique(generate.Tools.Google, "google_search")

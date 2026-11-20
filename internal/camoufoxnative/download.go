@@ -3,6 +3,7 @@ package camoufoxnative
 import (
 	"archive/zip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,11 +13,30 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
-const camoufoxRelease = "152.0.4-beta.29"
+const camoufoxRelease = "158.0.1-clock.2"
+
+// downloadStallTimeout 是下载连续收不到数据即判定中断的时长
+const downloadStallTimeout = 30 * time.Second
+
+// downloadAttempts 是 Camoufox 发行包下载最多尝试的次数，连接中断、停滞或服务端 5xx 后从已保存的末尾续传
+const downloadAttempts = 5
+
+// downloadStatusError 是发行包下载返回的 HTTP 错误状态
+type downloadStatusError int
+
+func (status downloadStatusError) Error() string {
+	return fmt.Sprintf("下载 Camoufox: HTTP %d", int(status))
+}
+
+// errDownloadStalled 表示下载连续 downloadStallTimeout 没有收到数据
+var errDownloadStalled = fmt.Errorf("连续 %d 秒没有收到数据", int(downloadStallTimeout/time.Second))
 
 // Download 是正在进行的 Camoufox 下载的已收与总字节，总字节未知时为 0
 type Download struct {
@@ -24,15 +44,29 @@ type Download struct {
 	Total    int64 `json:"total"`
 }
 
-// downloadState 是正在进行的下载的计数，写入时累计已收字节
+// downloadState 是正在进行的下载：已收与总字节、本次开始时已有的字节与开始时刻；写入时累计已收字节并推迟停滞判定
 type downloadState struct {
 	received atomic.Int64
 	total    int64
+	resumed  int64
+	started  time.Time
+	stall    *time.Timer
 }
 
 func (state *downloadState) Write(data []byte) (int, error) {
 	state.received.Add(int64(len(data)))
+	state.stall.Reset(downloadStallTimeout)
 	return len(data), nil
+}
+
+// remaining 按本次下载的平均速度估计剩余时间，无法估计时返回 0
+func (state *downloadState) remaining() time.Duration {
+	received := state.received.Load()
+	elapsed := time.Since(state.started)
+	if state.total <= 0 || received <= state.resumed || elapsed <= 0 {
+		return 0
+	}
+	return time.Duration(float64(state.total-received) / float64(received-state.resumed) * float64(elapsed))
 }
 
 // activeDownload 是正在进行的 Camoufox 下载，没有下载时为 nil
@@ -45,6 +79,120 @@ func DownloadProgress() (Download, bool) {
 		return Download{}, false
 	}
 	return Download{Received: state.received.Load(), Total: state.total}, true
+}
+
+// Preparation 是 Camoufox 的准备状态：是否就绪、是否正在下载或解压、正在进行的下载与最近一次准备失败的原因
+type Preparation struct {
+	Ready     bool      `json:"ready"`
+	Preparing bool      `json:"preparing"`
+	Download  *Download `json:"download,omitempty"`
+	Error     string    `json:"error,omitempty"`
+}
+
+// PreparingError 表示 Camoufox 正在准备，Download 为正在进行的下载，连接与解压期间为 nil；Remaining 为估计的剩余下载时间，无法估计时为 0
+type PreparingError struct {
+	Download  *Download
+	Remaining time.Duration
+}
+
+func (err *PreparingError) Error() string {
+	if err.Download == nil || err.Download.Total <= 0 {
+		return "正在准备 Camoufox"
+	}
+	return fmt.Sprintf("正在下载 Camoufox %d/%d MB", err.Download.Received/1e6, err.Download.Total/1e6)
+}
+
+// preparationRound 是一轮后台准备，done 关闭后 path 与 err 为结果
+type preparationRound struct {
+	done chan struct{}
+	path string
+	err  error
+}
+
+// preparation 是进程内共用的 Camoufox 准备：已就绪的路径、进行中的一轮与最近一轮失败的原因
+var preparation struct {
+	mu      sync.Mutex
+	path    string
+	round   *preparationRound
+	failure error
+}
+
+// PrepareInBackground 在 Camoufox 未就绪且没有进行中的准备时开始一轮后台准备，本机没有同版本 Camoufox 时经 proxy 下载
+func PrepareInBackground(proxy string) {
+	startPreparation(proxy)
+}
+
+// startPreparation 返回进行中的一轮准备，没有时开始一轮，已就绪时返回 nil
+func startPreparation(proxy string) *preparationRound {
+	preparation.mu.Lock()
+	defer preparation.mu.Unlock()
+	if preparation.path != "" || preparation.round != nil {
+		return preparation.round
+	}
+	round := &preparationRound{done: make(chan struct{})}
+	preparation.round, preparation.failure = round, nil
+	go func() {
+		round.path, round.err = FindExecutable(context.Background(), proxy)
+		if round.err != nil {
+			slog.Error("Camoufox 准备失败", "error", round.err)
+		}
+		preparation.mu.Lock()
+		preparation.round, preparation.path, preparation.failure = nil, round.path, round.err
+		preparation.mu.Unlock()
+		close(round.done)
+	}()
+	return round
+}
+
+// Prepare 返回同版本 Camoufox 的路径，未就绪时开始或加入进程内共用的后台准备并等到这一轮结束；ctx 结束只停止等待，不中止准备
+func Prepare(ctx context.Context, proxy string) (string, error) {
+	round := startPreparation(proxy)
+	if round == nil {
+		preparation.mu.Lock()
+		defer preparation.mu.Unlock()
+		return preparation.path, nil
+	}
+	select {
+	case <-round.done:
+		return round.path, round.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// ReadyPath 返回已就绪的 Camoufox 路径，正在准备时返回 *PreparingError，最近一轮准备失败时返回失败原因
+func ReadyPath() (string, error) {
+	preparation.mu.Lock()
+	defer preparation.mu.Unlock()
+	if preparation.path != "" {
+		return preparation.path, nil
+	}
+	if preparation.round == nil && preparation.failure != nil {
+		return "", preparation.failure
+	}
+	err := &PreparingError{}
+	if state := activeDownload.Load(); state != nil {
+		err.Download = &Download{Received: state.received.Load(), Total: state.total}
+		err.Remaining = state.remaining()
+	}
+	return "", err
+}
+
+// PreparationState 返回 Camoufox 的准备状态，没有准备过时按本机是否已有同版本 Camoufox 报告就绪
+func PreparationState() Preparation {
+	preparation.mu.Lock()
+	state := Preparation{Ready: preparation.path != "", Preparing: preparation.round != nil}
+	if preparation.failure != nil {
+		state.Error = preparation.failure.Error()
+	}
+	preparation.mu.Unlock()
+	if !state.Ready && !state.Preparing {
+		state.Ready = Installed()
+	}
+	if download, ok := DownloadProgress(); ok {
+		state.Download = &download
+	}
+	return state
 }
 
 // installCamoufox 经出口代理下载当前协议传输已对齐的 Camoufox 版本
@@ -64,7 +212,7 @@ func installCamoufox(ctx context.Context, executableName string, proxy string) (
 		return "", fmt.Errorf("创建 Camoufox 目录: %w", err)
 	}
 	archivePath := filepath.Join(filepath.Dir(root), asset+".part")
-	address := fmt.Sprintf("https://github.com/daijro/camoufox/releases/download/v%s/%s", camoufoxRelease, asset)
+	address := fmt.Sprintf("https://github.com/Mag1cFall/camoufox/releases/download/v%s/%s", camoufoxRelease, asset)
 	if err := downloadCamoufoxArchive(ctx, address, archivePath, proxy); err != nil {
 		if ctx.Err() != nil {
 			return "", err
@@ -106,7 +254,7 @@ func installCamoufox(ctx context.Context, executableName string, proxy string) (
 	return executable, nil
 }
 
-// downloadCamoufoxArchive 经出口代理把发行包写入 archivePath，文件已有部分内容时从末尾续传
+// downloadCamoufoxArchive 经出口代理把发行包写入 archivePath，文件已有部分内容时从末尾续传；连接中断、停滞或服务端 5xx 时依次等 1、2、4、8 秒后续传，最多尝试 downloadAttempts 次
 func downloadCamoufoxArchive(ctx context.Context, address string, archivePath string, proxy string) error {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	egress := "直连"
@@ -118,11 +266,33 @@ func downloadCamoufoxArchive(ctx context.Context, address string, archivePath st
 		transport.Proxy = http.ProxyURL(proxyURL)
 		egress = proxyURL.Redacted()
 	}
+	slog.Info("正在下载 Camoufox", "version", camoufoxRelease, "platform", runtime.GOOS+"/"+runtime.GOARCH, "egress", egress)
+	client := &http.Client{Transport: transport}
+	for attempt := 1; ; attempt++ {
+		err := fetchCamoufoxArchive(ctx, client, address, archivePath)
+		var status downloadStatusError
+		if err == nil || ctx.Err() != nil || errors.As(err, &status) && status < 500 || attempt == downloadAttempts {
+			return err
+		}
+		slog.Warn("Camoufox 下载中断，稍后续传", "attempt", attempt, "error", err)
+		select {
+		case <-time.After(time.Second << (attempt - 1)):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// fetchCamoufoxArchive 以一次请求把发行包从 archivePath 已有内容的末尾续写到结束
+func fetchCamoufoxArchive(ctx context.Context, client *http.Client, address string, archivePath string) error {
 	var offset int64
 	if info, err := os.Stat(archivePath); err == nil {
 		offset = info.Size()
 	}
-	slog.Info("正在下载 Camoufox", "version", camoufoxRelease, "platform", runtime.GOOS+"/"+runtime.GOARCH, "egress", egress)
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stall := time.AfterFunc(downloadStallTimeout, func() { cancel(errDownloadStalled) })
+	defer stall.Stop()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 	if err != nil {
 		return err
@@ -131,9 +301,9 @@ func downloadCamoufoxArchive(ctx context.Context, address string, archivePath st
 	if offset > 0 {
 		request.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
-	response, err := (&http.Client{Timeout: 30 * time.Minute, Transport: transport}).Do(request)
+	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("下载 Camoufox: %w", err)
+		return fmt.Errorf("下载 Camoufox: %w", stallCause(ctx, err))
 	}
 	defer response.Body.Close()
 	flags := os.O_CREATE | os.O_WRONLY
@@ -146,9 +316,9 @@ func downloadCamoufoxArchive(ctx context.Context, address string, archivePath st
 	case http.StatusRequestedRangeNotSatisfiable:
 		return nil
 	default:
-		return fmt.Errorf("下载 Camoufox: HTTP %d", response.StatusCode)
+		return downloadStatusError(response.StatusCode)
 	}
-	state := &downloadState{}
+	state := &downloadState{resumed: offset, started: time.Now(), stall: stall}
 	state.received.Store(offset)
 	if response.ContentLength > 0 {
 		state.total = offset + response.ContentLength
@@ -162,9 +332,17 @@ func downloadCamoufoxArchive(ctx context.Context, address string, archivePath st
 	defer activeDownload.Store(nil)
 	_, copyErr := io.Copy(io.MultiWriter(archive, state), contextReader{ctx: ctx, reader: response.Body})
 	if closeErr := archive.Close(); copyErr != nil || closeErr != nil {
-		return fmt.Errorf("保存 Camoufox: %w", firstError(copyErr, closeErr))
+		return fmt.Errorf("保存 Camoufox: %w", firstError(stallCause(ctx, copyErr), closeErr))
 	}
 	return nil
+}
+
+// stallCause 在下载因连续收不到数据而中止时返回 errDownloadStalled，其余情况原样返回 err
+func stallCause(ctx context.Context, err error) error {
+	if err != nil && errors.Is(context.Cause(ctx), errDownloadStalled) {
+		return errDownloadStalled
+	}
+	return err
 }
 
 func camoufoxInstallRoot() (string, error) {
@@ -184,45 +362,59 @@ func camoufoxAssetName() (string, error) {
 	return fmt.Sprintf("camoufox-%s-%s.%s.zip", camoufoxRelease, platform, architecture), nil
 }
 
+// extractCamoufoxArchive 把发行包解压到 destination：依次建出目录，文件以 CPU 数个协程并行写出，返回前等全部协程结束
 func extractCamoufoxArchive(ctx context.Context, archivePath string, destination string) error {
 	archive, err := zip.OpenReader(archivePath)
 	if err != nil {
 		return fmt.Errorf("打开 Camoufox 压缩包: %w", err)
 	}
 	defer archive.Close()
+	group, work := errgroup.WithContext(ctx)
+	group.SetLimit(runtime.NumCPU())
 	for _, entry := range archive.File {
-		if err := ctx.Err(); err != nil {
-			return err
+		if work.Err() != nil {
+			break
 		}
 		target := filepath.Join(destination, filepath.FromSlash(entry.Name))
 		relative, err := filepath.Rel(destination, target)
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			group.Wait()
 			return fmt.Errorf("Camoufox 压缩包包含无效路径 %q", entry.Name)
 		}
+		directory, mode := filepath.Dir(target), os.FileMode(0o755)
 		if entry.FileInfo().IsDir() {
-			if err := os.MkdirAll(target, entry.Mode()); err != nil {
-				return err
-			}
-			continue
+			directory, mode = target, entry.Mode()
 		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		if err := os.MkdirAll(directory, mode); err != nil {
+			group.Wait()
 			return err
 		}
-		source, err := entry.Open()
-		if err != nil {
-			return err
+		if !entry.FileInfo().IsDir() {
+			group.Go(func() error { return extractCamoufoxFile(work, entry, target) })
 		}
-		targetFile, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, entry.Mode())
-		if err != nil {
-			source.Close()
-			return err
-		}
-		_, copyErr := io.Copy(targetFile, contextReader{ctx: ctx, reader: source})
-		closeTargetErr := targetFile.Close()
-		closeSourceErr := source.Close()
-		if copyErr != nil || closeTargetErr != nil || closeSourceErr != nil {
-			return fmt.Errorf("解压 Camoufox %s: %w", entry.Name, firstError(copyErr, closeTargetErr, closeSourceErr))
-		}
+	}
+	if err := group.Wait(); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+// extractCamoufoxFile 把压缩包中的一个文件写到 target
+func extractCamoufoxFile(ctx context.Context, entry *zip.File, target string) error {
+	source, err := entry.Open()
+	if err != nil {
+		return err
+	}
+	targetFile, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, entry.Mode())
+	if err != nil {
+		source.Close()
+		return err
+	}
+	_, copyErr := io.Copy(targetFile, contextReader{ctx: ctx, reader: source})
+	closeTargetErr := targetFile.Close()
+	closeSourceErr := source.Close()
+	if copyErr != nil || closeTargetErr != nil || closeSourceErr != nil {
+		return fmt.Errorf("解压 Camoufox %s: %w", entry.Name, firstError(copyErr, closeTargetErr, closeSourceErr))
 	}
 	return nil
 }

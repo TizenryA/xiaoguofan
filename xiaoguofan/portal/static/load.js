@@ -8,10 +8,11 @@
   last=d.timestamp;const m=d.memory,p=d.pool,c=d.cpu;
   node('load-memory').textContent=m.used_bytes==null?'—':(m.used_bytes/1048576).toFixed(0)+' MiB';
   const bar=node('load-memory-bar');bar.max=m.limit_bytes;if(m.used_bytes==null)bar.removeAttribute('value');else bar.value=m.used_bytes;
-  node('load-memory-note').textContent=m.used_bytes>=m.high_bytes?'内存接近预算，优先回收空闲池':'总预算包含所有用户池与门户进程';
+  node('load-memory-note').textContent=m.used_bytes>=m.high_bytes?'内存接近预算，账号池按 30 分钟续期':'总预算包含所有用户池与门户进程';
   node('load-cpu').textContent=c.percent==null?'采样中':c.percent.toFixed(1)+'%';
+  node('load-queue').textContent='排队 '+number(d.requests.queued)+' · 本人 '+number(d.requests.user_queued);
   node('load-requests').textContent=number(d.requests.active)+' / '+number(d.requests.limit);
-  node('load-running').textContent=number(p.running);node('load-pool-note').textContent='名额上限 '+number(p.limit)+' · 实际受内存预算限制';
+  node('load-running').textContent=number(p.running);node('load-pool-note').textContent='可用池 '+number(p.limit)+' · 空闲 30 分钟关闭';
   for(const k of ['active','idle','starting','evictions'])node('load-'+k).textContent=number(p[k]);
   node('load-time').textContent='更新于 '+new Date(last*1000).toLocaleTimeString('zh-CN');state('实时采样',null);
  }

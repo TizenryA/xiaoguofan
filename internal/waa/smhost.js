@@ -14,6 +14,7 @@
   const arrayBufferDetached = getOwnPropertyDescriptor(ArrayBuffer.prototype, 'detached').get;
   const indirectEval = g.eval;
   const now = natives.now;
+  const taskStarted = natives.taskStarted;
   if (!shared) {
     shared = {
       registry: { native: new WeakMap(), trusted: new WeakMap() },
@@ -24,6 +25,26 @@
       notifiers: new Map(),
       reporters: new Map(),
       rejections: { pending: [], handled: [], notified: new Map() },
+    };
+    // 各接口默认值在首次读取时由宿主的只读形状表解析
+    const defaults = shared.shape.defaults;
+    for (const name of parseJSON(config.shapeDefaults)) {
+      defineProperty(defaults, name, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          const value = parseJSON(natives.shapeEntry('defaults', name));
+          defineProperty(defaults, name, { configurable: true, enumerable: true, writable: true, value });
+          return value;
+        },
+      });
+    }
+    // members 返回接口 name 的原型成员，首次读取时由宿主的只读形状表解析
+    const members = new Map();
+    shared.shape.members = name => {
+      let value = members.get(name);
+      if (!value) members.set(name, value = parseJSON(natives.shapeEntry('pr', name)));
+      return value;
     };
   }
   const registry = shared.registry;
@@ -123,17 +144,14 @@
     const set = ancestors[iface];
     return set ? set.has(target) : iface === target;
   };
-  const templates = [];
   let resolver = null;
-  // materialize 按模板键顺序定义已创建原型的成员
-  const materialize = () => {
-    for (const [object, id, keys] of templates.splice(0)) {
-      for (let index = 0; index < keys.length; index++) {
-        const key = keys[index];
-        const [accessor, value, get, set, writable, enumerable, configurable] = resolver(id, index);
-        const name = typeof key === 'string' && key.startsWith('@@') ? Symbol[key.slice(2)] : key;
-        defineProperty(object, name, accessor ? { get, set, enumerable, configurable } : { value, writable, enumerable, configurable });
-      }
+  // materialize 按模板键顺序定义接口原型的成员
+  const materialize = (object, id, keys) => {
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index];
+      const [accessor, value, get, set, writable, enumerable, configurable] = resolver(id, index);
+      const name = typeof key === 'string' && key.startsWith('@@') ? Symbol[key.slice(2)] : key;
+      defineProperty(object, name, accessor ? { get, set, enumerable, configurable } : { value, writable, enumerable, configurable });
     }
   };
   // orderKeys 把自有字符串键从首个与 names 顺序不同的位置起按 names 顺序重新定义
@@ -180,7 +198,6 @@
         for (let parent = table[name]; parent; parent = table[String(parent)]) set.add(String(parent));
         ancestors[name] = set;
       }
-      materialize();
     },
     isA: (iface, target) => isA(String(iface), String(target)),
     brandCheck(self, iface) {
@@ -195,6 +212,7 @@
     profile: parseJSON(config.profileJSON),
     timeOrigin: config.timeOrigin,
     performanceNow: () => mathFloor(now() - started),
+    inputNow: () => mathFloor(taskStarted() - started),
     preciseNow: () => mathFloor((now() - started) * 1000) / 1000,
     queueTask(delay, callback) {
       const wait = +delay;
@@ -209,9 +227,7 @@
     digest: (name, data) => natives.digest(String(name), data),
     encodingName: label => natives.encodingName(String(label)),
     templatedObject(id, keys, proto) {
-      const object = Object.create(proto);
-      templates.push([object, id, keys]);
-      return object;
+      return natives.templateObject(proto, object => materialize(object, id, keys));
     },
     setTemplateResolver(resolve) { resolver = resolve; },
     parseURL: (text, base) => record(natives.parseURL(String(text), base === undefined ? undefined : String(base))),
@@ -234,6 +250,13 @@
       const id = ++nextTask;
       tasks.set(id, loaded => { try { callback(loaded); } catch (error) {} });
       natives.loadImage(String(address), id);
+    };
+  }
+  if (natives.loadFrame) {
+    input.loadFrame = (address, callback) => {
+      const id = ++nextTask;
+      tasks.set(id, loaded => { try { callback(loaded); } catch (error) {} });
+      natives.loadFrame(String(address), id);
     };
   }
   const api = install(input);
@@ -261,6 +284,12 @@
     api,
     dispatch,
     report: error => api.reportException(error),
+    // activate 在顶层页面记录一次用户点击或按键
+    activate: () => api.activate(),
+    // mouseInput 在顶层页面按 Firefox 可信鼠标输入依次派发事件
+    mouseInput: (nodes, rects, target, left, point, movement, blurred, focused, types) => api.mouseInput(nodes, rects, target, left, point, movement, blurred, focused, types),
+    // keyInput 在顶层页面按 Firefox 可信键盘输入依次派发事件
+    keyInput: (target, text, types) => api.keyInput(target, text, types),
     shared,
     // track 按 Promise 拒绝跟踪事件维护未处理与已处理队列
     track(promise, handled, global) {

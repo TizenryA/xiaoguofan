@@ -32,6 +32,7 @@ type RequestLedger interface {
 	BodyCapture() bool
 	SaveBody(RequestBody)
 	Usage(context.Context, UsageQuery) (UsageReport, error)
+	UsagePairs(context.Context, UsageQuery) ([]UsagePair, error)
 	Records(context.Context, UsageRecordQuery) (UsageRecordPage, error)
 	ExportRecords(context.Context, UsageRecordQuery, io.Writer) error
 	RequestBody(context.Context, string) (RequestBody, error)
@@ -131,7 +132,6 @@ type UsageReport struct {
 	StackBy        string                  `json:"stack_by"`
 	Series         []UsageSeries           `json:"series"`
 	Groups         map[string][]UsageGroup `json:"groups"`
-	Pairs          []UsagePair             `json:"pairs"`
 	Options        map[string][]string     `json:"options"`
 }
 
@@ -190,6 +190,14 @@ func decodeUsageCursor(value string) (*UsageCursor, error) {
 	return &UsageCursor{Time: time.UnixMilli(milliseconds).UTC(), ID: id}, nil
 }
 
+// ProofPhasesMS 是生成 WAA proof 的分项毫秒数：等待操作锁、界面操作、等待 VM 重建与 VM 生成 proof
+type ProofPhasesMS struct {
+	LockMS        float64 `json:"lock_ms"`
+	InteractionMS float64 `json:"interaction_ms"`
+	RefreshMS     float64 `json:"refresh_ms"`
+	ComputeMS     float64 `json:"compute_ms"`
+}
+
 // UsageRecord 是一条已完成请求的账本记录
 type UsageRecord struct {
 	ID              string           `json:"id"`
@@ -204,6 +212,8 @@ type UsageRecord struct {
 	DurationMS      int64            `json:"duration_ms"`
 	FirstEventMS    int64            `json:"first_event_ms"`
 	QueueMS         int64            `json:"queue_ms"`
+	ProofMS         int64            `json:"proof_ms"`
+	ProofPhases     ProofPhasesMS    `json:"proof_phases"`
 	InputTokens     int64            `json:"input_tokens"`
 	CachedTokens    int64            `json:"cached_tokens"`
 	ReasoningTokens int64            `json:"reasoning_tokens"`
@@ -234,6 +244,7 @@ type RequestBody struct {
 // registerLedger 注册用量统计、请求记录与请求正文接口
 func (s *server) registerLedger(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/usage", s.handleUsage)
+	mux.HandleFunc("GET /api/usage/pairs", s.handleUsagePairs)
 	mux.HandleFunc("GET /api/usage/records", s.handleUsageRecords)
 	mux.HandleFunc("GET /api/usage/records.csv", s.handleUsageExport)
 	mux.HandleFunc("GET /api/requests/{id}/body", s.handleRequestBody)
@@ -274,13 +285,13 @@ func parseUsageRange(values url.Values) (time.Time, time.Time, error) {
 	return from.UTC(), to.UTC(), nil
 }
 
-// parseUsageFilters 读取各维度的筛选值，逗号分隔多个取值，空值与重复值被忽略
+// parseUsageFilters 读取各维度的筛选值，逗号分隔多个取值，空字符串筛出该维度为空的记录，重复值被忽略
 func parseUsageFilters(values map[string][]string) UsageFilters {
 	filters := UsageFilters{}
 	for _, dimension := range UsageDimensions {
 		for _, value := range values[dimension] {
 			for _, item := range strings.Split(value, ",") {
-				if item = strings.TrimSpace(item); item != "" && !slices.Contains(filters[dimension], item) {
+				if item = strings.TrimSpace(item); !slices.Contains(filters[dimension], item) {
 					filters[dimension] = append(filters[dimension], item)
 				}
 			}
@@ -329,6 +340,21 @@ func (s *server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, report)
+}
+
+func (s *server) handleUsagePairs(w http.ResponseWriter, r *http.Request) {
+	values := r.URL.Query()
+	from, to, err := parseUsageRange(values)
+	if err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	pairs, err := s.config.Ledger.UsagePairs(r.Context(), UsageQuery{From: from, To: to, Filters: parseUsageFilters(values)})
+	if err != nil {
+		writeAdminError(w, statusFromError(err), "usage_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string][]UsagePair{"pairs": pairs})
 }
 
 // parseUsageRecordQuery 读取请求记录的范围、筛选、状态码、关键字与分页参数
@@ -402,18 +428,18 @@ func (s *server) handleRequestBody(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
-// bodyCapture 保存截断后的正文与原始字节数
+// bodyCapture 保存截断后的正文与原始字节数，result 直接返回已保存的正文不另复制
 type bodyCapture struct {
 	mu   sync.Mutex
-	data []byte
+	data strings.Builder
 	size int64
 }
 
 func (capture *bodyCapture) add(data []byte) {
 	capture.mu.Lock()
 	capture.size += int64(len(data))
-	if room := requestBodyLimit - len(capture.data); room > 0 {
-		capture.data = append(capture.data, data[:min(room, len(data))]...)
+	if room := requestBodyLimit - capture.data.Len(); room > 0 {
+		capture.data.Write(data[:min(room, len(data))])
 	}
 	capture.mu.Unlock()
 }
@@ -421,7 +447,7 @@ func (capture *bodyCapture) add(data []byte) {
 func (capture *bodyCapture) result() (string, int64) {
 	capture.mu.Lock()
 	defer capture.mu.Unlock()
-	return string(capture.data), capture.size
+	return capture.data.String(), capture.size
 }
 
 // captureReader 在读取请求正文时复制前缀
@@ -467,6 +493,7 @@ func requestBodyMiddleware(ledger RequestLedger, next http.Handler) http.Handler
 			return
 		}
 		request, response := &bodyCapture{}, &bodyCapture{}
+		request.data.Grow(int(min(max(r.ContentLength, 0), requestBodyLimit)))
 		r.Body = &captureReader{ReadCloser: r.Body, capture: request}
 		next.ServeHTTP(&captureWriter{ResponseWriter: w, capture: response}, r)
 		body := RequestBody{ID: r.Context().Value(accessLogContextKey{}).(*accessLogMetadata).id(), Time: time.Now().UTC()}

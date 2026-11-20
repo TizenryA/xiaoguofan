@@ -1,13 +1,12 @@
 import { useI18n } from '@/i18n'
-import type { Model, ThinkingLevel } from '@/types'
-import { Capability, hasCode } from './catalog'
+import type { Model } from '@/types'
+import { Capability, hasCode, isOmniModel } from './catalog'
 
-// ZeroStarter 是对话空态的示例提示词：可带参考图片、思考档位与开启的工具
+// ZeroStarter 是对话空态的示例提示词：可带参考图片与开启的工具
 export interface ZeroStarter {
   title: string
   prompt: string
   images?: string[]
-  thinkingLevel?: ThinkingLevel
   search?: boolean
   codeExecution?: boolean
 }
@@ -15,17 +14,19 @@ export interface ZeroStarter {
 // ZeroExample 是对话空态右侧的示例卡片，点击与示例提示词相同
 interface ZeroExample extends ZeroStarter {
   preview: string
+  video?: string
   detection?: { label: string; inset?: string }
 }
 
 // ZeroConfig 是官网按模型系列配置的对话空态
 interface ZeroConfig {
   id: string
-  kind: 'chat' | 'images' | 'robotics'
+  kind: 'chat' | 'images' | 'robotics' | 'video'
   family: string
   title: string
   subtitle: string
   docs?: string
+  builtBy?: string
   starters: ZeroStarter[]
   examples: ZeroExample[]
   matches: (model: Model) => boolean
@@ -35,6 +36,14 @@ const { t } = useI18n()
 
 // zeroImage 是官网空态示例资源的地址
 const zeroImage = (name: string) => `https://www.gstatic.com/aistudio/zero-state/${name}`
+
+// maxVideoSeconds 返回 Omni 模型目录中视频时长的上限，没有视频时长选项时为 0
+function maxVideoSeconds(model: Model): number {
+  const item = model.capability_options?.video_duration_range?.find((entry) =>
+    entry.startsWith('max='),
+  )
+  return Number(item?.slice(4) ?? 0)
+}
 
 // zeroConfigs 返回当前界面语言的官网对话页空态配置，按官网顺序取第一个匹配的配置
 function zeroConfigs(): ZeroConfig[] {
@@ -81,6 +90,99 @@ function zeroConfigs(): ZeroConfig[] {
       matches: (model) => model.id.includes('robotics'),
     },
     {
+      id: 'omni-1-2',
+      kind: 'video',
+      family: 'Gemini Omni 1.2 Flash',
+      title: t('pg.videoEmptyTitle'),
+      subtitle: t('zero.omni12.subtitle'),
+      starters: [
+        { title: t('zero.omni12.starter1'), prompt: t('zero.omni12.starter1Prompt') },
+        { title: t('zero.omni12.starter2'), prompt: t('zero.omni12.starter2Prompt') },
+        { title: t('zero.omni12.starter3'), prompt: t('zero.omni12.starter3Prompt') },
+      ],
+      examples: [
+        {
+          title: t('zero.omni12.example1'),
+          prompt: t('zero.omni12.example1Prompt'),
+          preview: zeroImage('omni_1_2_ramen_bar.webp'),
+          video: zeroImage('omni_1_2_ramen_bar.mp4'),
+          images: [
+            zeroImage('omni_1_2_ramen_first_frame.webp'),
+            zeroImage('omni_1_2_ramen_last_frame.webp'),
+          ],
+        },
+        {
+          title: t('zero.omni12.example2'),
+          prompt: t('zero.omni12.example2Prompt'),
+          preview: zeroImage('omni_1_2_conservatory_voices.webp'),
+          video: zeroImage('omni_1_2_conservatory_voices.mp4'),
+          images: [
+            'location',
+            'location_lineup',
+            'pip_1',
+            'pip_2',
+            'pip_3',
+            'cosmo_1',
+            'cosmo_2',
+            'cosmo_3',
+            'arthur_1',
+            'arthur_2',
+            'arthur_3',
+            'mateo_1',
+            'mateo_2',
+            'mateo_3',
+          ].map((name) => zeroImage(`omni_1_2_conservatory_${name}.webp`)),
+        },
+        {
+          title: t('zero.omni12.example3'),
+          prompt: t('zero.omni12.example3Prompt'),
+          preview: zeroImage('omni_1_2_bee_hive.webp'),
+          video: zeroImage('omni_1_2_bee_hive.mp4'),
+          images: [zeroImage('omni_1_2_bee_hive_style_frame.webp')],
+        },
+      ],
+      matches: (model) => isOmniModel(model) && maxVideoSeconds(model) >= 15,
+    },
+    {
+      id: 'omni',
+      kind: 'video',
+      family: 'Gemini Omni',
+      title: t('pg.videoEmptyTitle'),
+      subtitle: t('zero.omni.subtitle'),
+      starters: [
+        {
+          title: t('zero.omni.starter1'),
+          prompt: t('zero.omni.starter1Prompt'),
+          images: [zeroImage('omni-surfer-frame.webp')],
+        },
+        {
+          title: t('zero.omni.starter2'),
+          prompt: t('zero.omni.starter2Prompt'),
+          images: [zeroImage('omni-submersible-frame.webp')],
+        },
+        {
+          title: t('zero.omni.starter3'),
+          prompt: t('zero.omni.starter3Prompt'),
+          images: [zeroImage('omni-fashion-frame.webp')],
+        },
+      ],
+      examples: [
+        {
+          title: t('zero.omni.example1'),
+          prompt: t('zero.omni.example1Prompt'),
+          preview: zeroImage('omni_ink_diorama.webp'),
+          video: zeroImage('omni_ink_diorama.mp4'),
+        },
+        {
+          title: t('zero.omni.example2'),
+          prompt: t('zero.omni.example2Prompt'),
+          preview: zeroImage('veo_3_1_tokyo_rain.webp'),
+          video: zeroImage('veo_3_1_tokyo_rain.mp4'),
+        },
+      ],
+      matches: isOmniModel,
+    },
+    {
       id: 'nano-banana-2-1',
       kind: 'images',
       family: 'Nano Banana',
@@ -91,17 +193,14 @@ function zeroConfigs(): ZeroConfig[] {
           title: t('zero.nanoBanana21.starter1'),
           prompt: t('zero.nanoBanana21.starter1Prompt'),
           images: [zeroImage('nb21-outfit-ref.webp')],
-          thinkingLevel: 'MEDIUM',
         },
         {
           title: t('zero.nanoBanana21.starter2'),
           prompt: t('zero.nanoBanana21.starter2Prompt'),
-          thinkingLevel: 'HIGH',
         },
         {
           title: t('zero.nanoBanana21.starter3'),
           prompt: t('zero.nanoBanana21.starter3Prompt'),
-          thinkingLevel: 'HIGH',
         },
       ],
       examples: [
@@ -109,19 +208,16 @@ function zeroConfigs(): ZeroConfig[] {
           title: t('zero.nanoBanana21.example1'),
           prompt: t('zero.nanoBanana21.example1Prompt'),
           preview: zeroImage('nano_banana_2_1_magazine_cover.webp'),
-          thinkingLevel: 'HIGH',
         },
         {
           title: t('zero.nanoBanana21.example2'),
           prompt: t('zero.nanoBanana21.example2Prompt'),
           preview: zeroImage('nano_banana_2_1_camera_knolling.webp'),
-          thinkingLevel: 'HIGH',
         },
         {
           title: t('zero.nanoBanana21.example3'),
           prompt: t('zero.nanoBanana21.example3Prompt'),
           preview: zeroImage('nano_banana_2_1_swiss_poster.webp'),
-          thinkingLevel: 'HIGH',
         },
       ],
       matches: (model) => model.id.includes('nano-banana-2.1'),
@@ -137,18 +233,15 @@ function zeroConfigs(): ZeroConfig[] {
           title: t('zero.nanoBananaLite.starter1'),
           prompt: t('zero.nanoBananaLite.starter1Prompt'),
           images: [zeroImage('nbl-corgi-ref.webp')],
-          thinkingLevel: 'MINIMAL',
         },
         {
           title: t('zero.nanoBananaLite.starter2'),
           prompt: t('zero.nanoBananaLite.starter2Prompt'),
           images: [zeroImage('nbl-kettle-ref.webp')],
-          thinkingLevel: 'MINIMAL',
         },
         {
           title: t('zero.nanoBananaLite.starter3'),
           prompt: t('zero.nanoBananaLite.starter3Prompt'),
-          thinkingLevel: 'MINIMAL',
         },
       ],
       examples: [
@@ -156,20 +249,17 @@ function zeroConfigs(): ZeroConfig[] {
           title: t('zero.nanoBananaLite.example1'),
           prompt: t('zero.nanoBananaLite.example1Prompt'),
           preview: zeroImage('nbl-sticker-sheet.webp'),
-          thinkingLevel: 'HIGH',
         },
         {
           title: t('zero.nanoBananaLite.example2'),
           prompt: t('zero.nanoBananaLite.example2Prompt'),
           preview: zeroImage('nbl-sneaker-colorways.webp'),
-          thinkingLevel: 'HIGH',
         },
         {
           title: t('zero.nanoBananaLite.example3'),
           prompt: t('zero.nanoBananaLite.example3Prompt'),
           preview: zeroImage('nbl-corgi-amalfi.webp'),
           images: [zeroImage('nbl-corgi-ref.webp')],
-          thinkingLevel: 'MINIMAL',
         },
       ],
       matches: (model) =>
@@ -234,39 +324,37 @@ function zeroConfigs(): ZeroConfig[] {
         {
           title: t('zero.flashLite.starter1'),
           prompt: t('zero.flashLite.starter1Prompt'),
-          thinkingLevel: 'MINIMAL',
         },
         {
           title: t('zero.flashLite.starter2'),
           prompt: t('zero.flashLite.starter2Prompt'),
-          thinkingLevel: 'LOW',
         },
         {
           title: t('zero.flashLite.starter3'),
           prompt: t('zero.flashLite.starter3Prompt'),
-          thinkingLevel: 'MINIMAL',
         },
       ],
       examples: [
         {
           title: t('zero.flashLite.example1'),
           prompt: t('zero.flashLite.example1Prompt'),
-          preview: 'https://www.gstatic.com/aistudio-static/applets/pixel-arcade/image.png',
-          thinkingLevel: 'MINIMAL',
+          preview:
+            'https://www.gstatic.com/aistudio/starter-apps/zero-state-assets/gridscape-16-9.webp',
         },
         {
           title: t('zero.flashLite.example2'),
           prompt: t('zero.flashLite.example2Prompt'),
-          preview: 'https://www.gstatic.com/aistudio-static/applets/shoebox-receipts/image.png',
-          thinkingLevel: 'MINIMAL',
+          preview:
+            'https://www.gstatic.com/aistudio/starter-apps/zero-state-assets/peekaword-3-2.webp',
         },
         {
           title: t('zero.flashLite.example3'),
           prompt: t('zero.flashLite.example3Prompt'),
-          preview: 'https://www.gstatic.com/aistudio-static/applets/website-checker/image.png',
-          thinkingLevel: 'LOW',
+          preview:
+            'https://www.gstatic.com/aistudio/starter-apps/zero-state-assets/moodboard-3-2.webp',
         },
       ],
+      builtBy: t('zero.builtBy'),
       matches: (model) =>
         model.id.startsWith('gemini-') &&
         model.id.includes('flash-lite') &&
@@ -282,17 +370,14 @@ function zeroConfigs(): ZeroConfig[] {
         {
           title: t('zero.flash.starter1'),
           prompt: t('zero.flash.starter1Prompt'),
-          thinkingLevel: 'LOW',
         },
         {
           title: t('zero.flash.starter2'),
           prompt: t('zero.flash.starter2Prompt'),
-          thinkingLevel: 'MINIMAL',
         },
         {
           title: t('zero.flash.starter3'),
           prompt: t('zero.flash.starter3Prompt'),
-          thinkingLevel: 'LOW',
           search: true,
         },
       ],
@@ -300,23 +385,23 @@ function zeroConfigs(): ZeroConfig[] {
         {
           title: t('zero.flash.example1'),
           prompt: t('zero.flash.example1Prompt'),
-          preview: 'https://www.gstatic.com/aistudio/starter-apps/thumbnails/Neon_Snake.png',
-          thinkingLevel: 'LOW',
+          preview:
+            'https://www.gstatic.com/aistudio/starter-apps/zero-state-assets/tickr-16-9.webp',
         },
         {
           title: t('zero.flash.example2'),
           prompt: t('zero.flash.example2Prompt'),
-          preview: 'https://www.gstatic.com/aistudio/starter-apps/thumbnails/lumina.png',
-          thinkingLevel: 'LOW',
+          preview:
+            'https://www.gstatic.com/aistudio-static/applets/interactive-annual-report/image.png',
         },
         {
           title: t('zero.flash.example3'),
           prompt: t('zero.flash.example3Prompt'),
           preview:
-            'https://www.gstatic.com/aistudio/starter-apps/thumbnails/map-styling-sandbox.png',
-          thinkingLevel: 'LOW',
+            'https://www.gstatic.com/aistudio/starter-apps/zero-state-assets/dinodraft-3-2.webp',
         },
       ],
+      builtBy: t('zero.builtBy'),
       matches: (model) =>
         model.id.startsWith('gemini-') &&
         model.id.includes('flash') &&
@@ -333,18 +418,15 @@ function zeroConfigs(): ZeroConfig[] {
         {
           title: t('zero.pro.starter1'),
           prompt: t('zero.pro.starter1Prompt'),
-          thinkingLevel: 'HIGH',
         },
         {
           title: t('zero.pro.starter2'),
           prompt: t('zero.pro.starter2Prompt'),
-          thinkingLevel: 'HIGH',
           codeExecution: true,
         },
         {
           title: t('zero.pro.starter3'),
           prompt: t('zero.pro.starter3Prompt'),
-          thinkingLevel: 'HIGH',
           search: true,
         },
       ],
@@ -353,20 +435,17 @@ function zeroConfigs(): ZeroConfig[] {
           title: t('zero.pro.example1'),
           prompt: t('zero.pro.example1Prompt'),
           preview: 'https://www.gstatic.com/aistudio/starter-apps/thumbnails/voxel_toy_box.png',
-          thinkingLevel: 'HIGH',
         },
         {
           title: t('zero.pro.example2'),
           prompt: t('zero.pro.example2Prompt'),
           preview: 'https://www.gstatic.com/aistudio/starter-apps/thumbnails/shader_pilot.png',
-          thinkingLevel: 'HIGH',
         },
         {
           title: t('zero.pro.example3'),
           prompt: t('zero.pro.example3Prompt'),
           preview:
             'https://www.gstatic.com/aistudio/starter-apps/thumbnails/research_visualization.png',
-          thinkingLevel: 'HIGH',
         },
       ],
       matches: (model) =>
@@ -383,20 +462,17 @@ function zeroConfigs(): ZeroConfig[] {
         {
           title: t('zero.flagship.starter1'),
           prompt: t('zero.flagship.starter1Prompt'),
-          thinkingLevel: 'HIGH',
           search: true,
           codeExecution: true,
         },
         {
           title: t('zero.flagship.starter2'),
           prompt: t('zero.flagship.starter2Prompt'),
-          thinkingLevel: 'HIGH',
           search: true,
         },
         {
           title: t('zero.flagship.starter3'),
           prompt: t('zero.flagship.starter3Prompt'),
-          thinkingLevel: 'HIGH',
         },
       ],
       examples: [
@@ -404,22 +480,20 @@ function zeroConfigs(): ZeroConfig[] {
           title: t('zero.flagship.example1'),
           prompt: t('zero.flagship.example1Prompt'),
           preview: 'https://www.gstatic.com/aistudio-static/applets/wizard-chess-3d/image.png',
-          thinkingLevel: 'HIGH',
         },
         {
           title: t('zero.flagship.example2'),
           prompt: t('zero.flagship.example2Prompt'),
           preview:
             'https://www.gstatic.com/aistudio-static/applets/pocket-world-terrarium/image.png',
-          thinkingLevel: 'HIGH',
         },
         {
           title: t('zero.flagship.example3'),
           prompt: t('zero.flagship.example3Prompt'),
           preview: 'https://www.gstatic.com/aistudio-static/applets/desk-racer/image.png',
-          thinkingLevel: 'HIGH',
         },
       ],
+      builtBy: t('zero.builtBy'),
       matches: (model) => model.id.startsWith('gemini-') && !model.id.includes('pro'),
     },
   ]

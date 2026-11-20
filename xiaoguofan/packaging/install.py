@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 HERE=Path(__file__).resolve().parent
-VERSION='0.9.15'
+VERSION='0.9.22'
 
 
 def run(*args,**kw):return subprocess.run(list(args),check=True,**kw)

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,9 +19,11 @@ var errIncompleteStream = errors.New("upstream stream closed before finish")
 const streamHeartbeatInterval = 10 * time.Second
 
 type generationResult struct {
+	// streamed 表示正文、思考与内联媒体已逐个写给客户端，结果中不再保留
+	streamed      bool
 	events        []aistudio.Event
-	text          strings.Builder
-	reasoning     strings.Builder
+	text          bytes.Buffer
+	reasoning     bytes.Buffer
 	toolCalls     []aistudio.FunctionCall
 	citations     []aistudio.Citation
 	grounding     *aistudio.GroundingMetadata
@@ -38,6 +41,11 @@ type generationResult struct {
 	turnToken            string
 	debugInfo            json.RawMessage
 	detailedFinishReason json.RawMessage
+	// interactionID 与 accountID 是 agent 后台任务的上游 interaction ID 与所属账户
+	interactionID string
+	accountID     string
+	// environmentID 是 agent 交互返回的远程环境 ID
+	environmentID string
 }
 
 func (result *generationResult) apply(event aistudio.Event) error {
@@ -50,6 +58,9 @@ func (result *generationResult) apply(event aistudio.Event) error {
 	if event.TurnToken != "" {
 		result.turnToken = event.TurnToken
 	}
+	if event.InteractionID != "" {
+		result.interactionID, result.accountID = event.InteractionID, event.AccountID
+	}
 	if len(event.DebugInfo) > 0 {
 		result.debugInfo = event.DebugInfo
 	}
@@ -61,13 +72,22 @@ func (result *generationResult) apply(event aistudio.Event) error {
 	case aistudio.EventError:
 		return event.Err
 	case aistudio.EventText:
+		if result.streamed {
+			return nil
+		}
 		result.text.WriteString(event.Text)
 	case aistudio.EventReasoning:
+		if result.streamed {
+			return nil
+		}
 		result.reasoning.WriteString(event.Text)
 	case aistudio.EventToolCall:
 		result.toolCalls = append(result.toolCalls, *event.FunctionCall)
 	case aistudio.EventGrounding:
 		grounding := *event.Grounding
+		if result.grounding != nil {
+			grounding.URLContext = mergeURLContext(result.grounding.URLContext, grounding.URLContext)
+		}
 		result.grounding = &grounding
 		result.citations = append(result.citations, groundingCitations(grounding)...)
 	case aistudio.EventCitation:
@@ -80,6 +100,9 @@ func (result *generationResult) apply(event aistudio.Event) error {
 			if event.InlineData.MIME == "" || len(event.InlineData.Data) == 0 {
 				return fmt.Errorf("upstream media is missing MIME or content")
 			}
+			if result.streamed {
+				return nil
+			}
 			if count := len(result.events); count > 0 && result.events[count-1].Kind == aistudio.EventMedia && aistudio.MergePCM(&result.events[count-1].Part, event.Part) {
 				result.media[len(result.media)-1].Data = result.events[count-1].InlineData.Data
 				return nil
@@ -91,6 +114,7 @@ func (result *generationResult) apply(event aistudio.Event) error {
 		}
 	case aistudio.EventFinish:
 		result.finishReason = event.FinishReason
+		result.environmentID = event.EnvironmentID
 		result.finishMessage = event.FinishMessage
 		result.stopSequence = event.StopSequence
 		result.safetyRatings = event.SafetyRatings
@@ -101,22 +125,35 @@ func (result *generationResult) apply(event aistudio.Event) error {
 	return nil
 }
 
-// awaitStreamStart 在写出流式响应头前等待首个事件，首个事件为错误时返回该错误，心跳间隔内没有事件时直接返回原事件流
-func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event) (<-chan aistudio.Event, error) {
+// mergeURLContext 返回 previous 加上 next 中的网址读取结果，同一网址取 next 的结果
+func mergeURLContext(previous, next []aistudio.URLMetadata) []aistudio.URLMetadata {
+	merged := slices.Clone(previous)
+	for _, item := range next {
+		if index := slices.IndexFunc(merged, func(old aistudio.URLMetadata) bool { return old.RetrievedURL == item.RetrievedURL }); index >= 0 {
+			merged[index] = item
+		} else {
+			merged = append(merged, item)
+		}
+	}
+	return merged
+}
+
+// awaitStreamStart 在写出流式响应头前等待首个事件，返回重放该事件的事件流与首个事件所在上游帧的用量；首个事件为错误时返回该错误，心跳间隔内没有事件时直接返回原事件流
+func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event) (<-chan aistudio.Event, *aistudio.Usage, error) {
 	timer := time.NewTimer(streamHeartbeatInterval)
 	defer timer.Stop()
 	var first aistudio.Event
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	case <-timer.C:
-		return events, nil
+		return events, nil, nil
 	case event, ok := <-events:
 		if !ok {
-			return nil, errIncompleteStream
+			return nil, nil, errIncompleteStream
 		}
 		if event.Kind == aistudio.EventError {
-			return nil, event.Err
+			return nil, nil, event.Err
 		}
 		first = event
 	}
@@ -131,39 +168,29 @@ func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event) (<-chan
 			}
 		}
 	}()
-	return replay, nil
+	return replay, first.FrameUsage, nil
 }
 
-// consumeEvents 收集全部事件，不逐个转发也不写心跳
+// consumeEvents 收集全部事件，不逐个转发
 func consumeEvents(ctx context.Context, events <-chan aistudio.Event) (generationResult, error) {
-	return consumeStreamEvents(ctx, events, nil, nil)
+	return consumeStreamEvents(ctx, events, nil)
 }
 
-// consumeStreamEvents 收集事件并逐个交给 emit，heartbeat 不为空时在事件间隔达到心跳间隔时调用
-func consumeStreamEvents(
-	ctx context.Context,
-	events <-chan aistudio.Event,
-	emit func(aistudio.Event) error,
-	heartbeat func() error,
-) (result generationResult, resultErr error) {
+// consumeStreamEvents 收集事件并逐个交给 emit
+func consumeStreamEvents(ctx context.Context, events <-chan aistudio.Event, emit func(aistudio.Event) error) (generationResult, error) {
+	return collectStreamEvents(ctx, events, emit, false)
+}
+
+// collectStreamEvents 收集事件并逐个交给 emit，streamed 为真时 emit 写出的正文、思考与内联媒体不留在结果中
+func collectStreamEvents(ctx context.Context, events <-chan aistudio.Event, emit func(aistudio.Event) error, streamed bool) (result generationResult, resultErr error) {
+	result.streamed = streamed
 	defer func() {
 		SetAccessLogError(ctx, resultErr)
 	}()
-	heartbeatTimer := time.NewTimer(streamHeartbeatInterval)
-	defer heartbeatTimer.Stop()
-	var heartbeatTick <-chan time.Time
-	if heartbeat != nil {
-		heartbeatTick = heartbeatTimer.C
-	}
 	for {
 		select {
 		case <-ctx.Done():
 			return result, ctx.Err()
-		case <-heartbeatTick:
-			if err := heartbeat(); err != nil {
-				return result, err
-			}
-			heartbeatTimer.Reset(streamHeartbeatInterval)
 		case event, ok := <-events:
 			if !ok {
 				if !result.finished {
@@ -179,7 +206,6 @@ func consumeStreamEvents(
 					return result, err
 				}
 			}
-			heartbeatTimer.Reset(streamHeartbeatInterval)
 		}
 	}
 }
@@ -255,8 +281,9 @@ func functionResultParts(raw json.RawMessage, isError bool, parse func(json.RawM
 	if isError {
 		key = "error"
 	}
+	trimmed := bytes.TrimSpace(raw)
 	var blocks []json.RawMessage
-	if json.Unmarshal(raw, &blocks) == nil && len(blocks) > 0 {
+	if bytes.HasPrefix(trimmed, []byte("[")) && json.Unmarshal(raw, &blocks) == nil && len(blocks) > 0 {
 		var texts []string
 		var media []aistudio.Part
 		contentBlocks := true
@@ -288,16 +315,14 @@ func functionResultParts(raw json.RawMessage, isError bool, parse func(json.RawM
 		}
 	}
 	if len(raw) == 0 {
-		raw = json.RawMessage("null")
+		raw, trimmed = json.RawMessage("null"), []byte("null")
 	}
-	if !json.Valid(raw) {
-		return nil, nil, fmt.Errorf("function result must be JSON")
-	}
-	trimmed := strings.TrimSpace(string(raw))
-	if !isError && strings.HasPrefix(trimmed, "{") {
+	if !isError && bytes.HasPrefix(trimmed, []byte("{")) {
 		return raw, nil, nil
 	}
-	return json.RawMessage(`{"` + key + `":` + trimmed + `}`), nil, nil
+	content := make(json.RawMessage, 0, len(key)+len(trimmed)+5)
+	content = append(append(append(append(content, `{"`...), key...), `":`...), trimmed...)
+	return append(content, '}'), nil, nil
 }
 
 func groundingCitations(metadata aistudio.GroundingMetadata) []aistudio.Citation {

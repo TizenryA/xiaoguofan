@@ -18,6 +18,19 @@
   const brands = host.brands;
   const realmName = host.realm;
   const topRealm = host.topRealm || null;
+  // userActivation 记录顶层页面最近一次用户点击或按键的 Unix 毫秒时刻，各 Realm 共用
+  const userActivation = topRealm ? topRealm.userActivation : { at: null };
+  // transientActivationMs 是 Firefox dom.user_activation.transient.timeout 的瞬时激活时长
+  const transientActivationMs = 5000;
+  // inputKeys 是 Windows Firefox 粘贴时按下的键：KeyboardEvent 的 code、keyCode、location 与是否为修饰键
+  const inputKeys = { Control: { code: 'ControlLeft', keyCode: 17, location: 1, modifier: true }, v: { code: 'KeyV', keyCode: 86, location: 0, modifier: false } };
+  // frameURL 是 iframe Realm 当前文档的地址，导航提交前为初始 about:blank 文档
+  let frameURL = realmName === 'frame' ? 'about:blank' : '';
+  // locationFields 返回地址对应的 Location 各字段
+  const locationFields = address => {
+    const record = host.parseURL(address);
+    return { href: record.href, origin: record.origin, protocol: record.protocol, host: record.host, hostname: record.hostname, port: record.port, pathname: record.pathname, search: record.search, hash: record.hash };
+  };
   const ES = new Set(['Object', 'Function', 'Array', 'Boolean', 'Date', 'Number', 'String', 'RegExp', 'Error', 'InternalError', 'AggregateError', 'EvalError', 'RangeError', 'ReferenceError', 'SuppressedError', 'SyntaxError', 'TypeError', 'URIError', 'ArrayBuffer', 'SharedArrayBuffer', 'Int8Array', 'Uint8Array', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array', 'Uint8ClampedArray', 'BigInt64Array', 'BigUint64Array', 'Float16Array', 'BigInt', 'Map', 'Set', 'WeakMap', 'WeakSet', 'DataView', 'Symbol', 'Promise', 'Proxy', 'FinalizationRegistry', 'WeakRef', 'Iterator', 'DisposableStack', 'AsyncDisposableStack']);
   const infos = Object.create(null);
   const protos = Object.create(null);
@@ -230,7 +243,8 @@
     return method;
   };
   // installable 判断形状表条目是否在目标对象上定义属性
-  const installable = entry => keyOf(entry.n) !== undefined && !entry.err && (entry.k === 'v' || entry.k === 'm' || entry.k === 'a' || (entry.k === 'i' && entry.n === 'constructor'));
+  const memberInstallable = (name, kind) => keyOf(name) !== undefined && (kind === 'v' || kind === 'm' || kind === 'a' || (kind === 'i' && name === 'constructor'));
+  const installable = entry => !entry.err && memberInstallable(entry.n, entry.k);
   // entryDescriptor 返回可安装条目在 target 上的属性描述符
   const entryDescriptor = (target, iface, entry, ctor) => {
     const flags = entry.f || '';
@@ -247,7 +261,8 @@
   const templateEntries = Object.create(null);
   // templateProperty 生成接口原型模板中第 index 个成员，返回是否访问器、值、getter、setter 与三个属性标志
   const templateProperty = (iface, index) => {
-    const descriptor = entryDescriptor(protos[iface], iface, templateEntries[iface][index], ctors[iface]);
+    const entries = templateEntries[iface] ??= shape.members(iface).filter(installable);
+    const descriptor = entryDescriptor(protos[iface], iface, entries[index], ctors[iface]);
     return ['get' in descriptor, descriptor.value, descriptor.get, descriptor.set, Boolean(descriptor.writable), descriptor.enumerable, descriptor.configurable];
   };
   host.setTemplateResolver(templateProperty);
@@ -302,8 +317,7 @@
       protos[info.n] = g[info.n].prototype;
       continue;
     }
-    templateEntries[info.cn] = info.pr.filter(installable);
-    const proto = host.templatedObject(info.cn, templateEntries[info.cn].map(entry => entry.n), info.pp && protos[info.pp] ? protos[info.pp] : Object.prototype);
+    const proto = host.templatedObject(info.cn, info.pk.filter(([name, kind]) => memberInstallable(name, kind)).map(([name]) => name), info.pp && protos[info.pp] ? protos[info.pp] : Object.prototype);
     const ctor = makeConstructor(info, proto);
     if (info.p && ctors[info.p]) Object.setPrototypeOf(ctor, ctors[info.p]);
     for (const entry of info.st) installEntry(ctor, info.cn, entry, ctor);
@@ -322,6 +336,12 @@
   const profileWindow = (profile.window || {});
   const windowBrand = { iface: 'Window', values: windowValues, over: Object.create(null), cache: new Map(), children: null, parent: null, attrs: null, listeners: null, realm: null };
   for (const [name, value] of Object.entries(profileWindow)) windowBrand.over[name] = value;
+  // navigate 在 iframe 导航响应到达后把 Realm 的 Location 与文档地址提交为新地址
+  if (realmName === 'frame') windowBrand.navigate = address => {
+    frameURL = address;
+    if (singletons.location) Object.assign(brands.get(singletons.location).over, locationFields(address));
+    if (singletons.document) Object.assign(brands.get(singletons.document).over, { URL: address, documentURI: address });
+  };
   brands.set(g, windowBrand);
   const windowProperties = Object.create(protos.EventTarget);
   const windowPropertiesLevel = realmShape.chain.find(level => level.name === 'WindowProperties');
@@ -402,6 +422,8 @@
       if (overrides) { const brand = brands.get(object); for (const [name, value] of Object.entries(overrides)) brand.over[name] = value; }
       if (path === 'location' && profile.location) Object.assign(brands.get(object).over, profile.location);
       if (path === 'document' && profile.location) Object.assign(brands.get(object).over, { URL: profile.location.href, documentURI: profile.location.href });
+      if (path === 'location' && frameURL) Object.assign(brands.get(object).over, locationFields(frameURL));
+      if (path === 'document' && frameURL) Object.assign(brands.get(object).over, { URL: frameURL, documentURI: frameURL });
       singletons[path] = object;
       if (path === 'document') {
         quietCreate++;
@@ -427,6 +449,60 @@
     ctor: name => ctors[name],
     proto: name => protos[name],
     pageOrigin: () => pageOrigin(),
+    userActivation,
+    // activate 记录一次用户点击或按键
+    activate: () => { userActivation.at = host.timeOrigin + host.performanceNow(); },
+    // mouseInput 按 Firefox 可信鼠标输入依次派发 types 中的事件：nodes 的布局矩形取 rects，指针与鼠标事件派发到指针下的 target，out 事件派发到指针离开的 left，坐标为 point，pointermove 与 mousemove 的移动量为 movement，焦点从 blurred 移到 focused，pointerdown 记录一次用户点击，同一次原生输入派生的各事件共用这次输入发生时的时间戳
+    mouseInput: (nodes, rects, target, left, point, movement, blurred, focused, types) => {
+      nodes.forEach((node, index) => { brandFor(node).rect = rects[index]; });
+      const [clientX, clientY] = point;
+      const timeStamp = host.inputNow();
+      for (const type of types) {
+        if (type === 'change') {
+          const event = create('Event');
+          Object.assign(brandFor(event).over, { type, isTrusted: true, bubbles: true, cancelable: false, composed: false, timeStamp });
+          dispatch(blurred, event);
+          continue;
+        }
+        const focus = type === 'focusin' || type === 'focusout';
+        const out = type === 'pointerout' || type === 'mouseout';
+        const pointer = type.startsWith('pointer') || type === 'click';
+        const pressed = type === 'pointerdown' || type === 'mousedown';
+        const changed = pressed || type === 'pointerup' || type === 'mouseup' || type === 'click';
+        const moved = type === 'pointermove' || type === 'mousemove';
+        const event = create(focus ? 'FocusEvent' : pointer ? 'PointerEvent' : 'MouseEvent');
+        const over = brandFor(event).over;
+        Object.assign(over, { type, isTrusted: true, bubbles: true, cancelable: !focus, composed: true, view: g, detail: !focus && type !== 'mouseover' && type !== 'mouseout' && (!pointer || type === 'click') ? 1 : 0, timeStamp });
+        if (focus) over.relatedTarget = type === 'focusout' ? focused : blurred;
+        else Object.assign(over, { button: pointer && !changed ? -1 : 0, buttons: pressed ? 1 : 0, clientX, clientY, screenX: clientX + g.mozInnerScreenX, screenY: clientY + g.mozInnerScreenY, movementX: moved ? movement[0] : 0, movementY: moved ? movement[1] : 0 });
+        if (pointer) Object.assign(over, { pointerId: 0, pointerType: 'mouse', width: 1, height: 1, pressure: pressed ? 0.5 : 0, isPrimary: true, altitudeAngle: Math.PI / 2, azimuthAngle: 0 });
+        if (type === 'pointerdown') api.activate();
+        dispatch(type === 'focusout' ? blurred : type === 'focusin' ? focused : out ? left : target, event);
+      }
+    },
+    // keyInput 按 Firefox 可信键盘输入依次向有焦点的 target 派发 types 中的事件：keydown 与 keyup 的冒号后为键名，paste 带只含 text/plain 的剪贴板数据，beforeinput 之后把 text 写入 target 再派发 input，按下非修饰键时记录一次用户按键，同一次原生输入派生的各事件共用这次输入发生时的时间戳
+    keyInput: (target, text, types) => {
+      const timeStamp = host.inputNow();
+      for (const entry of types) {
+        const [type, name] = entry.split(':');
+        const key = inputKeys[name];
+        const event = create(key ? 'KeyboardEvent' : type === 'paste' ? 'ClipboardEvent' : 'InputEvent');
+        const over = brandFor(event).over;
+        Object.assign(over, { type, isTrusted: true, bubbles: true, cancelable: type !== 'input', composed: true, timeStamp });
+        if (key) {
+          Object.assign(over, { view: g, detail: 0, key: name, code: key.code, keyCode: key.keyCode, which: key.keyCode, charCode: 0, location: key.location, ctrlKey: !(type === 'keyup' && name === 'Control'), altKey: false, shiftKey: false, metaKey: false, repeat: false, isComposing: false });
+          if (type === 'keydown' && !key.modifier) api.activate();
+        } else if (type === 'paste') {
+          const data = create('DataTransfer');
+          Object.assign(brandFor(data).over, { types: Object.freeze(['text/plain']), dropEffect: 'none', effectAllowed: 'uninitialized' });
+          over.clipboardData = data;
+        } else {
+          Object.assign(over, { view: g, detail: 0, inputType: 'insertFromPaste', data: text, dataTransfer: null, isComposing: false });
+          if (type === 'input') Object.getOwnPropertyDescriptor(protos[isA(brandFor(target).iface, 'HTMLInputElement') ? 'HTMLInputElement' : 'HTMLTextAreaElement'], 'value').set.call(target, text);
+        }
+        dispatch(target, event);
+      }
+    },
     reportException: error => reportException(error),
     reportRejection: (type, promise, reason) => reportRejection(type, promise, reason),
     idleDeadline: (didTimeout, remaining) => {
@@ -499,9 +575,22 @@
     if (brand.iface === 'HTMLIFrameElement' && !brand.contentWindow && host.createIframeWindow) {
       brand.contentWindow = host.createIframeWindow();
       syncFrames();
-      host.queueTask(0, () => { const event = create('Event', undefined); brandFor(event).over.isTrusted = true; dispatch(node, event, 'load'); });
+      const address = resolveURL(attribute(brand, 'src') || '');
+      if (/^https?:/i.test(address) && host.loadFrame) navigateFrame(node, brand, address);
+      else host.queueTask(0, () => frameLoaded(node));
     }
     for (const child of childrenOf(brand)) attached(child);
+  };
+  // frameLoaded 在 iframe 元素上派发可信的 load 事件
+  const frameLoaded = node => { const event = create('Event', undefined); brandFor(event).over.isTrusted = true; dispatch(node, event, 'load'); };
+  // navigateFrame 经宿主网络载入 iframe 地址，响应到达后提交 iframe 文档地址并派发 load，iframe 已移除时不派发
+  const navigateFrame = (node, brand, address) => {
+    const view = brand.contentWindow;
+    host.loadFrame(address, loaded => {
+      if (brand.contentWindow !== view) return;
+      if (loaded) brandFor(view).navigate(address);
+      frameLoaded(node);
+    });
   };
   const tagName = brand => (brand.tag || '').toUpperCase();
   const walk = (root, visit) => {
@@ -1072,6 +1161,7 @@
   };
   const digestNames = { 'SHA-1': 'SHA-1', 'SHA-256': 'SHA-256', 'SHA-384': 'SHA-384', 'SHA-512': 'SHA-512' };
   let animationHandle = 0;
+  let animationFrameTime = -Infinity;
   const animationCallbacks = new Set();
   const descendants = (root, accept) => {
     const found = [];
@@ -1079,6 +1169,7 @@
     return found;
   };
   const layoutRect = element => {
+    if (brandFor(element).rect) return brandFor(element).rect;
     if (realmName === 'top' && (element === api.singleton('document.body') || element === api.singleton('document.documentElement'))) {
       return [0, 0, g.innerWidth, g.innerHeight];
     }
@@ -1128,7 +1219,7 @@
     const names = [];
     for (let current = iface; current; current = parentOf[current]) {
       const info = infos[current];
-      if (info) for (const entry of info.pr) if (entry.k === 'a') names.push(entry.n);
+      if (info) for (const [name, kind] of info.pk) if (kind === 'a') names.push(name);
     }
     attributeCache.set(iface, names);
     return names;
@@ -1190,11 +1281,17 @@
     'Event.target': brand => brand.over.target === undefined ? null : brand.over.target,
     'Storage.length': brand => storageKeys(storageArea(brand)).length,
     'Performance.timeOrigin': () => host.timeOrigin,
+    'UserActivation.hasBeenActive': () => userActivation.at !== null,
+    'UserActivation.isActive': () => userActivation.at !== null && host.timeOrigin + host.performanceNow() - userActivation.at < transientActivationMs,
     'Document.cookie': () => '',
   });
   Object.assign(setters, {
     'HTMLImageElement.src': function (brand, value) { trustedImage(this, brand, String(value)); },
-    'HTMLIFrameElement.src': (brand, value) => { (brand.attrs || (brand.attrs = new Map())).set('src', String(value)); },
+    'HTMLIFrameElement.src': function (brand, value) {
+      (brand.attrs || (brand.attrs = new Map())).set('src', String(value));
+      const address = resolveURL(String(value));
+      if (brand.contentWindow && connected(this) && /^https?:/i.test(address) && host.loadFrame) navigateFrame(this, brand, address);
+    },
     'Element.id': (brand, value) => { (brand.attrs || (brand.attrs = new Map())).set('id', String(value)); },
     'CharacterData.data': (brand, value) => setCharacterData(brand, String(value)),
     'Node.nodeValue': (brand, value) => { if (isCharacterData(brand)) setCharacterData(brand, value === null ? '' : String(value)); },
@@ -1207,6 +1304,7 @@
     },
     'Element.className': (brand, value) => { (brand.attrs || (brand.attrs = new Map())).set('class', String(value)); },
     'HTMLTextAreaElement.value': (brand, value) => { brand.over.value = String(value).replace(/\r\n?/g, '\n'); },
+    'HTMLInputElement.value': (brand, value) => { brand.over.value = String(value).replace(/[\r\n]/g, ''); },
     'Document.cookie': (brand, value) => {
       const [pair, ...attributes] = String(value).split(';');
       const index = pair.indexOf('=');
@@ -1567,7 +1665,24 @@
     'Navigator.getGamepads': () => [],
     'Navigator.sendBeacon': () => true,
     'Performance.now': () => host.performanceNow(),
-    'Performance.toJSON': () => ({ timeOrigin: host.timeOrigin }),
+    // *.toJSON 是 WebIDL 默认 toJSON：按继承顺序收集声明 toJSON 的各级接口的属性，原始值、带 toJSON 的对象与这类对象的数组原样收入，事件处理属性与其他对象不收
+    '*.toJSON': function (brand) {
+      const chain = [];
+      for (let current = brand.iface; current && !ES.has(current); current = parentOf[current]) chain.unshift(current);
+      const json = value => value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || (value && typeof value.toJSON === 'function') ? value : undefined;
+      const result = {};
+      for (const iface of chain) {
+        const info = infos[iface];
+        if (!info || !shape.members(iface).some(entry => entry.n === 'toJSON')) continue;
+        for (const entry of shape.members(iface)) {
+          if (entry.k !== 'a' || !entry.g || /^on[a-z]/.test(entry.n)) continue;
+          const value = read(this, brand, entry.n, iface);
+          const converted = Array.isArray(value) ? value.map(json) : json(value);
+          if (converted !== undefined && !(Array.isArray(converted) && converted.includes(undefined))) result[entry.n] = converted;
+        }
+      }
+      return result;
+    },
     'Performance.getEntries': () => navigationEntries(),
     'Performance.getEntriesByType': (brand, [type]) => String(type) === 'navigation' ? navigationEntries() : [],
     'Performance.getEntriesByName': (brand, [name]) => navigationEntries().filter(entry => readValue(entry, brandFor(entry), 'name') === String(name)),
@@ -1584,10 +1699,10 @@
     'Window.requestAnimationFrame': (brand, [callback]) => {
       const frame = 1000 / 60;
       const now = host.performanceNow();
-      const next = Math.floor((now - 0.66) / frame) * frame + 0.66 + frame;
+      const next = Math.max(Math.floor((now - 0.66) / frame) * frame + 0.66 + frame, animationFrameTime + frame);
       const handle = ++animationHandle;
       animationCallbacks.add(handle);
-      host.queueTask(Math.max(0, Math.ceil(next - now)), () => { if (animationCallbacks.delete(handle)) callback(Math.round(next * 100) / 100); });
+      host.queueTask(Math.max(0, Math.ceil(next - now)), () => { if (animationCallbacks.delete(handle)) { animationFrameTime = next; callback(Math.round(next * 100) / 100); } });
       return handle;
     },
     'Window.cancelAnimationFrame': (brand, [id]) => { animationCallbacks.delete(id); },
@@ -1664,7 +1779,7 @@
       return Promise.resolve(cookieItems().filter(item => name === undefined || item.name === String(name)));
     },
     'GPU.requestAdapter': () => Promise.resolve(null),
-    'MediaDevices.enumerateDevices': () => Promise.resolve(['audioinput', 'videoinput'].map(kind => {
+    'MediaDevices.enumerateDevices': () => Promise.resolve(profile.mediaInputs.map(kind => {
       const device = create('MediaDeviceInfo');
       Object.assign(brandFor(device).over, { deviceId: '', kind, label: '', groupId: '' });
       return device;
@@ -1813,7 +1928,7 @@
     'Window.blur': () => {},
   });
   for (const info of shape.interfaces) {
-    if (ES.has(info.n) || !info.pr.some(entry => entry.n === '@@iterator' && entry.fn === 'entries')) continue;
+    if (ES.has(info.n) || !info.pi) continue;
     const iface = info.n;
     methods[iface + '.entries'] = brand => pairIterator(iface, brand, 'key+value');
     methods[iface + '.keys'] = brand => pairIterator(iface, brand, 'key');
@@ -1832,6 +1947,16 @@
   }
   getters['URL.searchParams'] = brand => brand.params;
   getters['URLSearchParams.size'] = brand => brand.list.length;
+  // PerformanceTiming 各属性是本 Realm 导航计时加 timeOrigin 的 Unix 毫秒值，没有发生的卸载与重定向阶段为 0
+  for (const name of ['navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd', 'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd', 'domLoading', 'domInteractive', 'domContentLoadedEventStart', 'domContentLoadedEventEnd', 'domComplete', 'loadEventStart', 'loadEventEnd']) {
+    getters['PerformanceTiming.' + name] = () => {
+      if (name === 'navigationStart') return host.timeOrigin;
+      const entry = navigationEntries()[0];
+      const entryValue = field => entry ? readValue(entry, brandFor(entry), field) : 0;
+      const value = name === 'domLoading' ? (profile.domLoading ?? entryValue('responseEnd')) : entryValue(name);
+      return value === 0 && /^(unload|redirect)/.test(name) ? 0 : host.timeOrigin + value;
+    };
+  }
   getters['PerformanceObserver.supportedEntryTypes:static'] = () => ['event', 'first-input', 'largest-contentful-paint', 'mark', 'measure', 'navigation', 'paint', 'resource'];
   getters['PushManager.supportedContentEncodings:static'] = () => Object.freeze(['aes128gcm']);
   getters['Notification.permission:static'] = () => 'default';

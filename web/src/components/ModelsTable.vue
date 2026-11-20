@@ -1,18 +1,22 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { parseAccountBindings } from '@/accountBindings'
 import { api } from '@/api'
-import { channelLabelKey, useI18n } from '@/i18n'
-import type { Model, ServiceConfig, UpstreamChannel } from '@/types'
+import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
+import { priceLines } from '@/playground/catalog'
+import type { Account, Model, ServiceConfig, UpstreamChannel } from '@/types'
 import { useQueryText } from '@/url'
 import DetailDialog from './DetailDialog.vue'
+import FilterMenu from './FilterMenu.vue'
 import UiIcon from './UiIcon.vue'
-import UiSelect from './UiSelect.vue'
+import UiSelect, { keepSelected } from './UiSelect.vue'
 
 const props = defineProps<{
   models: Model[]
   loading: boolean
   error: string
   config: ServiceConfig | null
+  accounts: Account[]
 }>()
 const emit = defineEmits<{
   saved: [config: ServiceConfig]
@@ -23,7 +27,7 @@ const { locale, t, errorText } = useI18n()
 const query = useQueryText('q')
 const selectedMethod = useQueryText('method')
 const detail = ref<Model | null>(null)
-const savingChannel = ref(false)
+const saving = ref(false)
 
 // modelChannels 与服务端一致解析 MODEL_CHANNELS 为模型到限定通道的映射：模型 ID 去掉 models/ 前缀，通道转为小写
 function modelChannels(value: string): Map<string, string> {
@@ -62,24 +66,68 @@ async function setModelChannel(model: Model, channel: string): Promise<void> {
   const channels = modelChannels(props.config.model_channels)
   if (channel === '') channels.delete(model.id)
   else channels.set(model.id, channel)
-  savingChannel.value = true
+  await saveConfig(
+    { model_channels: [...channels].map(([id, value]) => `${id}:${value}`).join(',') },
+    t('models.channelSaved'),
+  )
+}
+
+// modelAccountBindings 解析 MODEL_ACCOUNTS 为模型到可用账户 ID 的映射
+function modelAccountBindings(value: string): Map<string, string[]> {
+  return new Map(
+    [...parseAccountBindings(value)].map(([model, ids]) => [model.replace(/^models\//, ''), ids]),
+  )
+}
+
+// modelAccounts 返回模型可用的账户 ID，未绑定时为空
+function modelAccounts(model: Model): string[] {
+  return modelAccountBindings(props.config?.model_accounts ?? '').get(model.id) ?? []
+}
+
+// accountLabel 返回账户 ID 对应的显示名称
+function accountLabel(id: string): string {
+  return props.accounts.find((account) => account.id === id)?.label ?? id
+}
+
+// modelAccountsLabel 是模型账户选择按钮的文字：未选时为全部账户，只选一个时为该账户
+function modelAccountsLabel(model: Model): string {
+  const ids = modelAccounts(model)
+  if (ids.length === 0) return t('settings.keyAccountsAll')
+  return ids.length === 1 ? accountLabel(ids[0]!) : t('settings.keyAccountsSome')
+}
+
+// setModelAccounts 保存模型可用的账户，空列表表示可用全部账户
+async function setModelAccounts(model: Model, ids: string[]): Promise<void> {
+  if (props.config === null) return
+  const bindings = modelAccountBindings(props.config.model_accounts)
+  if (ids.length > 0) bindings.set(model.id, ids)
+  else bindings.delete(model.id)
+  await saveConfig(
+    { model_accounts: [...bindings].map(([id, value]) => `${id}:${value.join('|')}`).join(',') },
+    t('models.accountsSaved'),
+  )
+}
+
+// saveConfig 保存模型详情中修改的配置项并提示结果
+async function saveConfig(changes: Partial<ServiceConfig>, savedNotice: string): Promise<void> {
+  saving.value = true
   try {
-    const saved = await api.saveConfig({
-      ...props.config,
-      model_channels: [...channels].map(([id, value]) => `${id}:${value}`).join(','),
-    })
-    emit('saved', saved)
-    emit('notice', t('models.channelSaved'), 'success')
+    emit('saved', await api.saveConfig({ ...props.config!, ...changes }))
+    emit('notice', savedNotice, 'success')
   } catch (error) {
     emit('notice', errorText(error), 'error')
   } finally {
-    savingChannel.value = false
+    saving.value = false
   }
 }
 
 const methods = computed(() =>
-  [...new Set(props.models.flatMap((model) => model.methods))].sort((left, right) =>
-    left.localeCompare(right),
+  keepSelected(
+    [...new Set(props.models.flatMap((model) => model.methods))].sort((left, right) =>
+      left.localeCompare(right),
+    ),
+    selectedMethod.value,
+    '',
   ),
 )
 
@@ -98,30 +146,94 @@ const filteredModels = computed(() => {
   })
 })
 
-// capabilityNames 返回模型明确启用的能力名称
+// hiddenHelp 返回在 AI Studio 官网中隐藏的模型的说明，其他模型为 null
+function hiddenHelp(model: Model): TranslationKey | null {
+  if (model.methods.includes('createDecision')) return 'models.decisionHiddenHelp'
+  return model.hidden ? 'models.hiddenHelp' : null
+}
+
+// accountRisk 判断模型是否经 Build 写代码助手回答，使用时有账户被限制的风险
+function accountRisk(model: Model): boolean {
+  return model.channels?.includes('assistant') ?? false
+}
+
+// capabilityKeys 是模型目录能力在界面上的名称，与官网运行设置的用词一致；未列出的能力是内部路由标记或只有编号的能力码，不显示
+const capabilityKeys: Partial<Record<string, TranslationKey>> = {
+  thinking: 'models.capability.thinking',
+  thinking_level: 'pg.thinkingLevel',
+  thinking_summaries: 'models.capability.thinkingSummaries',
+  function_declarations: 'pg.functionCalling',
+  code_execution: 'pg.codeExecution',
+  google_search: 'pg.googleSearch',
+  google_maps: 'pg.googleMaps',
+  browse: 'pg.urlContext',
+  image_search: 'pg.imageSearch',
+  media_resolution: 'pg.mediaResolution',
+  aspect_ratio: 'pg.aspectRatio',
+  output_resolution: 'pg.outputResolution',
+  speech_translation: 'models.capability.speechTranslation',
+  transcription_speaker_labels: 'models.capability.speakerLabels',
+  transcription_word_timestamps: 'models.capability.wordTimestamps',
+  transcription_custom_vocabulary: 'models.capability.customVocabulary',
+  interactions_api: 'models.capability.interactions',
+}
+
+// capabilityNames 返回模型明确启用、且有界面名称的能力
 function capabilityNames(model: Model): string[] {
-  return Object.entries(model.capabilities ?? {})
-    .filter(([, enabled]) => enabled)
-    .map(([name]) => name)
+  return Object.entries(model.capabilities ?? {}).flatMap(([name, enabled]) => {
+    const key = capabilityKeys[name]
+    return enabled && key ? [t(key)] : []
+  })
 }
 
-// unnamedCapability 匹配目录中只有编号、没有名称的能力码
-const unnamedCapability = /^(secondary_)?capability_code_\d+$/
+// optionKeys 是模型目录能力选项在界面上的名称，顺序即详情中的显示顺序
+const optionKeys: [string, TranslationKey][] = [
+  ['aliases', 'models.aliases'],
+  ['voices', 'pg.voice'],
+  ['languages', 'pg.voiceLanguage'],
+  ['image_aspect_ratios', 'models.imageAspectRatios'],
+  ['image_output_resolutions', 'models.imageResolutions'],
+  ['video_tasks', 'pg.videoTask'],
+  ['video_aspect_ratios', 'models.videoAspectRatios'],
+  ['video_output_resolutions', 'models.videoResolutions'],
+  ['video_duration_range', 'pg.videoDuration'],
+  ['video_frame_rates', 'pg.frameRate'],
+]
 
-// capabilityGroups 把模型能力分成有名称的能力与未命名的能力码
-function capabilityGroups(model: Model): { named: string[]; coded: string[] } {
-  const names = capabilityNames(model)
-  return {
-    named: names.filter((name) => !unnamedCapability.test(name)),
-    coded: names.filter((name) => unnamedCapability.test(name)),
+// videoTaskKeys 是视频任务取值的界面名称
+const videoTaskKeys: Partial<Record<string, TranslationKey>> = {
+  text_to_video: 'pg.videoTaskText',
+  image_to_video: 'pg.videoTaskImage',
+  reference_to_video: 'pg.videoTaskReference',
+  edit: 'pg.videoTaskEdit',
+  extend: 'pg.videoTaskExtend',
+}
+
+// optionValues 返回能力选项按界面语言显示的取值：语言代码显示为语言名，视频时长显示为秒数范围
+function optionValues(name: string, values: string[]): string {
+  if (name === 'languages') {
+    const names = new Intl.DisplayNames([locale.value], { type: 'language' })
+    return values.map((code) => names.of(code) ?? code).join(' / ')
   }
+  if (name === 'video_tasks') {
+    return values
+      .map((value) => (videoTaskKeys[value] ? t(videoTaskKeys[value]) : value))
+      .join(' / ')
+  }
+  if (name === 'video_duration_range') {
+    const range = Object.fromEntries(values.map((value) => value.split('=')))
+    const seconds = new Intl.NumberFormat(locale.value, { style: 'unit', unit: 'second' })
+    return `${new Intl.NumberFormat(locale.value).format(Number(range.min))}–${seconds.format(Number(range.max))}`
+  }
+  return values.join(' / ')
 }
 
-// capabilityOptionEntries 展开模型目录返回的真实能力选项
-function capabilityOptionEntries(model: Model): [string, string[]][] {
-  return Object.entries(model.capability_options ?? {}).sort(([left], [right]) =>
-    left.localeCompare(right),
-  )
+// capabilityOptions 返回模型目录中有界面名称的能力选项
+function capabilityOptions(model: Model): { label: string; values: string }[] {
+  return optionKeys.flatMap(([name, key]) => {
+    const values = model.capability_options?.[name]
+    return values?.length ? [{ label: t(key), values: optionValues(name, values) }] : []
+  })
 }
 
 // outputLimit 返回模型可设置的输出上限，自动续写模型为输入上限
@@ -136,36 +248,58 @@ function tokenLimit(value: number | undefined): string {
   if (value === undefined || value === 0) return '—'
   return new Intl.NumberFormat(locale.value).format(value)
 }
+
+// dateFormat 与 monthFormat 是详情中发布日期与知识截止月份的格式
+const dateFormat = computed(
+  () => new Intl.DateTimeFormat(locale.value, { year: 'numeric', month: 'short', day: 'numeric' }),
+)
+const monthFormat = computed(
+  () => new Intl.DateTimeFormat(locale.value, { year: 'numeric', month: 'short' }),
+)
+
+// modelSummary 返回官网模型卡片的简介，没有简介时为与名称不同的目录描述
+function modelSummary(model: Model): string {
+  if (model.details?.summary) return model.details.summary
+  return model.description !== model.name ? (model.description ?? '') : ''
+}
 </script>
 
 <template>
-  <section class="flex min-h-0 flex-1 flex-col overflow-auto md:overflow-hidden">
+  <section
+    class="flex min-h-0 flex-1 flex-col overflow-auto max-md:[scrollbar-gutter:stable] md:overflow-hidden"
+  >
     <header
-      class="flex flex-wrap items-center gap-3 border-b border-line px-4 py-4 md:px-[max(2rem,calc((100%_-_var(--container-5xl))/2_+_2rem))]"
+      class="page-x flex flex-wrap items-center gap-3 border-b border-line py-4 md:overflow-hidden md:[scrollbar-gutter:stable]"
     >
       <div class="min-w-0 flex-1">
         <h2 class="text-xl font-semibold text-white">{{ t('section.models.title') }}</h2>
         <p class="mt-1 text-sm text-gray-500">{{ t('section.models.description') }}</p>
       </div>
     </header>
-    <div class="mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col p-4 md:p-8">
-      <div class="mb-4 flex flex-wrap items-center gap-3">
+    <div
+      class="page-x flex min-h-0 flex-1 flex-col py-4 md:overflow-hidden md:py-8 md:[scrollbar-gutter:stable]"
+    >
+      <div class="mb-3 flex flex-wrap items-center gap-2">
         <input
           v-model="query"
-          class="min-w-0 flex-1 basis-full rounded border border-line bg-canvas px-3 py-2 text-sm text-white transition focus:border-blue-500 focus:outline-none sm:min-w-64 sm:basis-0"
+          class="min-w-0 flex-1 basis-full rounded-md border border-line bg-canvas px-3 py-1 text-sm text-white transition focus:border-blue-500 focus:outline-none sm:min-w-64 sm:basis-0"
           :placeholder="t('models.search')"
           type="search"
         />
         <UiSelect
+          v-if="!loading"
           v-model="selectedMethod"
-          class="rounded border border-line bg-canvas px-3 py-2 text-sm text-gray-300 focus:border-blue-500 focus:outline-none"
+          class="rounded-md border border-line bg-canvas px-2 py-1.5 text-xs text-gray-200 focus:border-blue-500 focus:outline-none"
           :aria-label="t('models.methods')"
         >
           <option value="">{{ t('models.allMethods') }}</option>
           <option v-for="method in methods" :key="method" :value="method">{{ method }}</option>
         </UiSelect>
-        <span class="shrink-0 text-xs text-gray-500 tabular-nums">{{
-          t('models.count').replace('{count}', String(filteredModels.length))
+        <span v-if="!loading" class="shrink-0 text-xs text-gray-500 tabular-nums">{{
+          t(filteredModels.length === 1 ? 'models.countOne' : 'models.count').replace(
+            '{count}',
+            String(filteredModels.length),
+          )
         }}</span>
       </div>
 
@@ -179,11 +313,11 @@ function tokenLimit(value: number | undefined): string {
         v-else-if="filteredModels.length === 0"
         class="rounded border border-line bg-panel py-10 text-center text-gray-500"
       >
-        {{ t('models.empty') }}
+        {{ props.models.length === 0 ? t('models.empty') : t('models.noMatches') }}
       </div>
       <div
         v-else
-        class="min-h-0 flex-1 overflow-y-auto rounded-lg border border-line bg-panel max-md:max-h-[70vh]"
+        class="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable] rounded-lg border border-line bg-panel max-md:max-h-[70vh] max-md:shrink-0 max-md:basis-auto"
       >
         <div
           class="sticky top-0 z-10 hidden items-center gap-3 border-b border-line bg-panel px-4 py-2 text-xs text-gray-500 sm:flex"
@@ -211,6 +345,20 @@ function tokenLimit(value: number | undefined): string {
                 class="shrink-0 rounded border border-amber-700/60 bg-amber-900/20 px-1.5 py-0.5 text-xs font-medium text-amber-300"
               >
                 {{ t('models.paid') }}
+              </span>
+              <span
+                v-if="hiddenHelp(model)"
+                v-tooltip="t(hiddenHelp(model)!)"
+                class="shrink-0 rounded border border-amber-700/60 bg-amber-900/20 px-1.5 py-0.5 text-xs font-medium text-amber-300"
+              >
+                {{ t('models.hidden') }}
+              </span>
+              <span
+                v-if="accountRisk(model)"
+                v-tooltip="t('models.accountRiskHelp')"
+                class="shrink-0 rounded border border-amber-700/60 bg-amber-900/20 px-1.5 py-0.5 text-xs font-medium text-amber-300"
+              >
+                {{ t('models.accountRisk') }}
               </span>
             </div>
             <code v-tooltip.overflow="model.id" class="block truncate text-xs text-blue-400">{{
@@ -244,28 +392,100 @@ function tokenLimit(value: number | undefined): string {
       @close="detail = null"
     >
       <div v-if="detail" class="space-y-4">
-        <p
-          v-if="detail.description && detail.description !== detail.name"
-          class="text-xs leading-5 [overflow-wrap:anywhere] text-gray-400"
+        <div
+          v-if="detail.details?.alias || modelSummary(detail) || detail.details?.docs_url"
+          class="space-y-1 text-xs leading-5 [overflow-wrap:anywhere]"
         >
-          {{ detail.description }}
+          <p v-if="detail.details?.alias" class="text-gray-300">{{ detail.details.alias }}</p>
+          <p v-if="modelSummary(detail) || detail.details?.docs_url" class="text-gray-400">
+            {{ modelSummary(detail) }}
+            <a
+              v-if="detail.details?.docs_url"
+              :href="detail.details.docs_url"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="inline-flex items-center gap-0.5 whitespace-nowrap text-blue-400 hover:text-blue-300"
+              >{{ t('pg.developerDocs') }}<UiIcon name="up" :size="12"
+            /></a>
+          </p>
+        </div>
+        <p
+          v-if="detail.details?.warning"
+          class="flex items-start gap-2 text-xs leading-5 text-amber-200"
+        >
+          <UiIcon name="warning" :size="14" class="mt-0.5 shrink-0" />{{ detail.details.warning }}
         </p>
-        <dl class="grid grid-cols-2 gap-3 font-mono text-xs sm:grid-cols-4">
-          <div>
-            <dt class="text-gray-500">{{ t('models.context') }}</dt>
-            <dd class="text-gray-200">{{ tokenLimit(detail.input_token_limit) }}</dd>
-          </div>
-          <div>
-            <dt class="text-gray-500">{{ t('models.output') }}</dt>
-            <dd class="text-gray-200">{{ tokenLimit(outputLimit(detail)) }}</dd>
-            <dd
-              v-if="detail.capabilities?.output_continuation"
-              class="mt-0.5 font-sans text-xs text-gray-500"
+        <p
+          v-if="hiddenHelp(detail)"
+          class="flex items-start gap-2 text-xs leading-5 text-amber-200"
+        >
+          <UiIcon name="warning" :size="14" class="mt-0.5 shrink-0" />{{ t(hiddenHelp(detail)!) }}
+        </p>
+        <p
+          v-if="accountRisk(detail)"
+          class="flex items-start gap-2 text-xs leading-5 text-amber-200"
+        >
+          <UiIcon name="warning" :size="14" class="mt-0.5 shrink-0" />{{
+            t('models.accountRiskHelp')
+          }}
+        </p>
+        <div>
+          <dl class="grid grid-cols-2 gap-3 font-mono text-xs sm:grid-cols-4">
+            <div>
+              <dt class="text-gray-500">{{ t('models.context') }}</dt>
+              <dd class="text-gray-200">{{ tokenLimit(detail.input_token_limit) }}</dd>
+            </div>
+            <div>
+              <dt class="text-gray-500">{{ t('models.output') }}</dt>
+              <dd class="text-gray-200">{{ tokenLimit(outputLimit(detail)) }}</dd>
+            </div>
+            <div v-if="detail.details?.release_date">
+              <dt class="text-gray-500">{{ t('models.releaseDate') }}</dt>
+              <dd class="text-gray-200">
+                {{ dateFormat.format(detail.details.release_date * 1000) }}
+              </dd>
+            </div>
+            <div v-if="detail.details?.model_card_url || detail.details?.knowledge_cutoff">
+              <dt class="text-gray-500">{{ t('models.knowledgeCutoff') }}</dt>
+              <dd class="text-gray-200">
+                <a
+                  v-if="detail.details.model_card_url"
+                  :href="detail.details.model_card_url"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="inline-flex items-center gap-0.5 font-sans text-blue-400 hover:text-blue-300"
+                  >{{ t('pg.seeModelCard') }}<UiIcon name="up" :size="12"
+                /></a>
+                <template v-else-if="detail.details.knowledge_cutoff">{{
+                  monthFormat.format(detail.details.knowledge_cutoff * 1000)
+                }}</template>
+              </dd>
+            </div>
+          </dl>
+          <p v-if="detail.capabilities?.output_continuation" class="mt-2 text-xs text-gray-500">
+            {{ t('pg.outputContinuation') }}
+          </p>
+        </div>
+        <div v-if="detail.details?.pricing?.length">
+          <span class="mb-2 block text-xs text-gray-500">{{ t('models.pricing') }}</span>
+          <ul class="space-y-1 text-xs leading-5 [overflow-wrap:anywhere] text-gray-300">
+            <li
+              v-for="(line, index) in priceLines(detail, t)"
+              :key="index"
+              v-tooltip="line.tooltip"
             >
-              {{ t('models.continuation') }}
-            </dd>
-          </div>
-        </dl>
+              {{ line.text }}
+              <a
+                v-if="line.link"
+                :href="line.link"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="inline-flex items-center gap-0.5 whitespace-nowrap text-blue-400 hover:text-blue-300"
+                >{{ t('pg.learnMore') }}<UiIcon name="up" :size="12"
+              /></a>
+            </li>
+          </ul>
+        </div>
         <div v-if="detail.channels?.length">
           <span id="model-channel-label" class="mb-2 block text-xs text-gray-500">{{
             t('models.channels')
@@ -287,7 +507,7 @@ function tokenLimit(value: number | undefined): string {
                   : 'bg-raised text-gray-400 hover:text-gray-200'
               "
               :aria-pressed="modelChannel(detail) === channel"
-              :disabled="savingChannel"
+              :disabled="saving"
               @click="setModelChannel(detail, channel)"
             >
               {{ channel === '' ? t('models.channelAll') : t(channelLabelKey(channel)) }}
@@ -302,6 +522,21 @@ function tokenLimit(value: number | undefined): string {
               {{ t(channelLabelKey(channel)) }}
             </span>
           </div>
+        </div>
+        <div v-if="config && (accounts.length > 1 || modelAccounts(detail).length > 0)">
+          <span class="mb-2 block text-xs text-gray-500">{{ t('models.accounts') }}</span>
+          <FilterMenu
+            :label="modelAccountsLabel(detail)"
+            :options="accounts.map((account) => account.id)"
+            :selected="modelAccounts(detail)"
+            :format="accountLabel"
+            :search-label="t('settings.accountSearch')"
+            :empty-label="t('settings.accountNone')"
+            :clear-label="t('settings.keyAccountsClear')"
+            :disabled="saving"
+            @change="setModelAccounts(detail!, $event)"
+          />
+          <p class="mt-1.5 text-xs text-gray-500">{{ t('models.accountsHelp') }}</p>
         </div>
         <div>
           <span class="mb-2 block text-xs text-gray-500">{{ t('models.methods') }}</span>
@@ -319,46 +554,24 @@ function tokenLimit(value: number | undefined): string {
           <span class="mb-2 block text-xs text-gray-500">{{ t('models.capabilities') }}</span>
           <div class="flex flex-wrap gap-2">
             <span
-              v-for="capability in capabilityGroups(detail).named"
+              v-for="capability in capabilityNames(detail)"
               :key="capability"
-              class="rounded border border-line bg-canvas px-2 py-1 font-mono text-xs text-gray-300"
+              class="rounded border border-line bg-canvas px-2 py-1 text-xs text-gray-300"
             >
               {{ capability }}
             </span>
             <span v-if="capabilityNames(detail).length === 0" class="text-gray-600">—</span>
           </div>
-          <details v-if="capabilityGroups(detail).coded.length" class="group mt-2">
-            <summary
-              class="inline-flex cursor-pointer list-none items-center gap-1 text-xs text-gray-500 hover:text-gray-300"
-            >
-              <UiIcon name="chevronRight" :size="12" class="transition group-open:rotate-90" />
-              {{
-                t('models.unnamedCapabilities').replace(
-                  '{count}',
-                  String(capabilityGroups(detail).coded.length),
-                )
-              }}
-            </summary>
-            <div class="mt-2 flex flex-wrap gap-2">
-              <span
-                v-for="capability in capabilityGroups(detail).coded"
-                :key="capability"
-                class="rounded border border-line bg-canvas px-2 py-1 font-mono text-xs text-gray-500"
-              >
-                {{ capability }}
-              </span>
-            </div>
-          </details>
-          <div v-if="capabilityOptionEntries(detail).length" class="mt-3 space-y-1 text-xs">
+          <dl v-if="capabilityOptions(detail).length" class="mt-3 space-y-1 text-xs">
             <div
-              v-for="[name, values] in capabilityOptionEntries(detail)"
-              :key="name"
+              v-for="option in capabilityOptions(detail)"
+              :key="option.label"
               class="[overflow-wrap:anywhere]"
             >
-              <code class="text-gray-500">{{ name }}:</code>
-              <span class="ml-1 text-gray-400">{{ values.join(' / ') }}</span>
+              <dt class="inline text-gray-500">{{ option.label }}:</dt>
+              <dd class="ml-1 inline text-gray-400">{{ option.values }}</dd>
             </div>
-          </div>
+          </dl>
         </div>
       </div>
     </DetailDialog>

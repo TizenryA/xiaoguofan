@@ -10,6 +10,7 @@ import (
 	"time"
 
 	fhttp "github.com/Mag1cFall/fhttp"
+	quic "github.com/Mag1cFall/uquic"
 )
 
 const (
@@ -35,7 +36,7 @@ const (
 	h3RequestBodyChunk = 32 << 10
 )
 
-// firefoxHTTP3Settings 是 Firefox 152 控制流 SETTINGS 的参数与顺序：QPACK 容量、阻塞流、WebTransport、两个 H3 DATAGRAM 与扩展 CONNECT
+// firefoxHTTP3Settings 是 Firefox 158 控制流 SETTINGS 的参数与顺序：QPACK 容量、阻塞流、WebTransport、两个 H3 DATAGRAM 与扩展 CONNECT
 var firefoxHTTP3Settings = [][2]uint64{
 	{h3SettingQPACKCapacity, firefoxQPACKTableSize},
 	{h3SettingQPACKBlocked, firefoxQPACKBlockedStreams},
@@ -70,7 +71,7 @@ func requestClassOf(ctx context.Context) requestClass {
 	return class
 }
 
-// firefoxHTTP3 按 Firefox 152 的 Alt-Svc 流程在直连时把请求切换到 HTTP/3：响应通告 h3 后以携带凭据的连接验证，验证成功后该主机的请求改走 HTTP/3
+// firefoxHTTP3 按 Firefox 158 的 Alt-Svc 流程在直连时把请求切换到 HTTP/3：响应通告 h3 后以携带凭据的连接验证，验证成功后该主机的请求改走 HTTP/3
 type firefoxHTTP3 struct {
 	pool    *firefoxConnPool
 	mu      sync.Mutex
@@ -243,15 +244,55 @@ func (h3 *firefoxHTTP3) send(request *fhttp.Request, anonymous bool) (*fhttp.Res
 			}
 			return nil, request, nil
 		}
+		reused := conn.streams.Load() > 0
 		response, opened, err := conn.roundTrip(request, h3RequestFields(request, mapped && !anonymous))
-		if err != nil && !opened && attempt == 0 && request.Context().Err() == nil {
-			conn.close()
-			continue
+		if err != nil && attempt == 0 && request.Context().Err() == nil && (!opened || quicConnectionClosed(err) && (reused || firefoxSafeMethods[request.Method])) {
+			if restarted, ok := restartRequest(request, opened); ok {
+				conn.close()
+				h3.drop(host, anonymous, conn)
+				request = restarted
+				continue
+			}
 		}
 		if err == nil {
 			h3.observe(host, response.Header)
 		}
 		return response, nil, err
+	}
+}
+
+// quicConnectionClosed 判断请求失败是否因为 QUIC 连接关闭，请求流被单独重置时为 false
+func quicConnectionClosed(err error) bool {
+	var application *quic.ApplicationError
+	var transport *quic.TransportError
+	var idle *quic.IdleTimeoutError
+	var reset *quic.StatelessResetError
+	return errors.As(err, &application) || errors.As(err, &transport) || errors.As(err, &idle) || errors.As(err, &reset)
+}
+
+// restartRequest 返回在新连接上重发的请求，请求流已打开时以 GetBody 重新取得请求体，取不到时 ok 为 false
+func restartRequest(request *fhttp.Request, opened bool) (*fhttp.Request, bool) {
+	if !opened || request.Body == nil || request.Body == fhttp.NoBody {
+		return request, true
+	}
+	if request.GetBody == nil {
+		return nil, false
+	}
+	body, err := request.GetBody()
+	if err != nil {
+		return nil, false
+	}
+	restarted := request.Clone(request.Context())
+	restarted.Body = body
+	return restarted, true
+}
+
+// drop 把失败的连接从主机对应类别移出，使重发的请求改用新连接
+func (h3 *firefoxHTTP3) drop(host string, anonymous bool, conn *http3Conn) {
+	h3.mu.Lock()
+	defer h3.mu.Unlock()
+	if origin := h3.origins[host]; origin != nil && origin.classes[classIndex(anonymous)].conn == conn {
+		origin.classes[classIndex(anonymous)].conn = nil
 	}
 }
 

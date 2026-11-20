@@ -1,10 +1,12 @@
 package waa
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/htmlindex"
@@ -51,8 +53,14 @@ func decodeText(name string, data []byte, fatal bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if fatal && strings.ContainsRune(string(decoded), '�') && !strings.ContainsRune(string(data), '�') {
+	if fatal && bytes.ContainsRune(decoded, utf8.RuneError) && !reencodes(encoder, decoded, data) {
 		return "", encoding.ErrInvalidUTF8
 	}
 	return string(decoded), nil
+}
+
+// reencodes 判断 decoded 按该编码重新编码后与 data 逐字节相同，此时其中的 U+FFFD 都来自合法编码的 U+FFFD
+func reencodes(encoder encoding.Encoding, decoded, data []byte) bool {
+	encoded, err := encoder.NewEncoder().Bytes(decoded)
+	return err == nil && bytes.Equal(encoded, data)
 }

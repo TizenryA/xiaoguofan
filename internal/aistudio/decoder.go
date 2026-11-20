@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"unicode"
 )
 
@@ -25,7 +27,50 @@ type PromptFeedbackError struct {
 	Reason        string
 	Message       string
 	SafetyRatings []SafetyRating
-	Raw           json.RawMessage
+	// Usage 是拦截帧中上游计入的输入用量
+	Usage *Usage
+	Raw   json.RawMessage
+}
+
+// InputBlocked 表示上游按输入本身（安全设置、屏蔽词、禁止内容）拦截请求，同一输入重发仍被拦截
+func (e *PromptFeedbackError) InputBlocked() bool {
+	switch e.Reason {
+	case "safety", "blocklist", "prohibited_content":
+		return true
+	}
+	return false
+}
+
+// ContentPolicyError 表示上游以内容策略类原因结束生成
+type ContentPolicyError struct {
+	Reason  string
+	Message string
+	// Usage 是下游还没有收到事件就结束时上游给出的用量
+	Usage *Usage
+}
+
+// AbnormalFinishError 表示上游以格式错误的函数调用、意外的工具调用或格式错误的响应结束且这次生成没有任何输出
+type AbnormalFinishError struct {
+	Reason  string
+	Message string
+	// Usage 是上游最后给出的用量
+	Usage *Usage
+}
+
+// Error 返回上游异常结束生成的原因
+func (e *AbnormalFinishError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("AI Studio 异常结束生成且没有输出: %s: %s", strings.ToUpper(e.Reason), e.Message)
+	}
+	return fmt.Sprintf("AI Studio 异常结束生成且没有输出: %s", strings.ToUpper(e.Reason))
+}
+
+// Error 返回上游结束生成的内容策略原因
+func (e *ContentPolicyError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("AI Studio 因内容策略结束生成: %s: %s", strings.ToUpper(e.Reason), e.Message)
+	}
+	return fmt.Sprintf("AI Studio 因内容策略结束生成: %s", strings.ToUpper(e.Reason))
 }
 
 // Error 返回协议证据错误
@@ -94,6 +139,7 @@ func (reader *streamReadRecorder) failure(method string, frames int, decodeErr e
 type sparseJSONReader struct {
 	source        *bufio.Reader
 	pending       []byte
+	hole          [5]byte
 	inString      bool
 	escaped       bool
 	previousToken byte
@@ -115,19 +161,64 @@ func (r *sparseJSONReader) Read(destination []byte) (int, error) {
 		if written > 0 && r.source.Buffered() == 0 {
 			return written, nil
 		}
-		value, err := r.source.ReadByte()
-		if err != nil {
-			if written > 0 {
-				return written, nil
+		if r.source.Buffered() == 0 {
+			if _, err := r.source.Peek(1); err != nil {
+				if written > 0 {
+					return written, nil
+				}
+				return 0, err
 			}
-			return 0, err
 		}
-		r.pending = r.normalize(value)
+		chunk, _ := r.source.Peek(min(r.source.Buffered(), len(destination)-written))
+		count, hole := r.scan(chunk)
+		written += copy(destination[written:], chunk[:count])
+		if hole {
+			r.pending = append(append(r.hole[:0], "null"...), chunk[count])
+			count++
+		}
+		_, _ = r.source.Discard(count)
 	}
 	return written, nil
 }
 
-func (r *sparseJSONReader) normalize(value byte) []byte {
+// scan 按字节更新扫描状态，返回第一个前面是数组空位的字节的位置；没有空位时返回 len(chunk) 与 false；字符串内容按 bytes.IndexByte 跳到下一个引号或反斜杠
+func (r *sparseJSONReader) scan(chunk []byte) (int, bool) {
+	quote, slash := -1, -1
+	next := func(cached *int, value byte, from int) int {
+		if *cached < from {
+			*cached = len(chunk)
+			if index := bytes.IndexByte(chunk[from:], value); index >= 0 {
+				*cached = from + index
+			}
+		}
+		return *cached
+	}
+	for position := 0; position < len(chunk); position++ {
+		if r.inString {
+			if r.escaped {
+				r.escaped = false
+				continue
+			}
+			position = min(next(&quote, '"', position), next(&slash, '\\', position))
+			if position == len(chunk) {
+				break
+			}
+			if chunk[position] == '\\' {
+				r.escaped = true
+			} else {
+				r.inString = false
+			}
+			continue
+		}
+		if r.emptySlot(chunk[position]) {
+			return position, true
+		}
+	}
+	return len(chunk), false
+}
+
+// emptySlot 按 value 更新扫描状态，返回 value 之前是否为数组空位
+func (r *sparseJSONReader) emptySlot(value byte) bool {
 	if r.inString {
 		if r.escaped {
 			r.escaped = false
@@ -136,25 +227,16 @@ func (r *sparseJSONReader) normalize(value byte) []byte {
 		} else if value == '"' {
 			r.inString = false
 		}
-		return []byte{value}
+		return false
 	}
 	if value == '"' {
 		r.inString = true
-		r.previousToken = value
-		return []byte{value}
 	}
-	if value == ',' && (r.previousToken == '[' || r.previousToken == ',') {
-		r.previousToken = value
-		return []byte("null,")
-	}
-	if value == ']' && r.previousToken == ',' {
-		r.previousToken = value
-		return []byte("null]")
-	}
+	empty := value == ',' && (r.previousToken == '[' || r.previousToken == ',') || value == ']' && r.previousToken == ','
 	if !unicode.IsSpace(rune(value)) {
 		r.previousToken = value
 	}
-	return []byte{value}
+	return empty
 }
 
 func decodeJSONValue(raw []byte) (json.RawMessage, error) {
@@ -174,11 +256,263 @@ func decodeJSONValue(raw []byte) (json.RawMessage, error) {
 	return value, nil
 }
 
+// decodeGenerateItems 依次把 GenerateContent 流 field 1 中的帧交给 consume：补齐空位后单遍切出各值并逐个校验，切分或校验不接受时按标准解码从最后交出的帧之后重放，最后交出的帧以同样结束方式的空值代替
 func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) error {
 	reader := &streamReadRecorder{source: source}
-	decoder := json.NewDecoder(newSparseJSONReader(reader))
+	scanner := &frameScanner{source: newSparseJSONReader(reader)}
+	frames, err := scanner.decode(consume)
+	if err != errFrameReplay {
+		return err
+	}
+	if scanner.err != nil {
+		reader.source, reader.err = failedReader{scanner.err}, nil
+	}
+	data := slices.Concat(append(scanner.done, scanner.filled)...)[scanner.kept-scanner.doneAt:]
+	ends := make([]int, len(scanner.ends))
+	for index, end := range scanner.ends {
+		ends[index] = end - scanner.kept
+	}
+	var head []byte
+	if frames > 0 {
+		head = []byte(`[[""`)
+		if scanner.closed {
+			head = []byte(`[[[]`)
+		}
+	}
+	replay := &replayReader{data: data, ends: ends}
+	return decodeGenerateItemsStandard(io.MultiReader(bytes.NewReader(head), replay, scanner.source), reader, frames, consume)
+}
+
+// errFrameReplay 表示单遍切分不接受当前输入，需要按标准解码重放
+var errFrameReplay = errors.New("按标准解码重放")
+
+// failedReader 每次读取都返回 err，重放读到原流结束或出错的位置时再次给出同一结果
+type failedReader struct{ err error }
+
+func (reader failedReader) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
+// replayReader 按单遍切分时每次读取的边界重放已读到、尚未交出的字节，ends 为各次读取结束处在 data 中的位置
+type replayReader struct {
+	data []byte
+	ends []int
+	pos  int
+}
+
+func (reader *replayReader) Read(buffer []byte) (int, error) {
+	if len(reader.ends) == 0 {
+		return 0, io.EOF
+	}
+	count := copy(buffer, reader.data[reader.pos:reader.ends[0]])
+	reader.pos += count
+	if reader.pos == reader.ends[0] {
+		reader.ends = reader.ends[1:]
+	}
+	return count, nil
+}
+
+// frameScanner 从补齐空位后的 GenerateContent 流中切出根数组内的各值：filled 从 mark 起是尚未切完的字节，此前读到的字节从流内位置 doneAt 起依次存入 done；kept 是最后交出的帧之后的流内位置，closed 表示该帧以括号结束，ends 保存 kept 之后每次读取结束时的流内位置，done 与 ends 只保留重放所需的部分
+type frameScanner struct {
+	source io.Reader
+	done   [][]byte
+	doneAt int
+	kept   int
+	closed bool
+	filled []byte
+	ends   []int
+	read   int
+	mark   int
+	pos    int
+	err    error
+}
+
+// delivered 记下 raw 已交出：此后重放从它之后开始，丢弃此前读到的字节与读取边界
+func (s *frameScanner) delivered(raw []byte) {
+	s.kept = s.read + s.pos
+	s.closed = raw[len(raw)-1] == ']' || raw[len(raw)-1] == '}'
+	clear(s.done)
+	s.done = s.done[:0]
+	s.doneAt = s.read
+	ends := s.ends[:0]
+	for _, end := range s.ends {
+		if end > s.kept {
+			ends = append(ends, end)
+		}
+	}
+	s.ends = ends
+}
+
+// fill 再读一块数据，返回尚未切完的字节在 filled 中前移的距离；流已结束或读取出错时返回 false
+func (s *frameScanner) fill() (int, bool) {
+	shift := 0
+	for s.err == nil {
+		if cap(s.filled)-len(s.filled) < 16<<10 {
+			shift += s.mark
+			kept := s.filled[s.mark:]
+			if s.mark > 0 {
+				if len(s.done) == 0 {
+					s.doneAt = s.read
+				}
+				s.done = append(s.done, s.filled[:s.mark:s.mark])
+			}
+			s.filled = append(make([]byte, 0, max(64<<10, 2*len(kept))), kept...)
+			s.read, s.pos, s.mark = s.read+s.mark, s.pos-s.mark, 0
+		}
+		count, err := s.source.Read(s.filled[len(s.filled):cap(s.filled)])
+		s.filled = s.filled[:len(s.filled)+count]
+		s.err = err
+		if count > 0 {
+			s.ends = append(s.ends, s.read+len(s.filled))
+			return shift, true
+		}
+	}
+	return shift, false
+}
+
+// peek 跳过空白返回下一个字节，流已结束或读取出错时返回 false
+func (s *frameScanner) peek() (byte, bool) {
+	for {
+		for ; s.pos < len(s.filled); s.pos++ {
+			if char := s.filled[s.pos]; char != ' ' && char != '\t' && char != '\n' && char != '\r' {
+				return char, true
+			}
+		}
+		s.mark = s.pos
+		if _, ok := s.fill(); !ok {
+			return 0, false
+		}
+	}
+}
+
+// value 返回从当前位置开始的一个值的字节并前移到其后，字符串内容按 stringEnd 跳过；值为空或不完整时返回 false
+func (s *frameScanner) value() ([]byte, bool) {
+	s.mark = s.pos
+	depth, position := 0, s.pos
+	for {
+		for position < len(s.filled) {
+			switch s.filled[position] {
+			case '"':
+				from := position + 1
+				end, closed := stringEnd(s.filled, from)
+				for !closed {
+					from = len(s.filled)
+					for from > position+1 && s.filled[from-1] == '\\' {
+						from--
+					}
+					shift, ok := s.fill()
+					if !ok {
+						return nil, false
+					}
+					position, from = position-shift, from-shift
+					end, closed = stringEnd(s.filled, from)
+				}
+				position = end + 1
+				if depth == 0 {
+					return s.cut(position), true
+				}
+			case '[', '{':
+				depth++
+				position++
+			case ']', '}':
+				if depth == 0 {
+					return s.cut(position), position > s.mark
+				}
+				depth--
+				position++
+				if depth == 0 {
+					return s.cut(position), true
+				}
+			case ',', ' ', '\t', '\n', '\r':
+				if depth == 0 {
+					return s.cut(position), position > s.mark
+				}
+				position++
+			default:
+				position++
+			}
+		}
+		shift, ok := s.fill()
+		if !ok {
+			return nil, false
+		}
+		position -= shift
+	}
+}
+
+// cut 返回从 mark 到 end 的值并前移到 end
+func (s *frameScanner) cut(end int) []byte {
+	s.pos = end
+	return s.filled[s.mark:end:end]
+}
+
+// decode 依次交出 field 1 的各帧，核对 field 2 的流尾状态与根数组结束，返回已交出的帧数；切分或校验不接受时返回 errFrameReplay
+func (s *frameScanner) decode(consume func(json.RawMessage) error) (int, error) {
+	frames := 0
+	for range 2 {
+		if char, ok := s.peek(); !ok || char != '[' {
+			return frames, errFrameReplay
+		}
+		s.pos++
+	}
+	if char, ok := s.peek(); !ok {
+		return frames, errFrameReplay
+	} else if char == ']' {
+		s.pos++
+	} else {
+		for {
+			raw, ok := s.value()
+			if !ok || !json.Valid(raw) {
+				return frames, errFrameReplay
+			}
+			if err := consume(raw); err != nil {
+				return frames, err
+			}
+			frames++
+			s.delivered(raw)
+			char, ok := s.peek()
+			if !ok || char != ',' && char != ']' {
+				return frames, errFrameReplay
+			}
+			s.pos++
+			if char == ']' {
+				break
+			}
+		}
+	}
+	for field := 1; ; field++ {
+		char, ok := s.peek()
+		if !ok || char != ',' && char != ']' {
+			return frames, errFrameReplay
+		}
+		s.pos++
+		if char == ']' {
+			break
+		}
+		if _, ok := s.peek(); !ok {
+			return frames, errFrameReplay
+		}
+		raw, ok := s.value()
+		if !ok || !json.Valid(raw) {
+			return frames, errFrameReplay
+		}
+		if field == 1 {
+			if err := trailerError("GenerateContent", raw); err != nil {
+				return frames, err
+			}
+		}
+	}
+	if _, ok := s.peek(); ok || s.err != io.EOF {
+		return frames, errFrameReplay
+	}
+	return frames, nil
+}
+
+// decodeGenerateItemsStandard 以标准 JSON 解码逐个读取补齐空位后的 GenerateContent 流，前 skip 帧已经交出，不再交给 consume；skip 大于 0 时 source 以代替最后交出那一帧的占位值开始
+func decodeGenerateItemsStandard(source io.Reader, reader *streamReadRecorder, skip int, consume func(json.RawMessage) error) error {
+	decoder := json.NewDecoder(source)
 	decoder.UseNumber()
-	index := 0
+	index := max(skip-1, 0)
 	fail := func(path string, err error) error {
 		return reader.failure("GenerateContent", index, &ProtocolEvidenceError{Method: "GenerateContent", Path: path, Detail: err.Error()})
 	}
@@ -204,8 +538,10 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 		if err := decoder.Decode(&raw); err != nil {
 			return fail(fmt.Sprintf("$[0][%d]", index), err)
 		}
-		if err := consume(raw); err != nil {
-			return err
+		if index >= skip {
+			if err := consume(raw); err != nil {
+				return err
+			}
 		}
 		index++
 	}
@@ -266,9 +602,7 @@ func trailerError(method string, raw json.RawMessage) error {
 
 func rawArray(raw json.RawMessage, path string, evidence json.RawMessage) ([]json.RawMessage, error) {
 	var values []json.RawMessage
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&values); err != nil {
+	if err := json.Unmarshal(raw, &values); err != nil {
 		return nil, &ProtocolEvidenceError{Path: path, Detail: "期望数组", Raw: cloneEvidence(raw, evidence)}
 	}
 	return values, nil
@@ -282,11 +616,74 @@ func rawString(raw json.RawMessage, path string, evidence json.RawMessage) (stri
 	return value, nil
 }
 
+// splitArray 返回与 rawArray 相同的元素与错误，raw 须为合法 JSON：按顶层逗号切分数组，元素追加到调用方提供的 values 之后，与 raw 共用字节且容量截止到元素末尾
+func splitArray(raw json.RawMessage, path string, evidence json.RawMessage, values []json.RawMessage) ([]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, &ProtocolEvidenceError{Path: path, Detail: "期望数组", Raw: cloneEvidence(raw, evidence)}
+	}
+	depth, start := 0, 1
+	for position := 1; position < len(trimmed); position++ {
+		switch trimmed[position] {
+		case '"':
+			closing, ok := stringEnd(trimmed, position+1)
+			if !ok {
+				return nil, &ProtocolEvidenceError{Path: path, Detail: "期望数组", Raw: cloneEvidence(raw, evidence)}
+			}
+			position = closing
+		case '[', '{':
+			depth++
+		case ']', '}':
+			if depth > 0 {
+				depth--
+				continue
+			}
+			if element := bytes.TrimSpace(trimmed[start:position]); len(element) > 0 {
+				values = append(values, element[:len(element):len(element)])
+			}
+			return values, nil
+		case ',':
+			if depth == 0 {
+				element := bytes.TrimSpace(trimmed[start:position])
+				values = append(values, element[:len(element):len(element)])
+				start = position + 1
+			}
+		}
+	}
+	return nil, &ProtocolEvidenceError{Path: path, Detail: "期望数组", Raw: cloneEvidence(raw, evidence)}
+}
+
+// canonicalInt64 解析不带符号以外修饰、没有前导零、不超过 18 位的 JSON 整数字面量，其余写法返回 false
+func canonicalInt64(raw []byte) (int64, bool) {
+	digits := raw
+	if len(digits) > 0 && digits[0] == '-' {
+		digits = digits[1:]
+	}
+	if len(digits) == 0 || len(digits) > 18 || len(digits) > 1 && digits[0] == '0' {
+		return 0, false
+	}
+	value := int64(0)
+	for _, digit := range digits {
+		if digit < '0' || digit > '9' {
+			return 0, false
+		}
+		value = value*10 + int64(digit-'0')
+	}
+	if len(digits) < len(raw) {
+		value = -value
+	}
+	return value, true
+}
+
 func rawInt64(raw json.RawMessage, path string, evidence json.RawMessage) (int64, error) {
+	if value, ok := canonicalInt64(bytes.TrimSpace(raw)); ok {
+		return value, nil
+	}
 	var number json.Number
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&number); err != nil {
+	if err := json.Unmarshal(raw, &number); err != nil {
 		return 0, &ProtocolEvidenceError{Path: path, Detail: "期望整数", Raw: cloneEvidence(raw, evidence)}
 	}
 	value, err := strconv.ParseInt(number.String(), 10, 64)
@@ -298,9 +695,7 @@ func rawInt64(raw json.RawMessage, path string, evidence json.RawMessage) (int64
 
 func rawFloat64(raw json.RawMessage, path string, evidence json.RawMessage) (float64, error) {
 	var number json.Number
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&number); err != nil {
+	if err := json.Unmarshal(raw, &number); err != nil {
 		return 0, &ProtocolEvidenceError{Path: path, Detail: "期望数字", Raw: cloneEvidence(raw, evidence)}
 	}
 	value, err := strconv.ParseFloat(number.String(), 64)
@@ -325,7 +720,7 @@ func rawBool(raw json.RawMessage, path string, evidence json.RawMessage) (bool, 
 }
 
 func rawAt(values []json.RawMessage, index int) json.RawMessage {
-	if index < 0 || index >= len(values) {
+	if index >= len(values) {
 		return nil
 	}
 	return values[index]

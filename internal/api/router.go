@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +27,8 @@ type Config struct {
 	Updates          UpdateService
 	// MediaDir 是媒体 URL 模式下生成媒体的保存目录
 	MediaDir string
+	// MediaLimit 是媒体目录的总字节上限，超过时删除最久未使用的文件
+	MediaLimit int64
 	// MediaLinks 返回媒体输出是否使用 URL 与设置的服务地址
 	MediaLinks func() (enabled bool, base string)
 	// ResponseModes 返回非流式保活与假流式设置
@@ -35,6 +39,8 @@ type Config struct {
 	WaitLaunch func(context.Context)
 	// EgressProxy 返回服务连接外部 MCP 服务器所用的出口代理，空串为直连
 	EgressProxy func() string
+	// States 持久保存 Responses、Interactions 与 Chat 音频回复的续接节点，为空时只保存在内存中
+	States StateStore
 }
 
 // ResponseModes 是生成请求的响应方式设置
@@ -54,8 +60,11 @@ type server struct {
 	thoughtSignatures *thoughtSignatureStore
 	pairing           *pairingTokens
 	loginViews        *loginViews
+	accountTasks      *accountTasks
 	// background 按响应 ID 保存进行中的 Responses 后台响应
 	background sync.Map
+	// media 是媒体 URL 模式的生成媒体目录
+	media *mediaStore
 }
 
 var idSequence atomic.Uint64
@@ -63,12 +72,26 @@ var idSequence atomic.Uint64
 // NewHandler 创建公开 API 路由
 func NewHandler(service aistudio.Service, config Config) http.Handler {
 	s := &server{
-		service: service, config: config, responseStates: newResponseStateStore(), uploads: newGeminiUploads(), caches: newGeminiCaches(),
-		thoughtSignatures: newThoughtSignatureStore(), pairing: &pairingTokens{}, loginViews: &loginViews{},
+		service: service, config: config, responseStates: newResponseStateStore(config.States), uploads: newGeminiUploads(), caches: newGeminiCaches(),
+		thoughtSignatures: newThoughtSignatureStore(), pairing: &pairingTokens{}, loginViews: &loginViews{}, accountTasks: &accountTasks{},
+		media: &mediaStore{dir: config.MediaDir, limit: config.MediaLimit},
+	}
+	if config.MediaDir != "" {
+		if err := s.media.trim(); err != nil {
+			slog.Warn("媒体目录回收失败", "dir", config.MediaDir, "error", err)
+		}
 	}
 	public := http.NewServeMux()
-	public.HandleFunc("GET /v1/models", s.handleOpenAIModels)
-	public.HandleFunc("GET /v1/models/{model...}", s.handleOpenAIModel)
+	public.HandleFunc("GET /v1/models", geminiOr(s.handleGeminiModels, s.handleOpenAIModels))
+	public.HandleFunc("GET /v1/models/{model...}", geminiOr(s.handleGeminiModel, s.handleOpenAIModel))
+	public.HandleFunc("POST /v1/models/{action}", s.handleGeminiAction)
+	public.HandleFunc("GET /v1/operations/{operation}", s.handleGeminiVideoOperation)
+	public.HandleFunc("POST /upload/v1/files", s.handleGeminiFileUpload)
+	public.HandleFunc("POST /v1/cachedContents", s.handleGeminiCacheCreate)
+	public.HandleFunc("GET /v1/cachedContents", s.handleGeminiCacheList)
+	public.HandleFunc("GET /v1/cachedContents/{cache}", s.handleGeminiCacheGet)
+	public.HandleFunc("PATCH /v1/cachedContents/{cache}", s.handleGeminiCacheUpdate)
+	public.HandleFunc("DELETE /v1/cachedContents/{cache}", s.handleGeminiCacheDelete)
 	public.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	public.HandleFunc("POST /v1/embeddings", s.handleOpenAIEmbeddings)
 	public.HandleFunc("POST /v1/responses", s.handleResponses)
@@ -87,10 +110,10 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	public.HandleFunc("POST /v1/interactions/{id}/cancel", s.handleInteractionCancel)
 	public.HandleFunc("POST /v1beta/interactions/{id}/cancel", s.handleInteractionCancel)
 	public.HandleFunc("POST /v1/files", s.handleFileUpload)
-	public.HandleFunc("GET /v1/files", s.handleFileList)
-	public.HandleFunc("GET /v1/files/{file}", s.handleFileGet)
+	public.HandleFunc("GET /v1/files", geminiOr(s.handleGeminiFileList, s.handleFileList))
+	public.HandleFunc("GET /v1/files/{file}", geminiOr(s.handleGeminiFileGet, s.handleFileGet))
 	public.HandleFunc("GET /v1/files/{file}/content", s.handleFileContent)
-	public.HandleFunc("DELETE /v1/files/{file}", s.handleFileDelete)
+	public.HandleFunc("DELETE /v1/files/{file}", geminiOr(s.handleGeminiFileDelete, s.handleFileDelete))
 	public.HandleFunc("POST /v1/images/generations", s.handleOpenAIImages)
 	public.HandleFunc("POST /v1/images/edits", s.handleOpenAIImageEdits)
 	public.HandleFunc("POST /v1/audio/speech", s.handleOpenAISpeech)
@@ -109,6 +132,7 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	public.HandleFunc("GET /v1beta/models/{model...}", s.handleGeminiModel)
 	public.HandleFunc("POST /v1beta/models/{action}", s.handleGeminiAction)
 	public.HandleFunc("GET /v1beta/operations/{operation}", s.handleGeminiVideoOperation)
+	public.HandleFunc("POST /v1beta/decisions", s.handleDecision)
 	public.HandleFunc("POST /upload/v1beta/files", s.handleGeminiFileUpload)
 	public.HandleFunc("GET /v1beta/files", s.handleGeminiFileList)
 	public.HandleFunc("GET /v1beta/files/{file}", s.handleGeminiFileGet)
@@ -131,7 +155,7 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 
 	root := http.NewServeMux()
 	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
-	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, apiKeyContextMiddleware(config.APIKey, requestBodyMiddleware(config.Ledger, waitLaunchMiddleware(config.WaitLaunch, public))))))
+	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, apiKeyContextMiddleware(config.APIKey, accountContextMiddleware(requestBodyMiddleware(config.Ledger, waitLaunchMiddleware(config.WaitLaunch, s.catalogRead, public)))))))
 	loggedHandler := requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler))
 	root.Handle("/v1/", loggedHandler)
 	root.Handle("/v1beta/", loggedHandler)
@@ -141,18 +165,50 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 		root.Handle("GET /media/{file}", corsMiddleware(http.HandlerFunc(s.handleMedia)))
 	}
 	root.HandleFunc("POST /api/pairing/accounts", s.handlePairingAccount)
+	root.HandleFunc("PUT /api/pairing/accounts/{account}/cookies", s.handlePairingRenewal)
 	return root
 }
 
-// waitLaunchMiddleware 让请求在生成服务启动期间等到启动结束再处理，wait 为空时直接处理
-func waitLaunchMiddleware(wait func(context.Context), next http.Handler) http.Handler {
+// geminiOr 返回把以 Gemini API 方式鉴权的请求交给 gemini、其余交给 openai 的处理函数，供 /v1 下两个协议共用的路径
+func geminiOr(gemini, openai http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if geminiAuth(r) {
+			gemini(w, r)
+			return
+		}
+		openai(w, r)
+	}
+}
+
+// waitLaunchMiddleware 让请求在生成服务启动期间等到启动结束再处理，已发布的公开目录能回答的模型查询直接处理，wait 为空时直接处理
+func waitLaunchMiddleware(wait func(context.Context), catalogRead func(*http.Request) bool, next http.Handler) http.Handler {
 	if wait == nil {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		wait(r.Context())
+		if !catalogRead(r) {
+			wait(r.Context())
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// catalogRead 判断请求是否为已发布的公开目录能回答的模型查询：目录非空时的模型列表，或目录中已有该模型的单模型查询
+func (s *server) catalogRead(r *http.Request) bool {
+	path := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/v1beta"), "/v1")
+	if r.Method != http.MethodGet || path != "/models" && (!strings.HasPrefix(path, "/models/") || strings.Contains(path, "/operations/")) {
+		return false
+	}
+	models, err := s.service.Models(r.Context())
+	if err != nil || len(models) == 0 {
+		return false
+	}
+	id, single := strings.CutPrefix(path, "/models/")
+	if !single {
+		return true
+	}
+	_, found := LookupPublicModel(s.searchModels(models), id)
+	return found
 }
 
 func newID(prefix string) string {

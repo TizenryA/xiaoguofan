@@ -25,7 +25,7 @@ const buildProxyUnaryMethod = "ProxyUnaryCall"
 const buildProofField = 3
 
 // buildThinkingLevels 把 thinking level 枚举换算为 Gemini API 名称
-var buildThinkingLevels = map[int64]string{1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "MINIMAL"}
+var buildThinkingLevels = map[int64]string{1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "MINIMAL", 5: "EXTRA_HIGH"}
 
 // buildModelDefaults 返回 Build 独有模型按目录推导的生成默认值
 func buildModelDefaults(model Model) GenerationDefaults {
@@ -138,12 +138,12 @@ func buildSystemInstruction(system []string) map[string]any {
 	return map[string]any{"parts": parts}
 }
 
-// EncodeBuildProxyRequest 编码代理请求：ProxyStreamedCall 为 [路径, 请求体, WAA proof]，ProxyUnaryCall 追加 HTTP 方法
-func EncodeBuildProxyRequest(path string, body []byte, unary bool) ([]byte, error) {
+// EncodeBuildProxyRequest 编码代理请求：ProxyStreamedCall 为 [路径, 请求体, WAA proof]，ProxyUnaryCall 追加 HTTP 方法；返回正文与 WAA proof 字段在正文中的起始字节
+func EncodeBuildProxyRequest(path string, body []byte, unary bool) ([]byte, int, error) {
 	if unary {
-		return json.Marshal([]any{path, string(body), nil, http.MethodPost})
+		return marshalWAAArray([]any{path, string(body), nil, http.MethodPost}, buildProofField)
 	}
-	return json.Marshal([]any{path, string(body), nil})
+	return marshalWAAArray([]any{path, string(body), nil}, buildProofField)
 }
 
 // buildUsesUnary 判断模型是否需要订阅权益，需要时经 ProxyUnaryCall 单次代理调用
@@ -166,15 +166,14 @@ func buildBindingPrompt(body []byte) (string, error) {
 }
 
 func encodeBuildContents(contents []Content) ([]any, error) {
-	wire := make([]any, 0, len(contents))
-	var pendingCalls []FunctionCall
-	for index, content := range contents {
+	linked, err := linkedContents(contents)
+	if err != nil {
+		return nil, err
+	}
+	wire := make([]any, 0, len(linked))
+	for index, content := range linked {
 		if len(content.Parts) == 0 {
 			continue
-		}
-		content, err := linkFunctionResults(content, &pendingCalls)
-		if err != nil {
-			return nil, fmt.Errorf("编码 content %d: %w", index, err)
 		}
 		role := "user"
 		switch content.Role {
@@ -256,9 +255,6 @@ func encodeBuildPart(part Part) (map[string]any, error) {
 			signature = "skip_thought_signature_validator"
 		}
 	case part.FunctionResult != nil:
-		if part.FunctionResult.Name == "" {
-			return nil, fmt.Errorf("function result 缺少名称且无法唯一关联调用")
-		}
 		response, err := buildJSONObject(part.FunctionResult.Content)
 		if err != nil {
 			return nil, fmt.Errorf("function result content: %w", err)
@@ -720,7 +716,7 @@ func (d *BuildStreamDecoder) Decode(raw []byte) ([]Event, error) {
 	if len(response.Candidates) == 0 {
 		if response.PromptFeedback != nil && response.PromptFeedback.BlockReason != "" {
 			feedback := response.PromptFeedback
-			return nil, &PromptFeedbackError{Reason: buildEnumName(feedback.BlockReason, "BLOCK_REASON_"), Message: feedback.BlockReasonMessage, SafetyRatings: feedback.SafetyRatings, Raw: cloneRaw(raw)}
+			return nil, &PromptFeedbackError{Reason: buildEnumName(feedback.BlockReason, "BLOCK_REASON_"), Message: feedback.BlockReasonMessage, SafetyRatings: feedback.SafetyRatings, Usage: frameUsage, Raw: cloneRaw(raw)}
 		}
 		return nil, nil
 	}
@@ -1057,7 +1053,7 @@ func (c *Client) sendBuildMode(ctx context.Context, request GenerateRequest, ent
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
-	proxy, err := EncodeBuildProxyRequest(path, body, unary)
+	proxy, proofAt, err := EncodeBuildProxyRequest(path, body, unary)
 	if err != nil {
 		return nil, nil, fmt.Errorf("编码 Build 代理请求: %w", err)
 	}
@@ -1069,8 +1065,9 @@ func (c *Client) sendBuildMode(ctx context.Context, request GenerateRequest, ent
 	if unary {
 		mode = "native"
 	}
-	reportUpstreamMode(ctx, method, mode, reason)
+	reportUpstreamMode(ctx, method, mode, 0, reason)
 	rpc := newRPCRequest(method, request.AccountID, request.ID, proxy, !unary)
+	rpc.ProofAt = proofAt
 	c.applyBenefitTier(rpc.Method, request.AccountID, rpc.Header)
 	response, err := c.protected.DoProtected(ctx, request, rpc)
 	if err != nil {

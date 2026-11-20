@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,11 +42,15 @@ const (
 	adminRequestRetain         = 512
 	adminRequestCompactAt      = 640
 	adminRequestRefreshLatency = 50 * time.Millisecond
+	// adminRequestDataInterval 是正在输出的请求向管理页发布最近收到输出时刻的最短间隔
+	adminRequestDataInterval = time.Second
 )
 
 type trackedRequest struct {
 	request api.AdminRequest
 	cancel  context.CancelFunc
+	// publishedDataAt 是最近一次发布给管理页的收到输出时刻
+	publishedDataAt time.Time
 }
 
 // newRequestRegistry 创建活动请求注册表
@@ -65,7 +70,7 @@ func (registry *requestRegistry) start(request aistudio.GenerateRequest, cancel 
 	tracked := trackedRequest{
 		request: api.AdminRequest{
 			ID: request.ID, Model: request.Model, AccountID: request.AccountID,
-			State: "queued", StartedAt: time.Now().UTC(),
+			State: "queued", StartedAt: time.Now(),
 		},
 		cancel: cancel,
 	}
@@ -82,6 +87,20 @@ func (registry *requestRegistry) markRunning(id string, accountID string, accoun
 		tracked.request.AccountID = accountID
 		tracked.request.AccountLabel = accountLabel
 		tracked.request.State = "running"
+		tracked.request.SentAt = time.Now()
+		registry.active[id] = tracked
+		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
+	}
+	registry.mu.Unlock()
+}
+
+// markQueued 把换号后重新等待账户的请求改回等待执行，accountID 为请求指定的账户，清掉上一次尝试的账户、通道、发出与收到输出的时刻
+func (registry *requestRegistry) markQueued(id string, accountID string) {
+	registry.mu.Lock()
+	if tracked, exists := registry.active[id]; exists {
+		tracked.request.AccountID, tracked.request.AccountLabel, tracked.request.Channel = accountID, "", ""
+		tracked.request.State = "queued"
+		tracked.request.SentAt, tracked.request.LastDataAt, tracked.publishedDataAt = time.Time{}, time.Time{}, time.Time{}
 		registry.active[id] = tracked
 		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
 	}
@@ -95,6 +114,20 @@ func (registry *requestRegistry) markChannel(id string, channel string) {
 		tracked.request.Channel = channel
 		registry.active[id] = tracked
 		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
+	}
+	registry.mu.Unlock()
+}
+
+// markData 记下请求最近一次收到上游输出的时刻，首个输出立即发布，之后至多每 adminRequestDataInterval 发布一次
+func (registry *requestRegistry) markData(id string, at time.Time) {
+	registry.mu.Lock()
+	if tracked, exists := registry.active[id]; exists {
+		tracked.request.LastDataAt = at
+		if at.Sub(tracked.publishedDataAt) >= adminRequestDataInterval {
+			tracked.publishedDataAt = at
+			registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
+		}
+		registry.active[id] = tracked
 	}
 	registry.mu.Unlock()
 }
@@ -156,13 +189,35 @@ func (registry *requestRegistry) cancelAll() {
 	}
 }
 
-func (registry *requestRegistry) log(source string, level string, message string) {
-	registry.recordLog(api.AdminLog{Source: source, Level: level, Message: message, Event: "runtime.message"})
+// log 记录一条运行日志，attrs 依次为字段的英文标识与取值
+func (registry *requestRegistry) log(source, level, message string, attrs ...any) {
+	registry.recordLog(api.AdminLog{Source: source, Level: level, Message: message, Fields: logFields(attrs), Event: "runtime.message"})
 }
 
-// recordLog 将同一结构化事件发布到管理页面与控制台
+// logStage 记录一条属于 stage 的运行日志，attrs 依次为字段的英文标识与取值
+func (registry *requestRegistry) logStage(source, level string, stage api.LogStage, message string, attrs ...any) {
+	registry.recordLog(api.AdminLog{Source: source, Level: level, Message: message, Fields: logFields(attrs), Stage: &stage, Event: "runtime.message"})
+}
+
+// logFields 把依次排列的标识与取值转为日志字段，取值去掉首尾空白，时长取到毫秒
+func logFields(attrs []any) []api.LogField {
+	if len(attrs) == 0 {
+		return nil
+	}
+	fields := make([]api.LogField, 0, len(attrs)/2)
+	for index := 0; index+1 < len(attrs); index += 2 {
+		value := attrs[index+1]
+		if duration, ok := value.(time.Duration); ok {
+			value = duration.Round(time.Millisecond)
+		}
+		fields = append(fields, api.LogField{Key: attrs[index].(string), Value: strings.TrimSpace(fmt.Sprint(value))})
+	}
+	return fields
+}
+
+// recordLog 将同一结构化事件发布到管理页面与控制台，时间为带时区偏移的本地时间
 func (registry *requestRegistry) recordLog(entry api.AdminLog) {
-	entry.Time = time.Now().UTC()
+	entry.Time = time.Now()
 	registry.mu.Lock()
 	registry.logs = append(registry.logs, entry)
 	if len(registry.logs) >= adminLogCompactAt {
@@ -190,6 +245,12 @@ func (registry *requestRegistry) writeConsole(ctx context.Context) {
 			}
 			record := slog.NewRecord(entry.Time, level, entry.Message, 0)
 			record.AddAttrs(slog.String("event", entry.Event), slog.String("source", entry.Source))
+			if entry.Stage != nil {
+				record.AddAttrs(slog.Any("stage", entry.Stage))
+			}
+			for _, field := range entry.Fields {
+				record.AddAttrs(slog.String(field.Key, field.Value))
+			}
 			if entry.Request != nil {
 				record.AddAttrs(slog.Any("request", entry.Request))
 			}

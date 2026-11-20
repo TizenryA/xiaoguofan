@@ -31,7 +31,7 @@ from portal.store import DEFAULTS, Store, digest
 from portal.usage import UsageMeter
 from portal.workers import BrokerClient
 
-VERSION = '0.9.15'
+VERSION = '0.9.22'
 
 
 class Strict(BaseModel):
@@ -182,7 +182,22 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             raise HTTPException(409,'账号操作进行中，请稍后重试；不要重复点击检查')
         async with lock:
             yield
-    active = set()
+    from portal.scheduling import FairQueue, BodyBudget, BoundedBodyMiddleware
+    def capacity():
+        settings = store.settings()
+        return min(settings['global_concurrency'], settings['max_workers'])
+    from portal.model_cache import ModelCache
+    model_cache = ModelCache(store)
+    app.state.model_cache = model_cache
+    scheduler = FairQueue(capacity, userlocks)
+    budget = BodyBudget()
+    app.state.scheduler = scheduler
+    app.state.body_budget = budget
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        await model_cache.close()
+    app.router.lifespan_context = lifespan
     secure = origin.startswith('https://')
     redirect_uri = origin + '/auth/discord/callback'
 
@@ -221,17 +236,6 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     @app.middleware('http')
     async def security(request: Request, call_next):
         store.run('DELETE FROM native_pending WHERE expires<?',(time.time(),))
-        length = request.headers.get('content-length')
-        if length and (not length.isdigit() or int(length) > 2*1024*1024):
-            return JSONResponse({'detail':'请求体过大'}, 413)
-        # Management accepts bounded bodies only, including chunked uploads.
-        if request.method not in ['GET','HEAD']:
-            data = bytearray()
-            async for chunk in request.stream():
-                data.extend(chunk)
-                if len(data) > 2*1024*1024:
-                    return JSONResponse({'detail':'请求体过大'}, 413)
-            request._body = bytes(data)
         if request.url.path.startswith(prefix+'/api/') and request.method not in ['GET','HEAD']:
             if request.headers.get('origin') and request.headers['origin'].rstrip('/') != host_origin:
                 return JSONResponse({'detail':'来源验证失败'}, 403)
@@ -527,7 +531,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             if not account:
                 raise HTTPException(404, '账号不存在')
             try:
-                result = await asyncio.wait_for(workers.check(u['id'], account, store.settings()['max_workers']),95)
+                result = await asyncio.wait_for(workers.check(u['id'], account, store.settings()['max_workers']),360)
             except TimeoutError:
                 result = {'status':'error','models':0,'message':'账号检查超时，请稍后再试；不要连续点击检查'}
             except HTTPException as exc:
@@ -604,8 +608,9 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         except Exception:
             data = ProjectResources('/nonexistent-xiaoguofan-metrics').snapshot()
             data['pool'] = {'running':None,'active':None,'idle':None,'starting':None,'evictions':None}
-        data['pool']['limit'] = store.settings()['max_workers']
-        data['requests'] = {'active':len(active), 'limit':store.settings()['global_concurrency']}
+        capacity = min(store.settings()['max_workers'], data['pool'].get('limit', 0))
+        data['pool']['limit'] = capacity
+        data['requests'] = scheduler.snapshot(auth(request)['id'])
         data['refresh_seconds'] = 3
         return JSONResponse(data,headers={'Cache-Control':'no-store'})
 
@@ -635,11 +640,39 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             raise HTTPException(401, 'API Key 无效或已撤销')
         verify_access(u)
         s = store.settings()
-        rate('api:'+u['id'], s['requests_per_minute'])
         if not any(a['enabled'] for a in store.accounts(u['id'])):
             raise HTTPException(503, '未导入自己的 Google 账号，不会使用其他用户账号')
-        if len(active) >= s['global_concurrency'] or userlocks[u['id']].locked():
-            raise HTTPException(429, '当前请求繁忙，请稍后重试')
+        if request.method == 'GET' and path == '/v1/models':
+            uid = u['id']
+            rows = store.all('SELECT id,payload,enabled FROM accounts WHERE user_id=? ORDER BY id', (uid,))
+            fingerprint = digest(json.dumps(rows, sort_keys=True))
+            async def load_catalogue():
+                async with userlocks[uid]:
+                    accounts = [store.account(uid, a['id']) for a in store.accounts(uid) if a['enabled']]
+                    selected = choose_account(accounts, store, uid, '')
+                    pool = await workers.acquire(uid, [selected] if selected else [], store.settings()['max_workers'], channel='')
+                    try:
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(360, connect=30)) as http:
+                            result = await http.get(pool['url']+'/v1/models', headers={'Authorization':'Bearer '+pool['key']})
+                            result.raise_for_status()
+                            return split_catalogue(result.json())
+                    finally:
+                        await workers.release(uid, pool['lease'])
+            try:
+                payload = await model_cache.get(uid, fingerprint, load_catalogue)
+            except httpx.TimeoutException as exc:
+                raise HTTPException(504, '模型目录读取超时，请稍后重试') from exc
+            except httpx.HTTPStatusError as exc:
+                raise HTTPException(exc.response.status_code, '上游模型目录读取失败') from exc
+            except httpx.HTTPError as exc:
+                raise HTTPException(502, '模型目录连接失败，请稍后重试') from exc
+            try:
+                await asyncio.wait_for(workers.touch(uid), timeout=1)
+            except (httpx.HTTPError, HTTPException, TimeoutError):
+                logging.getLogger(__name__).warning('cached catalogue worker renewal unavailable')
+            if store.preferences(uid)['anti_truncation']:
+                payload = augment_models(payload)
+            return JSONResponse(payload, headers={'Cache-Control':'private, no-cache'})
         body = await request.body()
         parsed = None
         try:
@@ -660,10 +693,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             path = path.replace('/models/'+path_model, '/models/'+base_model, 1)
         if not anti and PREFIX in path:
             raise HTTPException(400, '防截断模型仅支持 OpenAI /v1/chat/completions')
-        if len(active) >= s['global_concurrency'] or userlocks[u['id']].locked():
-            raise HTTPException(429, '当前请求繁忙，请稍后重试')
-        active.add(u['id'])
-        await userlocks[u['id']].acquire()
+        ticket = scheduler.enqueue(u['id'])
         start = time.monotonic()
         aid, generation, synthetic_name, buffered = None, False, '', None
         worker = None
@@ -671,40 +701,42 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         from portal.proxy_response import ManagedStreamingResponse
         response = None
         client = None
-        cleaned = False
         meter = UsageMeter(started=start)
         final_status = 499
-        async def cleanup():
-            nonlocal cleaned
-            if cleaned:
-                return
-            cleaned = True
-            # Local admission must never depend on cancellable remote cleanup.
-            userlocks[u['id']].release()
-            active.discard(u['id'])
-            async def close_resources():
-                calls = []
-                if worker and worker.get('lease'):
-                    calls.append(workers.release(u['id'], worker['lease']))
-                if response is not None:
-                    calls.append(response.aclose())
-                if client is not None:
-                    calls.append(client.aclose())
-                results = await asyncio.gather(*calls, return_exceptions=True)
-                if any(isinstance(item, BaseException) for item in results):
-                    logging.getLogger(__name__).error('proxy resource cleanup failed')
-            task = asyncio.create_task(close_resources())
-            # Background work is bounded even if the calling request is cancelled again.
-            timer = asyncio.get_running_loop().call_later(5, task.cancel)
-            task.add_done_callback(lambda _: timer.cancel())
-            try:
-                await asyncio.shield(task)
-            except (Exception, asyncio.CancelledError):
-                logging.getLogger(__name__).warning('proxy cleanup interrupted or timed out')
-            finally:
-                store.record(u['id'], u['key_id'], model, final_status, time.monotonic()-start, meter.finish(), account_id=aid, generation=generation, first_token_seconds=meter.first_token_seconds if generation and final_status < 400 else None)
-        try:
-            client = httpx.AsyncClient(timeout=httpx.Timeout(330, connect=15), follow_redirects=False)
+        from portal.proxy_cleanup import ProxyCleanup
+        def record():
+            store.record(u['id'], u['key_id'], model, final_status, time.monotonic()-start, meter.finish(), account_id=aid, generation=generation, first_token_seconds=meter.first_token_seconds if generation and final_status < 400 else None)
+        cleanup = ProxyCleanup(workers, u['id'], scheduler, ticket, record)
+        async def prepare():
+            nonlocal u, s, worker, aid, client, response, body, parsed, synthetic_name, model, generation, buffered
+            while True:
+                await scheduler.acquire(ticket, request)
+                # Revalidate under the same user lock used by all account management.
+                current = store.key_user(key)
+                if not current or current['id'] != ticket.uid:
+                    raise HTTPException(401, 'API Key 无效或已撤销')
+                u = verify_access(current)
+                s = store.settings()
+                accounts = [store.account(u['id'], a['id']) for a in store.accounts(u['id']) if a['enabled']]
+                if not accounts:
+                    raise HTTPException(503, '未导入自己的 Google 账号，不会使用其他用户账号')
+                selected = choose_account(accounts, store, u['id'], base_model or model)
+                aid = selected['id'] if selected else None
+                try:
+                    async with asyncio.timeout(max(0, ticket.deadline-time.monotonic())):
+                        worker = await workers.acquire(u['id'], [selected] if selected else [], s['max_workers'], channel=channel or 'playground')
+                    cleanup.worker = worker
+                    scheduler.commit(ticket)
+                    break
+                except HTTPException as exc:
+                    from portal.scheduling import BUSY_DETAILS
+                    if exc.detail not in BUSY_DETAILS or exc.status_code not in (429, 503):
+                        raise
+                    scheduler.retry(ticket)
+                finally:
+                    accounts = selected = None
+            client = httpx.AsyncClient(timeout=httpx.Timeout(1800 if anti else 600, connect=30), follow_redirects=False)
+            cleanup.client = client
             if isinstance(parsed, dict) and base_model != model:
                 parsed = dict(parsed, model=base_model)
                 body = json.dumps(parsed, ensure_ascii=True).encode()
@@ -719,14 +751,6 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             if not model and path.startswith('/v1beta/models/'):
                 model = path.split('/models/',1)[1].split(':',1)[0]
             generation = request.method=='POST' and (path in ['/v1/chat/completions','/v1/completions','/v1/messages','/v1/responses','/v1/images/generations'] or ':generateContent' in path or ':streamGenerateContent' in path)
-            accounts = [store.account(u['id'], a['id']) for a in store.accounts(u['id']) if a['enabled']]
-            selected=choose_account(accounts,store,u['id'],base_model or model)
-            aid=selected['id'] if selected else None
-            worker_args = (u['id'], [selected] if selected else [], s['max_workers'])
-            if hasattr(workers, 'acquire'):
-                worker = await workers.acquire(*worker_args, channel=channel)
-            else:
-                worker = await workers.ensure(*worker_args, channel=channel) if channel else await workers.ensure(*worker_args)
             # User supplied cookies, upstream keys, forwarding headers and target URLs never pass through.
             headers = {'Authorization':'Bearer '+worker['key']}
             for h in ['content-type','accept','anthropic-version']:
@@ -735,6 +759,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             params = [(k,v) for k,v in request.query_params.multi_items() if k not in ['key','api_key']]
             req = client.build_request(request.method, worker['url']+path, params=params, headers=headers, content=body)
             response = await client.send(req, stream=True)
+            cleanup.response = response
             if response.status_code in (401,403):
                 raise HTTPException(502, 'Google／账号池认证失败，不是 Discord 登录失效；请检查 Google 会话或联系站长')
             catalogue = request.method == 'GET' and path == '/v1/models'
@@ -742,8 +767,6 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                 raw_response = bytearray()
                 async for part in response.aiter_bytes():
                     raw_response.extend(part)
-                    if len(raw_response) > 16 * 1024 * 1024:
-                        raise ValueError('防截断响应过大')
                 payload = json.loads(raw_response)
                 if catalogue:
                     result = split_catalogue(payload)
@@ -751,14 +774,51 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                 else:
                     result = await normalize(payload, synthetic_name, model)
                 buffered = json.dumps(result, ensure_ascii=False).encode()
-        except BaseException as exc:
-            final_status = 499 if isinstance(exc, asyncio.CancelledError) else 422 if isinstance(exc, HTTPException) and exc.status_code == 422 else 502 if isinstance(exc, HTTPException) and exc.status_code == 502 else 503
-            await cleanup()
-            if isinstance(exc, asyncio.CancelledError):
+        async def own_preparation():
+            nonlocal final_status
+            try:
+                await prepare()
+            except BaseException as exc:
+                final_status = exc.status_code if isinstance(exc, HTTPException) else 504 if isinstance(exc, TimeoutError) else 499 if isinstance(exc, asyncio.CancelledError) else 503
+                await cleanup()
+                if isinstance(exc, TimeoutError):
+                    raise HTTPException(504, '排队等待超时，请稍后重试') from None
                 raise
-            if isinstance(exc, HTTPException) and (exc.status_code in (422,502) or exc.detail in {'独立账号池认证失败，不是 Discord 登录失效；请检查 Google 会话或联系站长', '独立账号池启动失败，请稍后检查重建；无需删除或重导账号'} or exc.detail in {'项目内存预算已满，请稍后重试','项目资源保护未就绪，请稍后重试','自己的账号池正在处理请求，请稍后重试'}):
-                raise
-            raise HTTPException(503, '自己的账号池未就绪，请到账号管理点击检查重建；无需删除或重导账号') from None
+        async def watch_disconnect():
+            await request.scope['portal.disconnect'].wait()
+        preparation = asyncio.create_task(own_preparation())
+        disconnected = asyncio.create_task(watch_disconnect())
+        async def wait_prepared():
+            nonlocal final_status
+            try:
+                done, _ = await asyncio.wait({preparation, disconnected}, return_when=asyncio.FIRST_COMPLETED)
+                if disconnected in done:
+                    raise HTTPException(499, '请求已断开')
+                await preparation
+            except BaseException as exc:
+                final_status = exc.status_code if isinstance(exc, HTTPException) else 499 if isinstance(exc, asyncio.CancelledError) else 503
+                if not preparation.done():
+                    preparation.cancel()
+                try:
+                    await preparation
+                except BaseException:
+                    pass
+                await cleanup()
+                if isinstance(exc, (asyncio.CancelledError, HTTPException)):
+                    raise
+                raise HTTPException(503, '自己的账号池未就绪，请稍后重试') from None
+            finally:
+                disconnected.cancel()
+                if not preparation.done():
+                    preparation.cancel()
+                try:
+                    await preparation
+                except BaseException:
+                    pass
+                try:
+                    await disconnected
+                except BaseException:
+                    pass
 
         async def stream():
             nonlocal final_status
@@ -768,17 +828,49 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                     if buffered is not None:
                         yield buffered
                     elif anti and response.is_success and 'text/event-stream' in response.headers.get('content-type',''):
-                        async for part in transform_stream(response.aiter_bytes(), synthetic_name, model):
-                            yield part
+                        from contextlib import aclosing
+                        async with aclosing(transform_stream(response.aiter_bytes(), synthetic_name, model)) as transformed:
+                            async for part in transformed:
+                                yield part
                     else:
                         async for part in response.aiter_bytes():
                             yield part
-                async for chunk in output():
-                    meter.feed(chunk)
-                    yield chunk
+                from contextlib import aclosing
+                async with aclosing(output()) as source:
+                    async for chunk in source:
+                        meter.feed(chunk)
+                        yield chunk
             except BaseException:
                 final_status = 499
                 raise
+        wants_stream = request.method == 'POST' and ((isinstance(parsed, dict) and parsed.get('stream') is True) or ':streamGenerateContent' in path)
+        if wants_stream:
+            from portal.streaming import with_heartbeats
+            async def prepared_output():
+                nonlocal final_status
+                try:
+                    await wait_prepared()
+                    if response is not None and not response.is_success:
+                        final_status = response.status_code
+                        detail = (await response.aread()).decode(errors='replace')
+                        yield ('data: '+json.dumps({'error': {'message': detail, 'type': 'upstream_error', 'code': response.status_code}})+'\n\n').encode()
+                        return
+                    from contextlib import aclosing
+                    async with aclosing(stream()) as source:
+                        async for chunk in source:
+                            yield chunk
+                except HTTPException as exc:
+                    final_status = exc.status_code
+                    yield ('data: '+json.dumps({'error': {'message': str(exc.detail), 'type': 'upstream_error', 'code': exc.status_code}})+'\n\n').encode()
+            async def finish_stream():
+                for task in (preparation, disconnected):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(preparation, disconnected, return_exceptions=True)
+                await cleanup()
+            return ManagedStreamingResponse(with_heartbeats(prepared_output(), interval=30 if anti else 15), cleanup=finish_stream,
+                media_type='text/event-stream', headers={'X-Accel-Buffering':'no', 'Cache-Control':'no-cache'})
+        await wait_prepared()
         return ManagedStreamingResponse(stream(), cleanup=cleanup, status_code=response.status_code,
             headers={'Content-Type':response.headers.get('content-type','application/json'), 'X-Accel-Buffering':'no'})
 
@@ -819,4 +911,5 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         app.add_api_route(prefix, index, methods=['GET'])
         app.add_api_route(admin_path, admin_index, methods=['GET'])
         app.add_api_route('/health', health, methods=['GET'])
+    app.add_middleware(BoundedBodyMiddleware, budget=budget)
     return app

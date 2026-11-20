@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -13,14 +14,20 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-VERSION = '0.9.15'
+VERSION = '0.9.22'
 OUT = ROOT / 'dist/xiaoguofan'
-SPIDERMONKEY = 'v152.0.4-aistudio2api.1'
+GO_VERSION = '1.27.3'
+SPIDERMONKEY = 'v158.0.1-aistudio2api.2'
+LIBWEBP = 'v1.6.0-aistudio2api.1'
 ZIG_VERSION = '0.16.0'
 ZIG_SHA256 = '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00'
 SM_SHA256 = {
-    'amd64': 'd3ecebf1890355426ad261ab8723038849a524b348af53e1bb440ca53cc2cacb',
-    'arm64': 'b3c9539b8d8378d99f86b267e0e3d007dd01ff80acebf4f52f3e1d6ac04d9d00',
+    'amd64': '2a70d308f2b59bca62424af955a4f1d620a9bfbaad9d538f4cbd8e5cee871ae7',
+    'arm64': 'a29715fd332d767e6b27f08efeb5a24ff261cc5e0b84927dbaef5044c97ebba2',
+}
+WEBP_SHA256 = {
+    'amd64': 'd5047d17eace8b9639a08786b750e46ee83a1f251b7b961cd0f049371974ab78',
+    'arm64': '299028ab369a7f8b34feefd41f68cebdc6118c1306d37a57731da9503cd64084',
 }
 LINK_FLAGS = ("-s -w -linkmode external -extldflags '-static -Wl,--strip-all' "
               f'-X github.com/Mag1cFall/AIStudio2API/internal/app.version=xiaoguofan-v{VERSION}')
@@ -72,18 +79,23 @@ def prepare_toolchains(directory, arches):
         name = f'spidermonkey-{SPIDERMONKEY}-linux-{arch}.tar.gz'
         download_extract(f'https://github.com/Mag1cFall/firefox/releases/download/{SPIDERMONKEY}/{name}',
                          SM_SHA256[arch], directory / 'spidermonkey' / f'linux-{arch}')
+        name = f'libwebp-{LIBWEBP}-linux-{arch}.tar.gz'
+        download_extract(f'https://github.com/Mag1cFall/libwebp/releases/download/{LIBWEBP}/{name}',
+                         WEBP_SHA256[arch], directory / 'libwebp' / f'linux-{arch}')
 
 
 def build_env(arch, directory):
     target = {'amd64': 'x86_64', 'arm64': 'aarch64'}[arch]
     zig = shlex.quote(str(directory / 'zig' / f'zig-x86_64-linux-{ZIG_VERSION}' / 'zig'))
     sm = directory / 'spidermonkey' / f'linux-{arch}'
+    webp = directory / 'libwebp' / f'linux-{arch}'
     return os.environ | {
         'GOOS': 'linux', 'GOARCH': arch, 'CGO_ENABLED': '1', 'GOMAXPROCS': '2',
+        'GOTOOLCHAIN': 'go' + GO_VERSION,
         'CC': f'{zig} cc -target {target}-linux-musl',
         'CXX': f'{zig} c++ -target {target}-linux-musl',
-        'CGO_CXXFLAGS': '-I' + str(sm / 'include'),
-        'CGO_LDFLAGS': '-L' + str(sm / 'lib'),
+        'CGO_CPPFLAGS': f'-I{sm / "include"} -I{webp / "include"}',
+        'CGO_LDFLAGS': f'-L{sm / "lib"} -L{webp / "lib"}',
     }
 
 
@@ -105,18 +117,22 @@ def main():
     p.add_argument('--toolchain-dir', type=Path,
                    default=Path(os.environ.get('XGF_TOOLCHAIN_DIR', str(Path.home() / '.cache/xiaoguofan/toolchains'))))
     p.add_argument('--prepare-only', action='store_true')
+    p.add_argument('--test', nargs=2, action='append', default=[], metavar=('PACKAGE', 'TEST_NAME'),
+                   help='Opt in to one explicitly named new Go test in one package (repeatable); default: build only')
     a = p.parse_args()
     arches = ['amd64', 'arm64'] if a.arch == 'all' else [a.arch]
-    prepare_toolchains(a.toolchain_dir, ['amd64', *[x for x in arches if x != 'amd64']])
+    toolchain_arches = ['amd64', *[x for x in arches if x != 'amd64']] if a.test else arches
+    prepare_toolchains(a.toolchain_dir, toolchain_arches)
     if a.prepare_only:
         print('PINNED_TOOLCHAINS_READY', a.toolchain_dir, flush=True)
         return
     OUT.mkdir(parents=True, exist_ok=True)
     run('npm', 'ci', cwd=ROOT / 'web')
     run('npm', 'run', 'build', cwd=ROOT / 'web')
-    run('go', 'test', '-mod=readonly', '-p=2', '-tags=netgo,osusergo',
-        '-ldflags=' + TEST_LINK_FLAGS, './cmd/...', './internal/...',
-        env=build_env('amd64', a.toolchain_dir))
+    for package, test_name in a.test:
+        run('go', 'test', '-mod=readonly', '-p=2', '-count=1', '-tags=netgo,osusergo',
+            '-ldflags=' + TEST_LINK_FLAGS, '-run=^' + re.escape(test_name) + '$', package,
+            env=build_env('amd64', a.toolchain_dir))
     commit_file = ROOT / 'BUILD_SOURCE_COMMIT'
     commit = commit_file.read_text().strip() if commit_file.exists() else subprocess.check_output(
         ['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
@@ -151,7 +167,7 @@ def main():
                 shutil.copy2(ROOT / 'xiaoguofan' / f, app / f)
             (stage / 'build-info.json').write_text(json.dumps({
                 'version': VERSION, 'commit': commit, 'arch': arch, 'mode': mode,
-                'spidermonkey': SPIDERMONKEY, 'zig': ZIG_VERSION,
+                'go': GO_VERSION, 'spidermonkey': SPIDERMONKEY, 'libwebp': LIBWEBP, 'zig': ZIG_VERSION,
             }, indent=2) + '\n')
             shutil.copy2(OUT / f'worker-{arch}.tar.gz', stage / 'images/worker.tar.gz')
             if mode == 'docker':

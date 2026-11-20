@@ -5,12 +5,12 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"fmt"
-	"net/url"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
 const maxCookieAge = 400 * 24 * time.Hour
@@ -22,7 +22,6 @@ type Account struct {
 	Profile     string `json:"profile"`
 	DisplayName string `json:"display_name"`
 	Email       string `json:"email"`
-	Locale      string `json:"locale"`
 	Importable  bool   `json:"importable"`
 }
 
@@ -40,7 +39,6 @@ type ImportResult struct {
 	Profile     string
 	DisplayName string
 	Email       string
-	Locale      string
 	CookieCount int
 	State       aistudio.StorageState
 }
@@ -50,8 +48,8 @@ func Import(ctx context.Context, options ImportOptions) ([]ImportResult, error) 
 	if err := ensurePlatformImport(); err != nil {
 		return nil, err
 	}
-	proxyURL, err := validateProxy(options.Proxy)
-	if err != nil {
+	proxyURL := strings.TrimSpace(options.Proxy)
+	if err := config.ValidateProxy(proxyURL); err != nil {
 		return nil, err
 	}
 	accounts, err := Discover(options.ChromeRoot)
@@ -66,9 +64,6 @@ func Import(ctx context.Context, options ImportOptions) ([]ImportResult, error) 
 	if err != nil {
 		return nil, err
 	}
-	if len(masterKey) != 32 {
-		return nil, fmt.Errorf("Chrome v20 主密钥长度异常")
-	}
 	results := make([]ImportResult, 0, len(selected))
 	for _, account := range selected {
 		result, err := importAccount(ctx, options.ChromeRoot, proxyURL, account, masterKey)
@@ -80,30 +75,37 @@ func Import(ctx context.Context, options ImportOptions) ([]ImportResult, error) 
 	return results, nil
 }
 
-// Refresh 以导入来源 Chrome profile 的身份使用保存的 OAuth 续签材料重新签发 Google Cookie，来源未记录目录时使用稳定版 Chrome 目录
-func Refresh(ctx context.Context, source aistudio.AuthSource, material aistudio.ChromeOAuthMaterial, proxy string) ([]aistudio.StateCookie, error) {
-	if err := ensurePlatformImport(); err != nil {
-		return nil, err
-	}
-	proxyURL, err := validateProxy(proxy)
+// Refresh 以导入来源 Chrome profile 的身份使用保存的 OAuth 续签材料重新签发 Google Cookie，并返回 google.com 的 DBSC 会话登记
+func Refresh(ctx context.Context, source aistudio.AuthSource, material aistudio.ChromeOAuthMaterial, proxy string) ([]aistudio.StateCookie, *aistudio.BoundSession, error) {
+	identity, proxyURL, err := sourceIdentity(source, proxy)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	cookies, bound, err := fetchGoogleCookies(ctx, identity, material.GaiaID, material.RefreshToken, material.WrappedBindingKey, proxyURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	return toStorageCookies(cookies), bound, nil
+}
+
+// sourceIdentity 返回导入来源 Chrome profile 的请求身份与校验后的代理，来源未记录目录时使用稳定版 Chrome 目录
+func sourceIdentity(source aistudio.AuthSource, proxy string) (chromeIdentity, string, error) {
+	if err := ensurePlatformImport(); err != nil {
+		return chromeIdentity{}, "", err
+	}
+	proxyURL := strings.TrimSpace(proxy)
+	err := config.ValidateProxy(proxyURL)
+	if err != nil {
+		return chromeIdentity{}, "", err
 	}
 	root := source.Root
 	if root == "" {
 		if root, err = DefaultChromeRoot(); err != nil {
-			return nil, err
+			return chromeIdentity{}, "", err
 		}
 	}
 	identity, err := readChromeIdentity(root, source.Profile)
-	if err != nil {
-		return nil, err
-	}
-	cookies, err := fetchGoogleCookies(ctx, identity, material.GaiaID, material.RefreshToken, material.WrappedBindingKey, proxyURL)
-	if err != nil {
-		return nil, err
-	}
-	return toStorageCookies(cookies), nil
+	return identity, proxyURL, err
 }
 
 func importAccount(ctx context.Context, chromeRoot string, proxy string, account Account, masterKey []byte) (ImportResult, error) {
@@ -119,7 +121,7 @@ func importAccount(ctx context.Context, chromeRoot string, proxy string, account
 	if err != nil {
 		return ImportResult{}, err
 	}
-	cookies, err := fetchGoogleCookies(ctx, identity, gaiaID, token, wrappedKey, proxy)
+	cookies, bound, err := fetchGoogleCookies(ctx, identity, gaiaID, token, wrappedKey, proxy)
 	if err != nil {
 		return ImportResult{}, err
 	}
@@ -129,10 +131,11 @@ func importAccount(ctx context.Context, chromeRoot string, proxy string, account
 		OAuth: &aistudio.ChromeOAuthMaterial{
 			GaiaID: gaiaID, RefreshToken: token, WrappedBindingKey: append([]byte(nil), wrappedKey...),
 		},
+		Bound: bound,
 	})
 	return ImportResult{
 		Profile: account.Profile, DisplayName: account.DisplayName,
-		Email: strings.ToLower(strings.TrimSpace(account.Email)), Locale: account.Locale,
+		Email:       strings.ToLower(strings.TrimSpace(account.Email)),
 		CookieCount: len(cookies), State: state,
 	}, nil
 }
@@ -205,23 +208,6 @@ func missingValues(requested map[string]struct{}, found map[string]struct{}) []s
 	return missing
 }
 
-func validateProxy(value string) (string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", nil
-	}
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Hostname() == "" {
-		return "", fmt.Errorf("proxy 必须是 http、https 或 socks5 URL")
-	}
-	switch strings.ToLower(parsed.Scheme) {
-	case "http", "https", "socks5":
-		return value, nil
-	default:
-		return "", fmt.Errorf("proxy 必须是 http、https 或 socks5 URL")
-	}
-}
-
 func decryptV20Token(masterKey []byte, encrypted []byte) (string, error) {
 	if len(encrypted) < 3+12+16 || string(encrypted[:3]) != "v20" {
 		return "", fmt.Errorf("refresh token 密文版本不是 v20")
@@ -238,11 +224,7 @@ func decryptV20Token(masterKey []byte, encrypted []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("refresh token 解密失败")
 	}
-	token := string(plaintext)
-	if len(token) != 103 || !strings.HasPrefix(token, "1//0") {
-		return "", fmt.Errorf("refresh token 解密结果格式异常")
-	}
-	return token, nil
+	return string(plaintext), nil
 }
 
 func toStorageCookies(cookies []multiloginCookie) []aistudio.StateCookie {

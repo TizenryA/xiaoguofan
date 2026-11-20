@@ -42,6 +42,7 @@ const heading = computed(() =>
       :starters="configStarters"
       :examples="config.examples"
       :docs="config.docs"
+      :caption="config.builtBy?.replace('{model}', currentModel!.name || config.family)"
       @starter="emit('starter', $event as ZeroStarter)"
       @example="emit('starter', $event as ZeroStarter)"
     />
@@ -79,6 +80,7 @@ const heading = computed(() =>
   min-height: 0;
   overflow: auto;
   padding: 20px 20px 0;
+  scrollbar-gutter: stable;
 }
 
 .ms-model-empty-state {
