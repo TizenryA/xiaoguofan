@@ -2,7 +2,9 @@ name: Build And Release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -12,313 +14,81 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
-env:
-  GOTOOLCHAIN: local
-
 jobs:
-  checks:
-    uses: ./.github/workflows/checks.yml
-
-  build-linux:
-    needs: checks
-    runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            target: x86_64
-          - arch: arm64
-            target: aarch64
-    env:
-      CGO_ENABLED: '1'
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: frontend
-          path: internal/webui/dist
-      - uses: actions/setup-go@v7
-        id: go
-        with:
-          go-version: stable
-          cache: false
-      - uses: actions/cache/restore@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-linux-${{ matrix.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-          restore-keys: go-linux-${{ matrix.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - uses: ./.github/actions/static-libraries
-        with:
-          target: linux-${{ matrix.arch }}
-      - name: Build
-        shell: bash
-        env:
-          GOARCH: ${{ matrix.arch }}
-          CC: zig cc -target ${{ matrix.target }}-linux-musl
-          CXX: zig c++ -target ${{ matrix.target }}-linux-musl
-        run: |
-          link=""
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then link="-X github.com/Mag1cFall/AIStudio2API/internal/app.version=$GITHUB_REF_NAME"; fi
-          GOOS=linux go build -mod=readonly -trimpath -tags netgo,osusergo -ldflags="-s -w -linkmode external -extldflags '-static -Wl,--strip-all -Wl,--gc-sections' $link" -o bin/aistudio2api ./cmd/aistudio2api
-      - name: Package
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          name="aistudio2api-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}"
-          mkdir -p "dist/$name"
-          mv bin/aistudio2api "dist/$name/"
-          tar -cf - -C dist "$name" | 7z a -tgzip -mx=9 -mfb=258 -mpass=15 -si "dist/$name.tar.gz" > /dev/null
-      - uses: actions/cache/save@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-linux-${{ matrix.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-      - uses: actions/upload-artifact@v7
-        if: github.ref_type == 'tag'
-        with:
-          name: packages-linux-${{ matrix.arch }}
-          path: dist/*.tar.gz
-          retention-days: 7
-
-  build-windows:
-    needs: checks
+  build:
     runs-on: ubuntu-24.04
     env:
-      CGO_ENABLED: '1'
+      CGO_ENABLED: '0'
+      GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/setup-node@v7
         with:
-          name: frontend
-          path: internal/webui/dist
+          node-version: '22.13.0'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Check And Build Frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run lint
+          npm run build
       - uses: actions/setup-go@v7
-        id: go
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run Unit Tests
+        run: go test -mod=readonly ./cmd/... ./internal/...
+      - name: Check Minimum Go Version
+        run: |
+          go version
+          go vet ./...
+          go build -mod=readonly ./cmd/aistudio2api
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: false
-      - uses: actions/cache/restore@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-windows-amd64-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-          restore-keys: go-windows-amd64-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
-      - name: Install Windows C Compiler
-        run: |
-          curl -fsSL https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64.tar.xz | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
-      - uses: ./.github/actions/static-libraries
-        with:
-          target: windows-amd64
-      - name: Build
+      - name: Build Packages
         shell: bash
         run: |
-          number=0.0.0
-          link=""
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then number="${GITHUB_REF_NAME#v}"; link="-X github.com/Mag1cFall/AIStudio2API/internal/app.version=$GITHUB_REF_NAME"; fi
-          mkdir -p bin
-          CGO_ENABLED=0 go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.29
-          jq --arg v "$number" '.fixed.file_version = $v | .info["0000"].ProductVersion = $v' build/windows/info.json > bin/info.json
-          wails3 generate syso -arch amd64 -icon build/windows/icon.ico -manifest build/windows/wails.exe.manifest -info bin/info.json -out cmd/aistudio2api/rsrc_windows_amd64.syso
-          CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ GOOS=windows GOARCH=amd64 go build -mod=readonly -trimpath -tags desktop,production -ldflags="-s -w -H windowsgui -extldflags '-Wl,--gc-sections -Wl,--icf=safe' $link" -o bin/aistudio2api.exe ./cmd/aistudio2api
-      - name: Package
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          name="aistudio2api-${GITHUB_REF_NAME}-windows-amd64"
-          mkdir -p "dist/$name"
-          mv bin/aistudio2api.exe "dist/$name/"
-          (cd dist && 7z a -tzip -mm=Deflate -mx=9 -mfb=258 -mpass=15 "$name.zip" "$name" > /dev/null)
-      - uses: actions/cache/save@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-windows-amd64-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-      - uses: actions/upload-artifact@v7
-        if: github.ref_type == 'tag'
-        with:
-          name: packages-windows-amd64
-          path: dist/*.zip
-          retention-days: 7
-
-  desktop-macos:
-    needs: checks
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: frontend
-          path: internal/webui/dist
-      - uses: actions/setup-go@v7
-        id: go
-        with:
-          go-version: stable
-          cache: false
-      - uses: actions/cache/restore@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/Library/Caches/go-build
-          key: go-macos-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-          restore-keys: go-macos-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
-      - uses: ./.github/actions/static-libraries
-        with:
-          target: darwin-arm64
-      - uses: ./.github/actions/static-libraries
-        with:
-          target: darwin-amd64
-      - name: Build
-        shell: bash
-        env:
-          CGO_ENABLED: '1'
-          MACOSX_DEPLOYMENT_TARGET: '13.0'
-        run: |
-          link=""
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then link="-X github.com/Mag1cFall/AIStudio2API/internal/app.version=$GITHUB_REF_NAME"; fi
-          mkdir -p bin
-          build() {
-            export GOARCH=$1
-            export CGO_CPPFLAGS="-mmacosx-version-min=13.0 -I$RUNNER_TEMP/spidermonkey/darwin-$1/include -I$RUNNER_TEMP/libwebp/darwin-$1/include"
-            export CGO_LDFLAGS="-mmacosx-version-min=13.0 -L$RUNNER_TEMP/spidermonkey/darwin-$1/lib -L$RUNNER_TEMP/libwebp/darwin-$1/lib"
-            go build -mod=readonly -trimpath -tags desktop,production -ldflags="-s -w -extldflags -Wl,-dead_strip $link" -o "bin/desktop-$1" ./cmd/aistudio2api
-            go build -mod=readonly -trimpath -ldflags="-s -w -extldflags -Wl,-dead_strip $link" -o "bin/cli-$1" ./cmd/aistudio2api
-          }
-          build arm64 & arm64=$!
-          build amd64 & amd64=$!
-          wait "$arm64"
-          wait "$amd64"
-      - name: Package
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          version="$GITHUB_REF_NAME"
-          number="${version#v}"
-          pack() {
-            name="aistudio2api-${version}-darwin-$1"
-            mkdir -p "dist/$name"
-            mv "bin/cli-$1" "dist/$name/aistudio2api"
-            tar -cf - -C dist "$name" | 7z a -tgzip -mx=9 -mfb=258 -mpass=15 -si "dist/$name.tar.gz" > /dev/null
-          }
+          version="${GITHUB_SHA:0:7}"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then version="$GITHUB_REF_NAME"; fi
           mkdir -p dist
-          pack arm64 & arm64=$!
-          pack amd64 & amd64=$!
-          app=dist/AIStudio2API.app
-          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-          lipo -create -output "$app/Contents/MacOS/aistudio2api" bin/desktop-arm64 bin/desktop-amd64
-          cp -R build/darwin/icons.icns build/darwin/*.lproj "$app/Contents/Resources/"
-          cp build/darwin/Info.plist "$app/Contents/"
-          plutil -replace CFBundleShortVersionString -string "$number" "$app/Contents/Info.plist"
-          plutil -replace CFBundleVersion -string "$number" "$app/Contents/Info.plist"
-          codesign --force --deep --sign - "$app"
-          codesign --verify --deep --strict "$app"
-          ditto -c -k --keepParent "$app" "dist/aistudio2api-${version}-darwin-universal.zip"
-          mkdir dist/dmg
-          cp -R "$app" dist/dmg/
-          ln -s /Applications dist/dmg/Applications
-          # hdiutil 在 GitHub macOS runner 上偶发 Resource busy，重试三次
-          for attempt in 1 2 3; do
-            hdiutil create -volname AIStudio2API -srcfolder dist/dmg -fs HFS+ -ov -format ULMO "dist/aistudio2api-${version}-darwin-universal.dmg" && break
-            [ "$attempt" = 3 ] && exit 1
-            sleep 5
+          for target in windows/amd64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            export GOOS="${target%/*}" GOARCH="${target#*/}"
+            name="aistudio2api-${version}-${GOOS}-${GOARCH}"
+            directory="dist/$name"
+            mkdir -p "$directory"
+            binary=aistudio2api
+            if [[ "$GOOS" == windows ]]; then binary+=.exe; cp start.bat "$directory/"; fi
+            go build -mod=readonly -trimpath -ldflags='-s -w' -o "$directory/$binary" ./cmd/aistudio2api
+            cp README.md README_en.md LICENSE .env.example "$directory/"
+            cp -r docs "$directory/"
+            if [[ "$GOOS" == windows ]]; then
+              (cd dist && zip -qr "$name.zip" "$name")
+            else
+              tar -czf "dist/$name.tar.gz" -C dist "$name"
+            fi
           done
-          wait "$arm64"
-          wait "$amd64"
-      - uses: actions/cache/save@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/Library/Caches/go-build
-          key: go-macos-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
       - uses: actions/upload-artifact@v7
-        if: github.ref_type == 'tag'
         with:
-          name: desktop-macos
+          name: packages
           path: |
             dist/*.zip
-            dist/*.dmg
             dist/*.tar.gz
-          retention-days: 7
-
-  desktop-linux:
-    needs: checks
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: frontend
-          path: internal/webui/dist
-      - uses: actions/setup-go@v7
-        id: go
-        with:
-          go-version: stable
-          cache: false
-      - uses: actions/cache/restore@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-desktop-linux-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-          restore-keys: go-desktop-linux-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config file libgtk-3-dev libwebkit2gtk-4.1-dev glib-networking ibus-gtk3 fcitx5-frontend-gtk3
-      - uses: ./.github/actions/static-libraries
-        with:
-          target: linux-amd64-gnu
-      - name: Build
-        shell: bash
-        run: |
-          link=""
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then link="-X github.com/Mag1cFall/AIStudio2API/internal/app.version=$GITHUB_REF_NAME"; fi
-          mkdir -p bin
-          CGO_ENABLED=1 go build -mod=readonly -trimpath -tags desktop,production,gtk3 -ldflags="-s -w -extldflags -Wl,--gc-sections $link" -o bin/aistudio2api ./cmd/aistudio2api
-          go install -tags gtk3 github.com/wailsapp/wails/v3/cmd/wails3@v3.1.0
-      - name: Package
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          version="$GITHUB_REF_NAME"
-          mkdir -p dist
-          bash build/linux/appimage.sh bin/aistudio2api "dist/aistudio2api-${version}-linux-amd64.AppImage"
-          VERSION="${version#v}" GOARCH=amd64 wails3 tool package -name aistudio2api -format deb -config build/linux/nfpm.yaml -out dist
-          mv dist/aistudio2api*.deb "dist/aistudio2api-${version}-linux-amd64.deb"
-      - uses: actions/cache/save@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-desktop-linux-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-      - uses: actions/upload-artifact@v7
-        if: github.ref_type == 'tag'
-        with:
-          name: desktop-linux
-          path: |
-            dist/*.AppImage
-            dist/*.deb
           retention-days: 7
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: [checks, build-linux, build-windows, desktop-macos, desktop-linux]
+    needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
+          name: packages
           path: dist
-          pattern: '{packages-*,desktop-*}'
-          merge-multiple: true
       - name: Publish Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -332,85 +102,29 @@ jobs:
 
   docker:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: build-linux
-    strategy:
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-24.04
-            arch: amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            arch: arm64
-    runs-on: ${{ matrix.runner }}
+    needs: build
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: packages-linux-${{ matrix.arch }}
-          path: release
-      - run: mkdir -p release/linux-${{ matrix.arch }} && tar -xzf release/*.tar.gz --strip-components=1 -C release/linux-${{ matrix.arch }}
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.image.outputs.name }}
-      - id: build
-        uses: docker/build-push-action@v6
+          images: ghcr.io/${{ github.repository }}
+          tags: type=semver,pattern={{raw}}
+      - uses: docker/build-push-action@v6
         with:
           context: .
-          target: release
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
-      - run: |
-          mkdir -p digests
-          touch "digests/${DIGEST#sha256:}"
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-      - uses: actions/upload-artifact@v7
-        with:
-          name: digest-${{ matrix.runner }}
-          path: digests/*
-          retention-days: 1
-
-  docker-manifest:
-    needs: docker
-    runs-on: ubuntu-24.04
-    permissions:
-      packages: write
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: digests
-          pattern: digest-*
-          merge-multiple: true
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.image.outputs.name }}
-          tags: type=semver,pattern={{raw}}
-      - working-directory: digests
-        run: docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") $(printf "${IMAGE}@sha256:%s " *)
-        env:
-          IMAGE: ${{ steps.image.outputs.name }}
