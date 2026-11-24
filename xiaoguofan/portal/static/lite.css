@@ -342,3 +342,17 @@ details.fold.inline>.fold-body{padding:0 .9rem .9rem}
 @media(prefers-color-scheme:dark){.spark i{background:#3a4560}.tier-unknown{background:transparent}.tok-chart .c-out,.io-bar .io-out,.io-out{--c:#9fb3ea}.tok-chart .c-out{background:#9fb3ea}}
 .dash-sub{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.5rem;margin:.9rem 0 0;padding-top:.8rem;border-top:1px dashed var(--line)}
 .dash-sub dt{font-size:.75rem;color:var(--muted);font-weight:600}.dash-sub dd{margin:.1rem 0 0;font-size:.92rem;font-weight:700;font-variant-numeric:tabular-nums}
+/* access: two routes */
+.route-list{display:grid;gap:.7rem}
+@media(min-width:1000px){.route-list:not(.compact){grid-template-columns:1fr 1fr}}
+.route{border:1px solid var(--line);border-radius:var(--radius-sm);padding:.75rem .85rem;background:var(--surface);display:grid;gap:.45rem;min-width:0}
+.route-optimized{border-color:var(--ok);box-shadow:0 0 0 2px var(--ok-soft)}
+.route-head{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+.route .copy-row code{overflow-wrap:anywhere;word-break:break-all}
+.route .hint{margin:0}
+.route-alt{display:grid;grid-template-columns:auto 1fr auto;gap:.5rem;align-items:center;font-size:.85rem;margin-top:.4rem}
+.route-alt span{color:var(--muted);font-weight:600}
+.route-alt code{overflow-wrap:anywhere;word-break:break-all}
+@media(max-width:520px){.route-alt{grid-template-columns:1fr auto}.route-alt span{grid-column:1 / -1}}
+.route-list.compact .route{padding:.55rem .7rem}
+.reveal-sub{font-size:.9rem;margin:1rem 0 .5rem}

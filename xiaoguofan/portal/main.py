@@ -185,6 +185,17 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
     broker = broker or BrokerLoad(broker_socket)
     engine = (engine or EngineClient(broker_locator(broker_socket))).attach(store, alerts)
     trusted_proxies = gateway.parse_networks(os.environ.get('PORTAL_TRUSTED_PROXIES', ''))
+    # Second public entry (e.g. a relay closer to mainland users) mapping to this portal's root.
+    # Empty string hides it; must be a bare https origin.
+    optimized_origin = os.environ.get('PORTAL_OPTIMIZED_ORIGIN', 'https://xiaoguofanapi.tizenty.xyz').strip().rstrip('/')
+    if optimized_origin and not re.fullmatch(r'https://[A-Za-z0-9.-]+(:[0-9]{1,5})?', optimized_origin):
+        raise RuntimeError('PORTAL_OPTIMIZED_ORIGIN must be an https origin without a path')
+    routes = [{'id': 'original', 'name': '原始线路', 'badge': '', 'root': origin, 'base': origin+'/v1',
+               'note': '直连本站服务器。海外网络用这个；优化线路连不上时也可以换回来。'}]
+    if optimized_origin and optimized_origin != host_origin:
+        routes.insert(0, {'id': 'optimized', 'name': '优化线路', 'badge': '国内推荐', 'root': optimized_origin,
+                          'base': optimized_origin+'/v1',
+                          'note': '经洛杉矶中转，国内一般更快更稳。密钥、账号、记录和原始线路完全通用，随时可以换。'})
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
     app.state.engine = engine
@@ -343,7 +354,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
     def config():
         s = store.settings()
         return {'site_name':s['site_name'], 'version':VERSION, 'discord_ready':bool(s['public_login'] and s['discord_client_id'] and s['discord_client_secret']),
-                'api_base':origin+'/v1', 'callback_url':redirect_uri}
+                'api_base':origin+'/v1', 'routes':routes, 'callback_url':redirect_uri}
 
     @app.post('/api/auth/admin')
     def admin_login(payload: Login, request: Request):

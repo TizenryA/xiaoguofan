@@ -175,6 +175,18 @@ $('#native-cookie').addEventListener('drop',e=>{e.preventDefault();e.currentTarg
 $('#ext-check').onclick=()=>task($('#ext-check'),async()=>{const rows=await accounts();if(rows.length>wizard.startCount){await finishImport(rows[rows.length-1]?.label)}else $('#ext-status').textContent='还没看到新账号。确认在扩展里点了“确认上传”，并且当时打开的是本站页面，然后再点一次。'});
 
 /* ---------- access ---------- */
+function routeCard(r,compact){const box=el('div',undefined,'route route-'+r.id);
+ const head=el('div',undefined,'route-head');head.append(el('b',r.name));if(r.badge)head.append(el('span',r.badge,'chip ok route-badge'));
+ const row=el('div',undefined,'copy-row'),code=el('code',r.base),btn=el('button','复制','btn tonal sm');btn.type='button';btn.onclick=()=>copy(btn,r.base);btn.setAttribute('aria-label','复制'+r.name+'地址');row.append(code,btn);
+ box.append(head,row);if(compact)return box;
+ if(r.note)box.append(el('p',r.note,'hint'));
+ const more=el('details',undefined,'fold inline route-more');more.append(el('summary','用 Gemini / Anthropic 格式的软件填什么？'));
+ const body=el('div',undefined,'fold-body');
+ const line=(label,value,tip)=>{const p=el('div',undefined,'route-alt');const c=el('code',value),b=el('button','复制','btn ghost sm');b.type='button';b.onclick=()=>copy(b,value);p.append(el('span',label),c,b);body.append(p);if(tip)body.append(el('p',tip,'hint'))};
+ line('OpenAI 兼容',r.base,'大多数聊天软件选这个。');line('Gemini 原生',r.root,'软件会自动在后面加 /v1beta，只填到这里。');line('Anthropic（Claude 格式）',r.root,'软件会自动加 /v1/messages，只填到这里。');
+ more.append(body);box.append(more);return box}
+function renderRoutes(routes){const list=$('#route-list');list.replaceChildren(...routes.map(r=>routeCard(r)));$('#reveal-routes').replaceChildren(...routes.map(r=>routeCard(r,true)))}
+
 async function preferences(){const p=await api('/api/preferences');$('#anti-truncation').checked=p.anti_truncation;$('#anti-truncation').disabled=false;$('#anti-state').textContent=p.anti_truncation?'已开启 · 去聊天软件刷新模型列表':'已关闭 · 用原来的模型就好'}
 $('#anti-truncation').onchange=async e=>{const b=e.target,enabled=b.checked;b.disabled=true;try{await api('/api/preferences',{method:'PUT',body:JSON.stringify({anti_truncation:enabled})});await preferences();notify(enabled?'已开启，请刷新聊天软件的模型列表':'已关闭，原来的模型不受影响')}catch(err){b.checked=!enabled;notify(err.message)}finally{b.disabled=false}};
 async function keys(){const rows=await api('/api/keys'),list=$('#key-list');if(!rows.length){list.replaceChildren(el('p','还没有密钥。点上面按钮新建一把。','hint'));return}list.replaceChildren();
@@ -192,7 +204,7 @@ $('#next').onclick=()=>task($('#next'),async()=>{offset+=20;await records()});
 $$('#record-filters button').forEach(b=>b.onclick=()=>setFilter(b.dataset.filter));
 $$('#summary-range button').forEach(b=>b.onclick=()=>{summaryRange=b.dataset.range;$$('#summary-range button').forEach(x=>x.classList.toggle('on',x===b));renderStats(lastSummary?.[summaryRange])});
 $('#logout').onclick=()=>task($('#logout'),async()=>{await api('/api/auth/logout',{method:'POST'});location.reload()});
-$('#show-key').onclick=()=>$('#key-dialog').showModal();$('#copy-base').onclick=()=>copy($('#copy-base'),$('#api-base').textContent);$('#copy-key').onclick=()=>copy($('#copy-key'),$('#revealed-key').value);$('#reveal-dialog').addEventListener('close',()=>$('#revealed-key').value='');
+$('#show-key').onclick=()=>$('#key-dialog').showModal();$('#copy-key').onclick=()=>copy($('#copy-key'),$('#revealed-key').value);$('#reveal-dialog').addEventListener('close',()=>$('#revealed-key').value='');
 $('#edit-form').onsubmit=e=>{e.preventDefault();task(e.submitter,async()=>{await api('/api/accounts/'+editId,{method:'PATCH',body:JSON.stringify({label:e.target.elements.label.value,email:e.target.elements.email.value.trim(),plan:e.target.elements.plan.value})});$('#edit-dialog').close();await accounts()})};
 $('#key-form').onsubmit=e=>{e.preventDefault();task(e.submitter,async()=>{const r=await api('/api/keys',{method:'POST',body:JSON.stringify({label:e.target.elements.label.value})});e.target.reset();$('#key-dialog').close();$('#revealed-key').value=r.key;$('#reveal-dialog').showModal();await keys()})};
 function closeProfile(){$('#profile-menu').hidden=true;$('#avatar-button').setAttribute('aria-expanded','false')}
@@ -200,7 +212,7 @@ $('#avatar-button').onclick=()=>{const hidden=!$('#profile-menu').hidden;$('#pro
 document.addEventListener('click',e=>{if(!e.target.closest('.profile'))closeProfile();if(!e.target.closest('.acc-actions details'))$$('.acc-actions details[open]').forEach(d=>d.open=false)});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeProfile();$('#avatar-button').focus()}});
 $('#open-guide').onclick=()=>go('guide');$('#guide-menu').onclick=()=>go('guide');$('#guide-back').onclick=()=>go('accounts');
-(async()=>{const c=await api('/api/config');document.title=c.site_name;$('#version').textContent=c.version;$$('[data-site-name]').forEach(e=>e.textContent=c.site_name);$('#api-base').textContent=c.api_base;$('#discord-login').hidden=!c.discord_ready;$('#login-status').textContent=c.discord_ready?'用 Discord 验证身份后进入你的空间':'公共登录还没开放';
+(async()=>{const c=await api('/api/config');document.title=c.site_name;$('#version').textContent=c.version;$$('[data-site-name]').forEach(e=>e.textContent=c.site_name);renderRoutes(c.routes||[{id:'original',name:'接口地址',root:c.api_base.replace(/\/v1$/,''),base:c.api_base,note:''}]);$('#discord-login').hidden=!c.discord_ready;$('#login-status').textContent=c.discord_ready?'用 Discord 验证身份后进入你的空间':'公共登录还没开放';
  let u;try{u=await api('/api/me')}catch{return}csrf=u.csrf;$('#login').hidden=true;$('#workspace').hidden=false;$('#user-name').textContent=u.name;$('#admin-link').hidden=u.role!=='admin';$('#user-role').textContent=u.role==='admin'?'管理员':'个人空间';
  if(u.avatar_url){$('#user-avatar').src=u.avatar_url;$('#user-avatar').alt=u.name+'的 Discord 头像'}$('#user-avatar').onerror=()=>{$('#user-avatar').onerror=null;$('#user-avatar').src=portalBase+'/static/猫娘图标.webp'};
  await go(location.hash.slice(1)||'home')})().catch(e=>notify(e.message));
