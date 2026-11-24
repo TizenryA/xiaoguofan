@@ -77,7 +77,7 @@ class Import(Label):
 
 
 class NativeVerify(Strict):
-    cookie: str = Field(min_length=1,max_length=65536,repr=False)
+    cookie: str = Field(min_length=1,max_length=400000,repr=False)
     accounts_cookie: str = Field(default='',max_length=65536,repr=False)
     consent: StrictBool
 
@@ -533,7 +533,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
     def accounts(request: Request):
         uid = auth(request)['id']
         view = engine.account_view(uid)
-        return [a | {'live': view.get(a['id'], {'state':'pending','text':'正在准备，稍等片刻','tier':''})} for a in store.accounts(uid)]
+        return [a | {'live': view.get(a['id'], {'state':'pending','text':'正在准备，稍等片刻','tier':'','plan_tier':{'tier':'unknown','label':'未识别','source':''}})} for a in store.accounts(uid)]
 
     def ensure_unowned(uid, email):
         if email and store.email_owner(email, exclude_uid=uid):
@@ -561,11 +561,12 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
         u=auth(request,csrf=True)
         rate('native:'+u['id'],3)
         if not payload.consent:raise HTTPException(422,'请先确认本人授权')
-        from portal.native_cookie import verify_native
+        from portal.native_cookie import PASTE_KINDS, normalize_paste, verify_native
+        cookie,accounts_cookie,kind=normalize_paste(payload.cookie,payload.accounts_cookie)
         if native_slots.locked():raise HTTPException(429,'身份查询繁忙，请稍后重试')
         async with native_slots:
             try:
-                p,rows=await asyncio.wait_for(verify_native(payload.cookie,payload.accounts_cookie),45)
+                p,rows=await asyncio.wait_for(verify_native(cookie,accounts_cookie),45)
             except TimeoutError:
                 raise HTTPException(504,'Google 身份查询超时，未保存；请稍后重试') from None
         # Recheck access after network I/O before issuing a session-bound ticket.
@@ -577,7 +578,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
                 raise HTTPException(503,'待确认数量已满，请稍后重试')
             store.run('INSERT INTO native_pending VALUES (?,?,?,?,?)',
                       (digest(ticket),u['id'],digest(u['csrf']),time.time()+300,store.encrypt({'payload':p,'rows':rows})))
-        return {'ticket':ticket,'expires_in':300,'accounts':[{'email':r['email'],'authuser':r['authuser']} for r in rows],
+        return {'ticket':ticket,'expires_in':300,'source':PASTE_KINDS[kind],'accounts':[{'email':r['email'],'authuser':r['authuser']} for r in rows],
                 'message':('Google 默认账号页身份已核对（账号列表接口为空，仅支持默认账号）；未验证模型权限。选择后确认保存。' if p['storage_state'].get('xiaoguofan_identity_verification') else 'Google 身份已核对；未验证 AI Studio 模型权限。选择账号后确认保存。')}
 
     @app.post('/api/accounts/native/import',status_code=201)
@@ -711,7 +712,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
         from portal.quota import day_start
         now = time.time()
         return store.records(uid, limit, offset, status) | {
-            'summary': {'today': store.record_summary(uid, day_start(now)), 'week': store.record_summary(uid, now-7*86400)}}
+            'summary': {'today': store.record_summary(uid, day_start(now), 3600),
+                        'week': store.record_summary(uid, day_start(now)-6*86400, 86400)}}
 
     @app.get('/api/load')
     async def project_load(request: Request):

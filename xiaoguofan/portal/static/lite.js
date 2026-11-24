@@ -32,15 +32,38 @@ function kind(code){return code<400?'ok':code===429?'limited':code===499?'cancel
 function statusLabel(code){if(code<400)return '成功';return ({499:'已取消',429:'额度用完',401:'密钥无效',403:'被拒绝',400:'请求有误',413:'内容太大',502:'暂时失败',503:'暂时失败',504:'超时'})[code]||('失败 '+code)}
 function ttftClass(v){return v==null?'':v<2?'ttft-good':v<6?'ttft-mid':'ttft-slow'}
 function fmt(n){return n==null?'—':n>=10000?(n/10000).toFixed(n>=100000?0:1)+' 万':n.toLocaleString()}
+const bjPart=(t,o)=>new Date(t*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',...o});
+function setFilter(k){recordFilter=k;offset=0;$$('#record-filters button').forEach(x=>x.classList.toggle('on',x.dataset.filter===k));task(null,records)}
 function renderStats(s){const box=$('#record-stats');box.replaceChildren();if(!s)return;
- const tile=(label,value,unit,note,cls,extra)=>{const t=el('div',undefined,'stat '+(cls||''));const b=el('b',value);if(unit)b.append(el('small',unit));t.append(el('span',label),b);if(note)t.append(el('em',note));if(extra)t.append(extra);box.append(t)};
- const rate=s.success_rate;const bar=el('div',undefined,'rate-track');const fill=el('i');fill.style.width=(rate??0)+'%';bar.append(fill);
- tile('对话请求',String(s.n),'次',s.n?`成功 ${s.ok} 次`:'还没有请求');
- tile('成功率',rate==null?'—':String(rate),rate==null?'':'%','取消的不算',rate==null?'':rate>=90?'ok':rate>=60?'warn':'bad',bar);
- tile('平均开始回复',s.ttft==null?'—':String(s.ttft),s.ttft==null?'':'秒','从发出到第一个字',s.ttft==null?'':s.ttft<2?'ok':s.ttft<6?'warn':'bad');
- tile('用量（Token）',s.metered?fmt(s.input_tokens+s.output_tokens):'—','',s.metered?`输入 ${fmt(s.input_tokens)} · 输出 ${fmt(s.output_tokens)}`:'聊天软件没报告用量');
- tile('额度用完',String(s.limited),'次',s.limited?'会自动换你的其他账号':'没有遇到',s.limited?'warn':'');
- tile('失败',String(s.failed),'次',s.cancelled?`另有 ${s.cancelled} 次取消`:'不含取消',s.failed?'bad':'')}
+ const big=(label,value,unit,cls)=>{const t=el('div',undefined,'big '+(cls||''));const b=el('b',value);if(unit)b.append(el('small',unit));t.append(el('span',label),b);return t};
+ const rate=s.success_rate,top=el('div',undefined,'dash-top');
+ top.append(big('对话请求',String(s.n),'次'),big('成功率',rate==null?'—':String(rate),rate==null?'':'%',rate==null?'':rate>=90?'ok':rate>=60?'warn':'bad'),
+  big('平均开始回复',s.ttft==null?'—':String(s.ttft),s.ttft==null?'':'秒',s.ttft==null?'':s.ttft<2?'ok':s.ttft<6?'warn':'bad'));
+ // outcome split: one bar + legend that doubles as the list filter
+ const parts=[['ok','成功',s.ok],['limited','额度用完',s.limited],['failed','失败',s.failed],['cancelled','已取消',s.cancelled]];
+ const bar=el('div',undefined,'outcome-bar');bar.setAttribute('role','img');bar.setAttribute('aria-label',parts.map(p=>p[1]+' '+p[2]+' 次').join('，'));
+ for(const [k,,n] of parts)if(n){const seg=el('i',undefined,'seg-'+k);seg.style.flexGrow=String(n);bar.append(seg)}
+ if(!s.n)bar.append(el('i',undefined,'seg-empty'));
+ const legend=el('div',undefined,'legend');for(const [k,label,n] of parts){const b=el('button',undefined,'lg-'+k+(recordFilter===k?' on':''));b.type='button';b.dataset.filter=k;b.append(el('i'),document.createTextNode(label+' '),el('b',String(n)));b.onclick=()=>setFilter(recordFilter===k?'':k);legend.append(b)}
+ const outcome=el('div',undefined,'dash-outcome');outcome.append(el('h3','结果分布'),bar,legend);
+ const sub=el('dl',undefined,'dash-sub');const item=(k,v)=>{const d=el('div');d.append(el('dt',k),el('dd',v));sub.append(d)};
+ item('平均整次用时',s.duration==null?'—':s.duration+' 秒');item('额度用完',s.limited?s.limited+' 次':'没有遇到');item('没成功',s.failed?s.failed+' 次':'没有');outcome.append(sub);
+ // tokens: input/output split + per-hour / per-day columns
+ const tok=el('div',undefined,'dash-tokens'),total=s.input_tokens+s.output_tokens,head=el('div',undefined,'tok-head');
+ head.append(el('h3','Token 用量'),el('b',s.metered?fmt(total):'—'));if(s.metered)head.append(el('small',`平均每次 ${fmt(Math.round(total/Math.max(1,s.metered)))}`));tok.append(head);
+ if(!s.metered){tok.append(el('p','聊天软件没有报告用量，这里暂时没有数据。','hint'))}
+ else{const io=el('div',undefined,'io-bar'),inn=el('i',undefined,'io-in'),out=el('i',undefined,'io-out');inn.style.flexGrow=String(s.input_tokens||0.0001);out.style.flexGrow=String(s.output_tokens||0.0001);io.append(inn,out);
+  const ioLegend=el('div',undefined,'io-legend');const a=el('span',undefined,'io-in');a.append(el('i'),'输入（你发的）',el('b',fmt(s.input_tokens)));const b=el('span',undefined,'io-out');b.append(el('i'),'输出（回复）',el('b',fmt(s.output_tokens)));ioLegend.append(a,b);tok.append(io,ioLegend)}
+ const series=s.series||[];if(series.length){const max=Math.max(1,...series.map(x=>x.input_tokens+x.output_tokens)),useN=!s.metered,maxN=Math.max(1,...series.map(x=>x.n));
+  const chart=el('div',undefined,'tok-chart'+(series.length>12?' dense':''));const daily=series.length<=8;
+  series.forEach((x,i)=>{const col=el('div',undefined,'col'),stack=el('div',undefined,'stack');
+   const label=daily?bjPart(x.start,{month:'numeric',day:'numeric'}):bjPart(x.start,{hour:'numeric',hour12:false}).replace(/\D/g,'');
+   if(useN){const n=el('i',undefined,'c-n');n.style.height=(x.n/maxN*100)+'%';stack.append(n)}
+   else{const o=el('i',undefined,'c-out'),n=el('i',undefined,'c-in');o.style.height=(x.output_tokens/max*100)+'%';n.style.height=(x.input_tokens/max*100)+'%';stack.append(o,n)}
+   col.title=`${daily?label:label+':00'} · ${x.n} 次`+(useN?'':` · 输入 ${fmt(x.input_tokens)} · 输出 ${fmt(x.output_tokens)}`);
+   col.append(stack,el('small',daily||i%6===0?(daily?label:label+'时'):''));chart.append(col)});
+  tok.append(el('h4',(daily?'每天':'每小时')+(useN?'请求次数':'Token'),'chart-title'),chart)}
+ box.append(top,outcome,tok)}
 async function records(){const list=$('#records-list');if(!list.children.length)list.replaceChildren(el('p','正在读取…','hint'));
  const d=await api(`/api/records?limit=20&offset=${offset}${recordFilter?'&status='+recordFilter:''}`);total=d.total;lastSummary=d.summary;renderStats(d.summary?.[summaryRange]);
  $('#page-info').textContent=total?`${offset+1}–${Math.min(offset+20,total)} / 共 ${total} 条`:'';$('#prev').disabled=offset===0;$('#next').disabled=offset+20>=total;
@@ -60,7 +83,7 @@ async function accounts(){const rows=await api('/api/accounts'),list=$('#account
  if(!rows.length){const e=el('div',undefined,'empty');e.append(el('p','还没有账号。跟着下面的步骤导入一个，大约 3 分钟。'));list.replaceChildren(e);return rows}
  list.replaceChildren();for(const a of rows){const l=a.live||{},card=el('article',undefined,'card acc');
   const head=el('div',undefined,'acc-head'),who=el('div');who.append(el('h3',a.label),el('small',a.email||'还没填 Google 邮箱'));
-  const plan=el('span',a.plan==='pro'?'PRO':'Free','chip soft');head.append(who,plan);
+  const tags=el('div',undefined,'acc-tags');tags.append(xgfTierChip(l.plan_tier));if(a.plan==='pro'&&!['pro','ultra','paid'].includes(l.plan_tier?.tier))tags.append(el('span','你标注：PRO','chip soft'));head.append(who,tags);
   const st=el('div',undefined,'acc-state');const chip=el('span',undefined,'chip '+xgfStateClass(l.state,a.enabled));chip.append(el('i',undefined,'dot'),document.createTextNode(l.text||(a.enabled?'正在准备':'已停用')));st.append(chip);
   if(l.recover_at)st.append(el('span','约 '+xgfBeijing(l.recover_at)+' 恢复（'+xgfUntil(l.recover_at)+'）','chip warn'));
   const actions=el('div',undefined,'acc-actions');
@@ -120,10 +143,35 @@ $('#upload-form').onsubmit=e=>{e.preventDefault();task(e.submitter,async()=>{con
   const p={email:f.email.value.trim(),label:f.label.value.trim(),storage_state:j.storage_state||j,locale:j.locale||'en-US',timezone:j.timezone||'America/Los_Angeles'};if(j.fingerprint)p.fingerprint=j.fingerprint;
   await api('/api/accounts/import',{method:'POST',body:JSON.stringify(p)});const label=p.label;e.target.reset();parsedFile=null;$('#file-checks').hidden=true;$('#file-name').textContent='还没有选择文件';e.target.querySelector('.file-zone').classList.remove('has-file');checkEmail();refreshUploadButton();await finishImport(label)}
  catch(x){err.textContent=x.message;err.hidden=false}})};
-$('#native-cookie').addEventListener('input',e=>{const v=e.target.value.trim(),items=[];if(!v){$('#cookie-checks').hidden=true;return}
- if(/^https?:\/\//i.test(v))items.push(['bad','这是网址，不是 Cookie。请在 Via 菜单里用“复制 Cookie”']);
- else{if(!v.includes('='))items.push(['bad','看起来不是 Cookie（应该是一串 名字=值; 名字=值）']);for(const n of REQUIRED)items.push(v.includes(n+'=')?['','包含 '+n]:['bad','缺少 '+n+'，可能没登录或复制的不是 AI Studio 页面'])}
- renderChecks($('#cookie-checks'),items)});
+/* one paste box: Cookie header, Cookie-Editor JSON, our export file, cookies.txt (server re-checks everything) */
+function detectPaste(v){const items=[],now=Date.now()/1000;let kind='',names=new Set(),expired=false;
+ if(/^https?:\/\//i.test(v))return {kind:'',items:[['bad','这是网址，不是登录信息。手机 Via 请用菜单里的“复制 Cookie”']]};
+ const googleDomain=d=>['google.com','aistudio.google.com'].includes(String(d||'').replace(/^\./,'').toLowerCase());
+ if(/^[\[{]/.test(v)){let j;try{j=JSON.parse(v)}catch{return {kind:'JSON',items:[['bad','看起来是 JSON，但不完整：请把导出的内容全部复制过来']]}}
+  let list=j;kind='Cookie-Editor 等扩展导出的 JSON';if(j&&!Array.isArray(j)){const st=j.storage_state||j;list=st.cookies;kind='小锅饭导出文件'}
+  if(!Array.isArray(list)||!list.length)return {kind,items:[['bad','JSON 里没有 Cookie 列表，请用 Cookie-Editor 的“Export → JSON”']]};
+  const own=list.filter(c=>c&&googleDomain(c.domain));if(!own.length)items.push(['bad','没有 google.com 的登录项：请在 AI Studio 页面导出']);
+  for(const c of own){names.add(c.name);const e=Number(c.expirationDate??c.expires??-1);if(REQUIRED.includes(c.name)&&e>0&&e<now)expired=true}}
+ else if(v.includes('\t')||v.startsWith('# Netscape')){kind='cookies.txt';for(const line of v.split(/\r?\n/)){const l=line.replace(/^#HttpOnly_/,'');if(!l||l.startsWith('#'))continue;const p=l.split('\t');if(p.length!==7){items.push(['bad','cookies.txt 有一行不是 7 列，请重新导出']);break}
+  if(googleDomain(p[0])){names.add(p[5]);const e=Number(p[4]);if(REQUIRED.includes(p[5])&&e>0&&e<now)expired=true}}}
+ else{kind='Cookie 字符串';if(!v.includes('='))return {kind:'',items:[['bad','看不出格式：应该是 “名字=值; 名字=值”、JSON 或 cookies.txt']]};
+  if(/[\r\n]/.test(v.trim()))items.push(['bad','Cookie 字符串不能有换行，请只复制一行']);
+  for(const part of v.replace(/^cookie:/i,'').split(';')){const n=part.trim().split('=')[0];if(n)names.add(n)}}
+ const miss=REQUIRED.filter(n=>!names.has(n));
+ if(miss.length)items.push(['bad','缺少必要的登录项：'+miss.join('、')+'。可能没登录，或导出的不是 AI Studio 页面']);else items.push(['','必要的登录项都在']);
+ if(!['SID','__Secure-1PSID','__Secure-3PSID'].some(n=>names.has(n)))items.push(['bad','缺少 SID 类登录项：Via 请用“复制 Cookie”，不要用网页脚本读取']);
+ if(expired)items.push(['bad','登录信息已经过期，请在浏览器重新登录后再导出']);
+ return {kind,items}}
+function checkPaste(){const v=$('#native-cookie').value.trim(),tag=$('#paste-kind');if(!v){$('#cookie-checks').hidden=true;tag.hidden=true;return}
+ const r=detectPaste(v);tag.hidden=!r.kind;tag.textContent=r.kind?'识别为：'+r.kind:'';renderChecks($('#cookie-checks'),r.items);
+ $('#native-verify').disabled=Boolean(r.items.some(x=>x[0]==='bad'))}
+$('#native-cookie').addEventListener('input',checkPaste);
+async function loadPasteFile(file){if(!file)return;if(file.size>1024*1024){renderChecks($('#cookie-checks'),[['bad','文件超过 1MB，不像登录文件']]);return}
+ const ta=$('#native-cookie');ta.value=await file.text();ta.dispatchEvent(new Event('input',{bubbles:true}))}
+$('#native-file').addEventListener('change',e=>{loadPasteFile(e.target.files[0]);e.target.value=''});
+$('#native-cookie').addEventListener('dragover',e=>{e.preventDefault();e.currentTarget.classList.add('drag')});
+$('#native-cookie').addEventListener('dragleave',e=>e.currentTarget.classList.remove('drag'));
+$('#native-cookie').addEventListener('drop',e=>{e.preventDefault();e.currentTarget.classList.remove('drag');loadPasteFile(e.dataTransfer.files[0])});
 $('#ext-check').onclick=()=>task($('#ext-check'),async()=>{const rows=await accounts();if(rows.length>wizard.startCount){await finishImport(rows[rows.length-1]?.label)}else $('#ext-status').textContent='还没看到新账号。确认在扩展里点了“确认上传”，并且当时打开的是本站页面，然后再点一次。'});
 
 /* ---------- access ---------- */
@@ -141,7 +189,7 @@ $('#goto-upload').onclick=()=>$('#add-account').scrollIntoView({behavior:'smooth
 $('#refresh-quota').onclick=()=>task($('#refresh-quota'),quota);
 $('#prev').onclick=()=>task($('#prev'),async()=>{offset=Math.max(0,offset-20);await records()});
 $('#next').onclick=()=>task($('#next'),async()=>{offset+=20;await records()});
-$$('#record-filters button').forEach(b=>b.onclick=()=>{recordFilter=b.dataset.filter;offset=0;$$('#record-filters button').forEach(x=>x.classList.toggle('on',x===b));task(null,records)});
+$$('#record-filters button').forEach(b=>b.onclick=()=>setFilter(b.dataset.filter));
 $$('#summary-range button').forEach(b=>b.onclick=()=>{summaryRange=b.dataset.range;$$('#summary-range button').forEach(x=>x.classList.toggle('on',x===b));renderStats(lastSummary?.[summaryRange])});
 $('#logout').onclick=()=>task($('#logout'),async()=>{await api('/api/auth/logout',{method:'POST'});location.reload()});
 $('#show-key').onclick=()=>$('#key-dialog').showModal();$('#copy-base').onclick=()=>copy($('#copy-base'),$('#api-base').textContent);$('#copy-key').onclick=()=>copy($('#copy-key'),$('#revealed-key').value);$('#reveal-dialog').addEventListener('close',()=>$('#revealed-key').value='');

@@ -15,8 +15,9 @@ def test_plan_owner_isolation_and_quotas(tmp_path):
     s.record(a['id'],'k','gemini-3.8-flash',200,1,account_id=own,generation=True)
     q=c.get('/api/quota').json();row=q['account_usage'][0]
     assert row['id']==own and row['plan']=='pro' and row['today']['attempts']==3 and row['today']['success']==2
-    assert row['models']['4a']=={'used':1,'limit':50,'remaining':49}
-    assert row['models']['3.8f']=={'used':1,'limit':100,'remaining':99}
+    assert {k:row['models']['4a'][k] for k in ('used','limit','remaining')}=={'used':1,'limit':50,'remaining':49}
+    assert row['models']['4a']['days'][-1]==1 and row['models']['4a']['week']==1
+    assert {k:row['models']['3.8f'][k] for k in ('used','limit','remaining')}=={'used':1,'limit':100,'remaining':99}
     assert other not in str(q) and 'private' not in str(q)
     assert len(q['trend'])==7 and q['reference_only'] is True
     assert q['google_remaining'] is None
@@ -31,7 +32,9 @@ def test_unknown_history_failures_and_midnight_boundaries(tmp_path):
     s.run('UPDATE requests SET created=? WHERE account_id=?',(before,aid))
     q=c.get('/api/quota').json()
     assert q['unattributed']['success']==1
-    assert q['account_usage'][0]['models']['4a']=={'used':0,'limit':2,'remaining':2}
+    m=q['account_usage'][0]['models']['4a']
+    assert {k:m[k] for k in ('used','limit','remaining')}=={'used':0,'limit':2,'remaining':2}
+    assert m['days'][-1]==0 and m['days'][-2]==1 and m['week']==1
     assert q['account_usage'][0]['period']['success']==1
     assert model_group('gemini-4-argon')=='4a' and model_group('gemini-3.8-flash')=='3.8f'
     assert model_group('unknown-4-argon-custom')=='other'

@@ -62,7 +62,9 @@ def health_matrix(store, hours=24, max_models=8, only_used=False):
     by_account = {}
     for c in cells:
         by_account.setdefault(c['account_id'], {})[c['model']] = c
-    from portal.engine import human_state
+    from portal.engine import PUBLIC_CATALOGUE, detect_tier, human_state
+    row = store.one('SELECT payload FROM model_catalogues WHERE owner=?', (PUBLIC_CATALOGUE,))
+    catalogue = json.loads(row['payload']) if row else None
     rows = []
     for a in accounts:
         seen = by_account.get(a['id'], {})
@@ -86,8 +88,12 @@ def health_matrix(store, hours=24, max_models=8, only_used=False):
         except ValueError:
             engine_models = 0
         state = a['state'] or ('disabled' if not a['enabled'] else 'pending')
+        try:
+            plan_tier = detect_tier(a['tier'], json.loads(a['models'] or '[]'), catalogue)
+        except ValueError:
+            plan_tier = detect_tier(a['tier'], [], catalogue)
         rows.append({'account_id': a['id'], 'label': a['label'], 'owner': a['owner'], 'owner_id': a['owner_id'],
-                     'email': mask_email(a['engine_id']), 'plan': a['plan'], 'tier': a['tier'] or '',
+                     'email': mask_email(a['engine_id']), 'plan': a['plan'], 'tier': plan_tier['label'], 'tier_source': plan_tier['source'],
                      'state': state, 'state_text': human_state(state), 'active': a['active'] or 0,
                      'engine_models': engine_models, 'cells': out, 'total': total['n'],
                      'grade': grade(total['ok'], total['counted'])})

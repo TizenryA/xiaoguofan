@@ -36,6 +36,34 @@ STATE_TEXT = {
     'error': '没能载入', 'conflict': '这个 Google 账号已被其他用户导入，不能重复使用',
 }
 PAID_TIERS = {'pro', 'ultra', 'plus'}
+TIER_LABELS = {'free': '免费版', 'plus': 'Plus', 'pro': 'Pro', 'ultra': 'Ultra'}
+
+
+def detect_tier(raw_tier, models, catalogue=None):
+    """Plan tier for one account, only from evidence; never guessed.
+
+    1. The engine reads Google's own GetAiStudioBenefitTier answer when it loads the account's
+       AI Studio model list and reports Free/Plus/Pro/Ultra ("Unknown" until that has happened).
+    2. Otherwise, if the account's own model list contains a model that AI Studio marks as
+       paid-only (access mode 3 = Pro/Ultra, 4 = Ultra only), that proves at least that tier.
+       A missing paid model proves nothing (lists can be partial), so it never yields "free".
+    3. Anything else is "unknown". Quota errors are not used: 429 happens on every tier.
+    """
+    tier = str(raw_tier or '').strip().lower()
+    if tier in TIER_LABELS:
+        return {'tier': tier, 'label': TIER_LABELS[tier], 'source': 'google'}
+    owned = {m.removeprefix('models/') for m in models or [] if isinstance(m, str)}
+    modes = set()
+    for item in (catalogue or {}).get('data', []) if isinstance(catalogue, dict) else []:
+        if isinstance(item, dict) and str(item.get('id', '')).removeprefix('models/') in owned:
+            access = [m for m in item.get('access_modes') or [] if isinstance(m, int)]
+            if access and all(m in (3, 4) for m in access):
+                modes.add(frozenset(access))
+    if any(m == {4} for m in modes):
+        return {'tier': 'ultra', 'label': 'Ultra', 'source': 'models'}
+    if modes:
+        return {'tier': 'paid', 'label': '付费（Pro 或以上）', 'source': 'models'}
+    return {'tier': 'unknown', 'label': '未识别', 'source': ''}
 log = logging.getLogger(__name__)
 
 
@@ -342,6 +370,7 @@ class EngineClient:
         rows = {r['account_id']: r for r in self.store.all('SELECT * FROM engine_accounts WHERE user_id=?', (uid,))}
         conflicts = {c['id'] for c in self.conflicts(uid)}
         out = {}
+        catalogue, _ = self.cached_catalogue()
         for a in self.store.all('SELECT id,enabled FROM accounts WHERE user_id=?', (uid,)):
             if a['id'] in conflicts:
                 state, message = 'conflict', ''
@@ -353,8 +382,13 @@ class EngineClient:
                 state, message = 'pending', ''
             engine_id = (rows.get(a['id']) or {}).get('engine_id')
             cooling = [c for c in self.cooldowns.get(engine_id, []) if c['until'] > time.time()] if engine_id else []
+            row = rows.get(a['id']) or {}
+            try:
+                models = json.loads(row.get('models') or '[]')
+            except ValueError:
+                models = []
             out[a['id']] = {'state': state, 'text': human_state(state, message),
-                            'tier': (rows.get(a['id']) or {}).get('tier', ''),
+                            'tier': row.get('tier', ''), 'plan_tier': detect_tier(row.get('tier'), models, catalogue),
                             'cooling': cooling, 'recover_at': min((c['until'] for c in cooling), default=None)}
         return out
 

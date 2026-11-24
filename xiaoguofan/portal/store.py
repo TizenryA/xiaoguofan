@@ -242,7 +242,7 @@ class Store:
         return {'total':self.one(f'SELECT COUNT(*) n FROM requests r WHERE {where}', (uid,))['n'],
                 'items':self.all(f'SELECT r.model,r.status,r.duration,r.first_token_seconds,r.input_tokens,r.output_tokens,r.created,r.account_id,r.generation,a.label account_label FROM requests r LEFT JOIN accounts a ON a.id=r.account_id AND a.user_id=r.user_id WHERE {where} ORDER BY r.id DESC LIMIT ? OFFSET ?', (uid, limit, offset))}
 
-    def record_summary(self, uid, since):
+    def record_summary(self, uid, since, bucket=0):
         """Headline numbers for the records page (generation requests only)."""
         r = self.one('SELECT COUNT(*) n, COALESCE(SUM(status<400),0) ok, COALESCE(SUM(status=429),0) limited, '
                      'COALESCE(SUM(status=499),0) cancelled, COALESCE(SUM(status>=400 AND status NOT IN (429,499)),0) failed, '
@@ -254,6 +254,16 @@ class Store:
         r['success_rate'] = round(r['ok']/counted*100, 1) if counted > 0 else None
         for k in ('ttft', 'duration'):
             r[k] = round(r[k], 2) if r[k] is not None else None
+        if bucket:
+            # Token chart: fixed buckets (hour or day, Beijing time) from `since`, oldest first.
+            count = max(1, min(48, int((time.time()-since)//bucket)+1))
+            rows = self.all('SELECT CAST((created-?)/? AS INTEGER) b, COUNT(*) n, COALESCE(SUM(status<400),0) ok, '
+                            'COALESCE(SUM(input_tokens),0) input_tokens, COALESCE(SUM(output_tokens),0) output_tokens '
+                            'FROM requests WHERE user_id=? AND created>=? AND (generation=1 OR (generation IS NULL AND model<>\'\')) GROUP BY b',
+                            (since, bucket, uid, since))
+            by = {row['b']: row for row in rows}
+            r['series'] = [{'start': since+i*bucket, **{k: (by.get(i) or {}).get(k, 0) for k in ('n', 'ok', 'input_tokens', 'output_tokens')}}
+                           for i in range(count)]
         return r
 
     def create_key(self, uid, label):

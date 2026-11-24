@@ -20,7 +20,7 @@
    if(revision!==current){await discard();return}
    ticket=result.ticket;
    for(const a of result.accounts){const option=document.createElement('option');option.value=String(a.authuser);option.textContent=a.email;$('native-account').append(option)}
-   $('native-confirm').hidden=false;$('native-status').textContent=result.message+' 原始内容已清空，请在 5 分钟内选好账号并确认。';
+   $('native-confirm').hidden=false;$('native-status').textContent=(result.source?'识别为'+result.source+'。':'')+result.message+' 原始内容已清空，请在 5 分钟内选好账号并确认。';
   }catch(err){if(revision===current)$('native-status').textContent=err.message}
   finally{controls(false)}
  };
