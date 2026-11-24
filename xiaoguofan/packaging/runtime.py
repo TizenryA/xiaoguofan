@@ -61,7 +61,8 @@ def launch(c,mode):
     if mode=='broker':
         os.umask(0o007)
         args=['portal.workers:create_broker','--uds',c['socket']]
-    else:args=['portal.main:create_app','--host','127.0.0.1','--port',str(c['port'])]
+    # Don't wait on open streams at shutdown, so a restart takes seconds, not systemd's 90 s stop timeout.
+    else:args=['portal.main:create_app','--host','127.0.0.1','--port',str(c['port']),'--timeout-graceful-shutdown','5']
     os.execv(sys.executable,[sys.executable,'-m','uvicorn',*args,'--factory','--no-access-log','--no-proxy-headers'])
 
 

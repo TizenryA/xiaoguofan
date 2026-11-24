@@ -25,10 +25,7 @@ PRAGMA journal_size_limit = 524288;`
 const incrementalVacuum = 2
 
 func init() {
-	sql.Register(driverName, &sqlite3.SQLiteDriver{ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-		_, err := conn.Exec(connectPragmas, nil)
-		return err
-	}})
+	sql.Register(driverName, &sqlite3.SQLiteDriver{ConnectHook: connectHook})
 }
 
 // Open 打开或创建数据库，每个连接缓存最近用过的 statements 条预编译语句；新库与非增量收缩的已有库先整理为增量收缩，再为已有表补上缺少的列、执行 schema 并删除 schema 没有定义的对象

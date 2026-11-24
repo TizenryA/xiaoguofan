@@ -1,3 +1,5 @@
+//go:build cgo && !nomozjs
+
 package mozjs
 
 // #include "clock.h"

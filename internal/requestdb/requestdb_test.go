@@ -10,10 +10,14 @@ import (
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
+	"github.com/Mag1cFall/AIStudio2API/internal/sqlitedb"
 )
 
 // TestLedgerUsageAndBodies 验证关闭前排队的记录落盘、当前与上一周期分开汇总、正文只保留最近条数
 func TestLedgerUsageAndBodies(t *testing.T) {
+	if !sqlitedb.Available {
+		t.Skip("SQLite 需要 cgo")
+	}
 	path := filepath.Join(t.TempDir(), "requests.db")
 	logs := func(level, message string, attrs ...any) { t.Errorf("%s %s %v", level, message, attrs) }
 	store, err := Open(path, logs)
@@ -68,6 +72,9 @@ func TestLedgerUsageAndBodies(t *testing.T) {
 
 // TestLedgerTimeZoneChange 验证服务器时区改变后重新打开账本时按新时区重建本地日汇总，小时汇总与原始记录不变
 func TestLedgerTimeZoneChange(t *testing.T) {
+	if !sqlitedb.Available {
+		t.Skip("SQLite 需要 cgo")
+	}
 	local := time.Local
 	t.Cleanup(func() { time.Local = local })
 	logs := func(level, message string, attrs ...any) {

@@ -1,3 +1,5 @@
+//go:build cgo && !nomozjs
+
 // mozjs.cpp 实现 mozjs.h：上下文、根表、求值、Go 原生函数、微任务队列、Promise 拒绝记录与浏览器宿主原生函数
 #include "mozjs.h"
 #include "clock.h"
