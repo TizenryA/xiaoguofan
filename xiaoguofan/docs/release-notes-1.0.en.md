@@ -1,4 +1,6 @@
-# Raven's Little Pot 1.0 update notes
+# 渡鸦の小锅饭 1.0 update notes
+
+<small>duya's xiaoguofan</small>
 
 1.0 is live. Your keys, accounts and activity are all kept, and you don't need to change anything in your chat app.
 

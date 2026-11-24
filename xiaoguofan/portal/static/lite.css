@@ -363,3 +363,9 @@ details.fold.inline>.fold-body{padding:0 .9rem .9rem}
 .login-card{position:relative}
 .login-lang{position:absolute;top:.8rem;right:.8rem;margin:0}
 html[lang=en] .usage-day{text-transform:lowercase}
+
+/* English subtitle under the Chinese brand (shown in both languages) */
+.brand-text{display:flex;flex-direction:column;min-width:0;line-height:1.15}
+.brand-text>span{overflow:hidden;text-overflow:ellipsis}
+.brand-en{display:block;font-size:.68rem;font-weight:500;letter-spacing:.02em;color:var(--muted);white-space:nowrap;text-transform:none}
+.login-card .login-brand-en{margin:-.6rem 0 0}

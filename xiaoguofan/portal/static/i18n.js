@@ -5,7 +5,14 @@
 const STORE='xgf-lang';
 const CJK=/[\u3400-\u9fff\uff01-\uff5e\u3000-\u303f\u201c\u201d]/;
 const HAN=/[\u3400-\u9fff]/;
-function pickLang(nav,saved){if(saved==='zh'||saved==='en')return saved;return /^zh\b/i.test(nav||'')?'zh':'en'}
+// Chinese if the clock is set to a Chinese-speaking zone OR any preferred language is zh*; else English.
+// A saved manual choice always wins.
+const ZH_TZ=['Asia/Shanghai','Asia/Chongqing','Asia/Urumqi','Asia/Harbin','Asia/Hong_Kong','Asia/Macau','Asia/Taipei'];
+function pickLang(langs,saved,tz){if(saved==='zh'||saved==='en')return saved;
+  if(tz&&ZH_TZ.includes(tz))return 'zh';
+  const list=Array.isArray(langs)?langs:[langs];
+  return list.some(l=>/^zh\b/i.test(l||''))?'zh':'en'}
+function localZone(){try{return Intl.DateTimeFormat().resolvedOptions().timeZone||''}catch{return ''}}
 function compile(dict){
   const exact=Object.assign({},dict&&dict.exact);
   const templates=Object.entries(dict&&dict.templates||{}).sort((a,b)=>b[0].replace(/\{\w+\}/g,'').length-a[0].replace(/\{\w+\}/g,'').length).map(([k,v])=>{
@@ -13,7 +20,8 @@ function compile(dict){
     return {re:new RegExp(src),names,value:v}});
   return {exact,templates}}
 function fill(value,vars){return value.replace(/\{(\w+)(?:\|([^|}]*)\|([^}]*))?\}/g,(m,n,one,many)=>{if(!(n in vars))return m;const v=vars[n];if(one!==undefined)return String(v).replace(/[^\d.]/g,'')==='1'?one:many;return v})}
-const ALLOWED=/\[防截断\]|小锅饭 · 导出 JSON/g;
+// Chinese kept as-is in English text: the brand, 猫佬, the anti-cutoff model tag, the userscript button.
+const ALLOWED=/渡鸦の小锅饭|小锅饭 · 导出 JSON|小锅饭|猫佬|\[防截断\]/g;
 function hanCount(s){return (s.replace(ALLOWED,'').match(/[\u3400-\u9fff]/g)||[]).length}
 function makeTranslator(dict){
   const c=compile(dict),memo=new Map();
@@ -31,14 +39,14 @@ function makeTranslator(dict){
     return best===null?s:lead+best+trail}
   return tr}
 function format(s,vars){return vars?s.replace(/\{(\w+)\}/g,(m,n)=>n in vars?vars[n]:m):s}
-const api={pickLang,makeTranslator,CJK,HAN};
+const api={pickLang,makeTranslator,CJK,HAN,ZH_TZ};
 if(typeof module!=='undefined'&&module.exports){module.exports=api;return}
 
 let saved=null;try{saved=localStorage.getItem(STORE)}catch{}
 // The server reads this cookie for pages it renders itself (error pages, CSV export).
 function cookie(l){document.cookie='xgf_lang='+l+'; path=/; max-age=31536000; SameSite=Lax'}
 if((saved==='zh'||saved==='en')&&!document.cookie.includes('xgf_lang='+saved))cookie(saved);
-const lang=pickLang(navigator.language,saved);
+const lang=pickLang(navigator.languages&&navigator.languages.length?navigator.languages:[navigator.language],saved,localZone());
 const tr=lang==='en'?makeTranslator(root.XGF_EN||{}):(s=>s);
 const I={lang,locale:lang==='en'?'en-US':'zh-CN',
   // Times are shown in Beijing time for Chinese, and in the visitor's own zone for English.

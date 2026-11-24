@@ -12,7 +12,7 @@ from pathlib import Path
 
 DICT_PATH = Path(__file__).parent/'static'/'i18n-en.js'
 HAN = re.compile(r'[\u3400-\u9fff]')
-ALLOWED = re.compile(r'\[防截断\]|小锅饭 · 导出 JSON')
+ALLOWED = re.compile(r'渡鸦の小锅饭|小锅饭 · 导出 JSON|小锅饭|猫佬|\[防截断\]')
 PLACEHOLDER = re.compile(r'\{(\w+)\}')
 FILL = re.compile(r'\{(\w+)(?:\|([^|}]*)\|([^}]*))?\}')
 # JSON fields that hold user content (names, notes, model ids) are never rewritten.

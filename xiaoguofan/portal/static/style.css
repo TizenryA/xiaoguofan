@@ -8,3 +8,10 @@
 .login-lang{position:absolute;top:1rem;right:1rem;margin:0}
 .user-menu{flex-wrap:nowrap}
 .user-menu>*,.lang-toggle{white-space:nowrap}
+
+/* English subtitle under the Chinese brand (shown in both languages) */
+.wordmark .brand-text{display:flex;flex-direction:column;line-height:1.2;min-width:0}
+.brand-en{display:block;font-size:max(.68vw,11px);font-weight:400;letter-spacing:.02em;color:var(--muted);white-space:nowrap}
+.wordmark small.brand-en{font-size:max(.68vw,11px)}
+.login-brand-en{margin:-.2vw 0 .6vw;font-size:max(.8vw,12px)}
+@media(max-width:700px){.brand-en,.wordmark small.brand-en{font-size:2.6vw}.login-brand-en{margin:-.8vw 0 2vw}}

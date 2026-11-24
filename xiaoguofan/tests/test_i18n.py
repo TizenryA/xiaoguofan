@@ -13,9 +13,9 @@ from portal.main import create_app
 ROOT = Path(__file__).parents[1]/'portal'
 STATIC = ROOT/'static'
 HAN = re.compile(r'[\u3400-\u9fff]')
-# Chinese that is meant to stay in English text: the anti-cutoff model tag users see in their
-# app, and the export button label inside the (Chinese-only) userscript.
-KEEP = re.compile(r'\[防截断\]|小锅饭 · 导出 JSON')
+# Chinese that is meant to stay in English text: the brand (渡鸦の小锅饭 / 小锅饭), 猫佬, the
+# anti-cutoff model tag users see in their app, and the userscript's export button label.
+KEEP = re.compile(r'渡鸦の小锅饭|小锅饭 · 导出 JSON|小锅饭|猫佬|\[防截断\]')
 
 
 def left(text):
@@ -191,3 +191,14 @@ def test_csv_header_in_english(tmp_path):
         en = c.get('/lite/api/records.csv', cookies={'xgf_lang': 'en'}).text
     assert zh.lstrip('\ufeff').startswith('模型,状态')
     assert en.lstrip('\ufeff').startswith('Model,Status,Duration (s)')
+
+
+def test_brand_stays_chinese_with_english_subtitle():
+    for name in ('lite.html', 'index.html'):
+        html = (STATIC/name).read_text(encoding='utf-8')
+        assert '渡鸦の小锅饭' in html
+        assert html.count("duya's xiaoguofan") == 2, name  # top bar / rail and login card
+    exact, templates = i18n.dictionary()
+    for value in [*exact.values(), *(t[3] for t in templates)]:
+        assert not re.search(r'Raven|Little Pot|Maolao', value), value
+    assert i18n.translate('欢迎来到渡鸦の小锅饭，喵') == 'Welcome to 渡鸦の小锅饭, meow'

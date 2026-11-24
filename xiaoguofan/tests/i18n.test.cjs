@@ -9,13 +9,26 @@ const src = fs.readFileSync(path.join(__dirname, '../portal/static/i18n-en.js'),
 const dict = JSON.parse(src.slice(src.indexOf('window.XGF_EN=') + 14).trim().replace(/;$/, ''));
 const tr = i18n.makeTranslator(dict);
 
-test('language: saved choice wins, otherwise zh* browsers get Chinese and everyone else English', () => {
-  assert.strictEqual(i18n.pickLang('zh-CN', null), 'zh');
-  assert.strictEqual(i18n.pickLang('zh-TW', null), 'zh');
-  assert.strictEqual(i18n.pickLang('en-US', null), 'en');
-  assert.strictEqual(i18n.pickLang('ja-JP', null), 'en');
-  assert.strictEqual(i18n.pickLang('zh-CN', 'en'), 'en');
-  assert.strictEqual(i18n.pickLang('en-GB', 'zh'), 'zh');
+test('language: saved choice wins, else a Chinese time zone or any zh* language picks Chinese', () => {
+  const p = i18n.pickLang;
+  assert.strictEqual(p(['zh-CN'], null, 'America/Los_Angeles'), 'zh');
+  assert.strictEqual(p(['en-US', 'zh-TW'], null, 'Europe/London'), 'zh');
+  assert.strictEqual(p('zh-HK', null, ''), 'zh');
+  for (const tz of ['Asia/Shanghai', 'Asia/Chongqing', 'Asia/Urumqi', 'Asia/Harbin', 'Asia/Hong_Kong', 'Asia/Macau', 'Asia/Taipei'])
+    assert.strictEqual(p(['en-US'], null, tz), 'zh', tz);
+  assert.strictEqual(p(['en-US'], null, 'America/New_York'), 'en');
+  assert.strictEqual(p(['ja-JP', 'en'], null, 'Asia/Tokyo'), 'en');
+  assert.strictEqual(p(['en-US'], null, 'Asia/Singapore'), 'en');
+  assert.strictEqual(p([], null, undefined), 'en');
+  assert.strictEqual(p(['zh-CN'], 'en', 'Asia/Shanghai'), 'en');
+  assert.strictEqual(p(['en-GB'], 'zh', 'Europe/London'), 'zh');
+});
+
+test('brand names stay Chinese in English text', () => {
+  assert.strictEqual(tr('渡鸦の小锅饭'), '渡鸦の小锅饭');
+  assert.strictEqual(tr('欢迎来到渡鸦の小锅饭，喵'), 'Welcome to 渡鸦の小锅饭, meow');
+  assert.ok(tr('感谢猫佬的支持 · 友链：').includes('猫佬'));
+  for (const v of [...Object.values(dict.exact), ...Object.values(dict.templates)]) assert.ok(!/Raven|Little Pot|Maolao/.test(v), v);
 });
 
 test('exact text, surrounding spaces kept', () => {
@@ -34,7 +47,7 @@ test('templates translate their pieces and pick plurals', () => {
 
 test('dictionary values are English and keep their placeholders', () => {
   const han = /[\u3400-\u9fff]/;
-  const keep = /\[防截断\]|小锅饭 · 导出 JSON/g;
+  const keep = /渡鸦の小锅饭|小锅饭 · 导出 JSON|小锅饭|猫佬|\[防截断\]/g;
   for (const [k, v] of Object.entries(dict.exact)) assert.ok(!han.test(v.replace(keep, '')), k);
   for (const [k, v] of Object.entries(dict.templates)) {
     assert.ok(!han.test(v.replace(keep, '')), k);
