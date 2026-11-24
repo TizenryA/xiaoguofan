@@ -34,7 +34,7 @@ def test_google_login_entry_is_official_and_does_not_claim_credential_callback(t
         assert {'noopener', 'noreferrer'} <= set(link['rel'].split())
         assert link['referrerpolicy'] == 'no-referrer'
         download = links.links['google-import-extension']
-        assert download['href'] == prefix + '/static/AIStudio-Lite-账号导入.zip'
+        assert download['href'].split('?v=')[0] == prefix + '/static/AIStudio-Lite-账号导入.zip'
         assert 'download' in download
         assert '登录不会自动上传凭据' in page
         assert '返回本页' in page

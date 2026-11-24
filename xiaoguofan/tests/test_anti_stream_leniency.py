@@ -84,35 +84,48 @@ async def test_standard_content_is_immediate_while_upstream_is_still_open():
 
 @pytest.mark.anyio
 async def test_call_accepts_large_request_and_response_with_relaxed_wait(monkeypatch):
-    # Isolate pipe limits/timeouts without sleeping or making Node hold both copies.
+    # Isolate transport limits/timeouts without sleeping or making Node hold both copies.
     text = 'x' * (16 * 1024 * 1024 + 1)
     original_wait_for = asyncio.wait_for
 
-    class Process:
-        returncode = 0
-        received = None
+    class Reader:
+        async def read(self, n=-1):
+            return json.dumps({'content': text}).encode()
 
-        async def communicate(self, raw):
-            self.received = raw
-            return json.dumps({'content': text}).encode(), None
+    class Writer:
+        received = b''
 
-        async def wait(self):
-            return 0
+        def write(self, data):
+            self.received += data
 
-    proc = Process()
+        async def drain(self):
+            pass
 
-    async def spawn():
-        return proc
+        def can_write_eof(self):
+            return True
+
+        def write_eof(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    writer = Writer()
+
+    async def open_session(cls):
+        return anti._Session(Reader(), writer)
 
     async def wait_for(awaitable, timeout):
         assert timeout >= 120
         return await original_wait_for(awaitable, timeout)
 
-    monkeypatch.setattr(anti, '_spawn', spawn)
+    monkeypatch.setattr(anti._Session, 'open', classmethod(open_session))
     monkeypatch.setattr(anti.asyncio, 'wait_for', wait_for)
     assert await anti._call({'op': 'fixture', 'content': text}) == {'content': text}
-    assert isinstance(proc.received, bytes)
-    assert json.loads(proc.received)['content'] == text
+    assert json.loads(writer.received)['content'] == text
 
 
 @pytest.mark.anyio

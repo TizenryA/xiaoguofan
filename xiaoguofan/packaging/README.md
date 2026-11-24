@@ -1,10 +1,10 @@
 # 小锅饭发行包
 
-提供 Linux systemd 安装版与 Docker Compose 版，两者都使用 Docker 动态用户池。默认只监听 127.0.0.1:8890；需自行配置 HTTPS 反向代理及域名。仅支持 systemd + cgroup v2 + Docker systemd cgroup driver，不支持普通无特权 PaaS。
+提供 Linux systemd 安装版与 Docker Compose 版，两者都使用一个共享引擎容器（`xiaoguofan-engine`，每个用户仍只用自己的 Google 账号）。默认只监听 127.0.0.1:8890；需自行配置 HTTPS 反向代理及域名。仅支持 systemd + cgroup v2 + Docker systemd cgroup driver，不支持普通无特权 PaaS。
 
 - Linux 版：门户/broker 是宿主 Python 服务；Node 用于防截断。安装器使用 uv 创建隔离环境。
 - Docker 版：门户和 broker 使用同一个镜像；仅 broker 挂载 Docker socket（拥有宿主高权限），门户不挂载。两者使用 host network，因此仅支持 Linux。不能把 broker socket 或 Docker socket 暴露到公网。
-- 所有门户、broker、Node 和 worker 都在 `xiaoguofan.slice` 中，总上限 2GiB、禁用 Swap，High=1792MiB。默认保留每池650MiB最坏情况预算，因此100仅是入口/池名额配置上限，不代表100人同时生成。
+- 门户、broker、防截断服务（`xiaoguofan-anti`）和共享引擎都在 `xiaoguofan.slice` 中：总上限 10GiB、High=9GiB、禁用 Swap。引擎默认 8g 内存 / 6 CPU，可用 `PORTAL_ENGINE_*` 环境变量调整（见 `docs/共享引擎部署与回滚.md`）。
 - amd64 可在构建机原生验收；arm64 为交叉构建加QEMU测试，非物理ARM服务器验证。
 
 ## 依赖
@@ -16,14 +16,14 @@
 解压对应架构压缩包，进入目录：
 
 ```
-cd xiaoguofan-v0.9.22-linux-amd64
+cd xiaoguofan-v1.0.0-linux-amd64
 sudo python3 install.py --mode linux --origin https://your.example/lite
 ```
 
 Docker版：
 
 ```
-cd xiaoguofan-v0.9.22-docker-amd64
+cd xiaoguofan-v1.0.0-docker-amd64
 sudo python3 install.py --mode docker --origin https://your.example/lite
 ```
 

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -472,8 +473,22 @@ func prepareProtocolHeaders(
 	return state, headers, nil
 }
 
-// CooldownQueueLimit 为全部候选账户冷却时一个请求排队等待恢复的累计上限，覆盖分钟限额窗口
-const CooldownQueueLimit = time.Minute
+// CooldownQueueLimit 为全部候选账户冷却时一个请求排队等待恢复的累计上限，默认覆盖分钟限额窗口；
+// 环境变量 AISTUDIO_COOLDOWN_QUEUE_SECONDS 可调整（0 表示不排队，立即返回带恢复时刻的 429，由上游门户换号或告知用户）
+var CooldownQueueLimit = cooldownQueueLimitFromEnv(os.Getenv("AISTUDIO_COOLDOWN_QUEUE_SECONDS"))
+
+// cooldownQueueLimitFromEnv 解析排队上限秒数，非法或越界（0..600 之外）时回落到一分钟
+func cooldownQueueLimitFromEnv(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Minute
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds < 0 || seconds > 600 {
+		return time.Minute
+	}
+	return time.Duration(seconds) * time.Second
+}
 
 // QueuedCoolingError 返回全部候选账户冷却时的排队结果：最早恢复的冷却在已排队 queued 之后的上限内、不晚于 ctx 的期限且不是权限拒绝冷却时为 nil，否则为 AllCoolingError
 func QueuedCoolingError(ctx context.Context, modelID string, cooldown CooldownState, queued time.Duration) error {

@@ -15,8 +15,10 @@ def test_installer_refuses_insecure_or_overlapping_paths():
 
 
 def test_broker_only_docker_socket_and_shared_slice():
-    c={'root':'/opt/app','data':'/var/data','socket_dir':'/run/xiaoguofan-release','portal_image':'xiaoguofan-portal:0.9.15','docker_gid':999}
+    c={'root':'/opt/app','data':'/var/data','socket_dir':'/run/xiaoguofan-release','portal_image':'xiaoguofan-portal:1.0.0','docker_gid':999,'anti_socket':'/run/xiaoguofan-release/anti.sock'}
     d=installer.compose(c,123,124)['services']
+    assert not any('docker.sock' in v for v in d['anti']['volumes']) and d['anti']['command']==['anti']
+    assert d['portal']['depends_on']['anti']['condition']=='service_healthy'
     for v in d.values():assert v['cgroup_parent']=='xiaoguofan.slice' and v['network_mode']=='host'
     assert not any('docker.sock' in v for v in d['portal']['volumes'])
     assert any('docker.sock' in v for v in d['broker']['volumes'])
@@ -30,3 +32,6 @@ def test_linux_units_retain_least_privilege_and_budget():
     assert 'User=xiaoguofan' in u['xiaoguofan-portal.service']
     assert 'Slice=xiaoguofan.slice' in u['xiaoguofan-portal.service']
     assert 'cleanup' in u['xiaoguofan-broker.service'] and 'MemoryMax=150M' in u['xiaoguofan-broker.service']
+    anti=u['xiaoguofan-anti.service']
+    assert 'User=xiaoguofan' in anti and 'PrivateNetwork=true' in anti and 'runtime.py anti' in anti
+    assert 'Wants=xiaoguofan-anti.service' in u['xiaoguofan-portal.service']

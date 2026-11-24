@@ -1,0 +1,69 @@
+# DMIT 洛杉矶入口反代：xiaoguofanapi.tizenty.xyz（Cloudflare 灰云，直接解析到 DMIT）
+# 只做转发，不存任何数据、不保存账号；证书由 Caddy 自动申请。
+#
+# 使用前设置两个环境变量（例如写进 /etc/caddy/env 并在 systemd 单元里 EnvironmentFile=）：
+#   XGF_ORIGIN_HOST  生产门户现在用的域名（生产 Caddy 已有证书的那个），例如 xiaoguofan.example.com
+#   XGF_ORIGIN_ADDR  生产机地址:443，例如 156.9.67.181:443
+#
+# 关键点：
+#   flush_interval -1   流式回复逐字转发，不在 DMIT 攒包（首字延迟不受影响）
+#   长超时              长思考 / 防截断请求可能持续 30 分钟以上
+#   不缓存、不压缩 SSE  避免攒包
+
+xiaoguofanapi.tizenty.xyz {
+	# 只压缩网页静态资源；不压缩 text/event-stream
+	encode gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type application/javascript*
+		}
+	}
+
+	request_body {
+		max_size 64MB
+	}
+
+	reverse_proxy {$XGF_ORIGIN_ADDR} {
+		header_up Host {$XGF_ORIGIN_HOST}
+		# Caddy 默认会追加 X-Forwarded-For；真实访客 IP 交给生产 Caddy（生产侧需把 DMIT 列入 trusted_proxies，见部署文档）
+		header_up X-Real-IP {remote_host}
+
+		flush_interval -1
+
+		transport http {
+			tls
+			tls_server_name {$XGF_ORIGIN_HOST}
+			dial_timeout 10s
+			response_header_timeout 45m
+			read_timeout 0
+			write_timeout 0
+			keepalive 5m
+			keepalive_idle_conns 64
+			versions 1.1 2
+		}
+
+		# 生产不可达时快速给出明确错误，不重试生成请求（避免重复扣用量）
+		lb_try_duration 0
+	}
+
+	header {
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/xiaoguofanapi.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>X-Goog-Api-Key delete
+				request>headers>X-Api-Key delete
+			}
+		}
+	}
+}

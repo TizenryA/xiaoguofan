@@ -4,6 +4,7 @@ import http.cookiejar
 import json
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -20,25 +21,24 @@ def broker(path,body):
     out=subprocess.check_output(['curl','--fail','--silent','--show-error','--max-time','90','--unix-socket',c['socket'],'-H','Content-Type: application/json','-d',json.dumps(body),'http://broker/'+path],text=True)
     return json.loads(out)
 
-assert request('/health')['version']=='0.9.22'
+assert request('/health')['version']=='1.0.0'
 password=json.loads((data/'credentials.json').read_text())['password']
 assert request('/api/auth/admin',{'password':password})
-load=request('/api/load');assert load['available'] and load['memory']['limit_bytes']==2147483648
 assert request('/api/admin/stats')['totals']['registered_users']==0
 assert request('/api/admin/settings')['public_login'] is False
-slice=Path('/sys/fs/cgroup/xiaoguofan.slice');assert (slice/'memory.max').read_text().strip()=='2147483648'
-assert (slice/'memory.swap.max').read_text().strip()=='0'
-uid='c'*32;token='d'*32
+slice=Path('/sys/fs/cgroup/xiaoguofan.slice');assert (slice/'memory.max').read_text().strip()
+# One shared engine container, inside the project slice, loopback only.
+info=broker('engine',{});assert info['url'].startswith('http://127.0.0.1:')
+labels=json.loads(subprocess.check_output(['docker','inspect','xiaoguofan-engine'],text=True))[0]
+assert labels['Config']['Labels'].get('xiaoguofan.engine')=='1'
+assert labels['HostConfig']['CgroupParent']=='xiaoguofan.slice'
+assert 'XGF_ACCOUNT_SCOPE=required' in labels['Config']['Env']
+# Without the trusted scope header the engine must refuse generation requests.
+req=urllib.request.Request(info['url']+'/v1/chat/completions',data=b'{"model":"x","messages":[]}',headers={'Authorization':'Bearer '+info['key'],'Content-Type':'application/json'})
 try:
-    result=broker('ensure',{'uid':uid,'accounts':[],'limit':100,'lease':token});assert result['lease']==token
-    labels=json.loads(subprocess.check_output(['docker','inspect','asp-'+uid],text=True))[0]
-    assert labels['Config']['Labels']['xiaoguofan.instance']==c['instance']
-    assert labels['HostConfig']['CgroupParent']=='xiaoguofan.slice'
-    assert labels['HostConfig']['Memory']==labels['HostConfig']['MemorySwap']==650*1024**2
-    assert any(slice.glob('docker-*.scope'))
-    assert broker('load',{})['pool']['active']==1
-    broker('release',{'uid':uid,'lease':token});assert broker('load',{})['pool']['active']==0
-finally:
-    broker('release',{'uid':uid,'lease':token});broker('stop',{'uid':uid})
+    urllib.request.urlopen(req,timeout=10);raise SystemExit('engine accepted a request without account scope')
+except urllib.error.HTTPError as exc:
+    assert exc.code==403,exc.code
+load=broker('load',{});assert load['engine']['running']
 key=hashlib.sha256((data/'master.key').read_bytes()).hexdigest();(root/'smoke-key-hash').write_text(key)
-print('RELEASE_REAL_INSTALL_LOGIN_STATS_LOAD_WORKER_SHARED_BUDGET_PASS',c['mode'],load['memory']['used_bytes'])
+print('RELEASE_REAL_INSTALL_LOGIN_STATS_SHARED_ENGINE_SCOPE_PASS',c['mode'],load['memory']['used_bytes'])

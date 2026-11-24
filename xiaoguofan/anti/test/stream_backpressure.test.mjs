@@ -1,8 +1,8 @@
-// Focused fixtures for HD: node --test tests/anti_stream_backpressure.test.mjs
+// Focused fixtures for HD: node --test anti/test/*.test.mjs
 import assert from 'node:assert/strict';
 import { Writable } from 'node:stream';
 import test from 'node:test';
-import { StreamTransformer } from '../portal/anti_core/synthetic/stream-transformer.js';
+import { StreamTransformer } from '../core/synthetic/stream-transformer.js';
 
 const content = 'data: {"model":"fixture","choices":[{"index":0,"delta":{"content":"原文"}}]}\n\n';
 const cfg = { maxResponseBytes: Infinity, streamSideBufferBytes: 0 };

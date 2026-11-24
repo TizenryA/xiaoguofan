@@ -1390,7 +1390,7 @@ func (service *trackedService) videoCooling(ctx context.Context, request aistudi
 	}
 	available := len(groups.WarmReady) + len(groups.WarmAvailable) + len(groups.WarmBusy) +
 		len(groups.StandbyReady) + len(groups.StandbyBusy)
-	if available > 0 || groups.EarliestCooldown.Until.IsZero() || time.Until(groups.EarliestCooldown.Until) <= cooldownQueueLimit {
+	if available > 0 || groups.EarliestCooldown.Until.IsZero() || time.Until(groups.EarliestCooldown.Until) <= aistudio.CooldownQueueLimit {
 		return nil
 	}
 	return &aistudio.AllCoolingError{ModelID: modelID, Until: groups.EarliestCooldown.Until, Reason: groups.EarliestCooldown.Reason}
@@ -1499,8 +1499,17 @@ func (closer *trackedMediaReadCloser) Close() error {
 	return closer.err
 }
 
-// acquireWarmLease 取得 Worker 已就绪的账户租约，可用账户重叠的同条件请求按到达先后取用共同的账户；全部账户冷却时排队等待恢复，一个请求等冷却恢复累计不超过 cooldownQueueLimit，cooled 是它已等的时长，最早恢复的是权限拒绝冷却或晚于请求期限时不排队；quotaFallback 为 true 时不再排队后改用套餐限额、每日限额或权限拒绝冷却中的账户；冷 Worker 启动失败后换到其他账户计入 failures，超过换号上限时返回启动失败
+// acquireWarmLease 取得 Worker 已就绪的账户租约，可用账户重叠的同条件请求按到达先后取用共同的账户；全部账户冷却时排队等待恢复，一个请求等冷却恢复累计不超过 aistudio.CooldownQueueLimit，cooled 是它已等的时长，最早恢复的是权限拒绝冷却或晚于请求期限时不排队；quotaFallback 为 true 时不再排队后改用套餐限额、每日限额或权限拒绝冷却中的账户；冷 Worker 启动失败后换到其他账户计入 failures，超过换号上限时返回启动失败
 func (service *trackedService) acquireWarmLease(ctx context.Context, selection aistudio.AccountSelection, quotaFallback bool, failures *int, cooled *time.Duration) (*aistudio.AccountLease, error) {
+	lease, err := service.acquireWarmLeaseOnce(ctx, selection, quotaFallback, failures, cooled)
+	if err == nil && lease != nil {
+		aistudio.ReportServingAccount(ctx, lease.Account().ID)
+	}
+	return lease, err
+}
+
+// acquireWarmLeaseOnce 是 acquireWarmLease 的实际选号过程，成功后由 acquireWarmLease 上报本次使用的账户
+func (service *trackedService) acquireWarmLeaseOnce(ctx context.Context, selection aistudio.AccountSelection, quotaFallback bool, failures *int, cooled *time.Duration) (*aistudio.AccountLease, error) {
 	fixedAccount := strings.TrimSpace(selection.AccountID) != "" || strings.TrimSpace(selection.ResourceID) != ""
 	failedWorkers := make(map[string]struct{})
 	var promoteFailure error
@@ -1691,9 +1700,6 @@ func promotionFailure(pool *aistudio.AccountPool, selection aistudio.AccountSele
 
 // schedulingRecheck 为等待调度信号时的定时复查间隔
 const schedulingRecheck = time.Second
-
-// cooldownQueueLimit 为全部候选账户冷却时一个请求排队等待恢复的累计上限，覆盖分钟限额窗口
-const cooldownQueueLimit = aistudio.CooldownQueueLimit
 
 // waitScheduling 等待账户或 Worker 可调度状态变化、定时复查或请求取消
 func waitScheduling(ctx context.Context, changed <-chan struct{}, delay time.Duration) error {
@@ -2555,9 +2561,9 @@ func (err *accountsUnavailableError) ErrorCode() string {
 	return "account_unavailable"
 }
 
-// RetryAt 返回被拒账户最早的冷却恢复时刻，晚于 cooldownQueueLimit 时返回零值
+// RetryAt 返回被拒账户最早的冷却恢复时刻，晚于一分钟时返回零值
 func (err *accountsUnavailableError) RetryAt(now time.Time) time.Time {
-	if err.until.Sub(now) > cooldownQueueLimit {
+	if err.until.Sub(now) > time.Minute {
 		return time.Time{}
 	}
 	return err.until

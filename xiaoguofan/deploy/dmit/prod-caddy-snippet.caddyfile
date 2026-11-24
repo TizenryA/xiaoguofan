@@ -1,0 +1,24 @@
+# 生产机 Caddy 需要的补充（合并进现有站点配置，不要整体替换）
+#
+# 1) 全局选项：信任 DMIT 与 Cloudflare 边缘传来的 X-Forwarded-For，
+#    否则所有经 DMIT 的访客在门户看来都是同一个 IP（登录限速会互相影响）。
+{
+	servers {
+		trusted_proxies static 179.253.243.0/32 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22
+		client_ip_headers X-Forwarded-For
+	}
+}
+
+# 2) 站点里转发到门户的 reverse_proxy 加上流式和长超时：
+#	reverse_proxy 127.0.0.1:<门户端口> {
+#		flush_interval -1
+#		transport http {
+#			response_header_timeout 45m
+#			read_timeout 0
+#			write_timeout 0
+#		}
+#	}
+#
+# 3) 门户环境变量（systemd 单元 Environment= 或 portal.env）：
+#	PORTAL_TRUSTED_PROXIES=179.253.243.0/32
+#    门户只相信来自本机回环和这里列出的地址的转发头；Cloudflare 边缘地址已内置识别。

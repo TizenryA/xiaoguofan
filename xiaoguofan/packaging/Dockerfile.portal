@@ -6,6 +6,7 @@ WORKDIR /app
 COPY xiaoguofan/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY xiaoguofan/portal /app/portal
+COPY xiaoguofan/anti /app/anti
 COPY xiaoguofan/packaging/runtime.py /runtime.py
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 XGF_CONFIG=/config/config.json
 ENTRYPOINT ["python","/runtime.py"]

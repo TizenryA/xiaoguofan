@@ -1,3 +1,5 @@
+import re
+
 from fastapi.testclient import TestClient
 
 from portal.main import create_app
@@ -8,11 +10,11 @@ def test_subpath_deployment_preserves_host_origin_csrf_and_routes(tmp_path):
     with TestClient(app,base_url='https://aistudio.tizenty.xyz') as c:
         r=c.get('/lite')
         assert r.status_code==200
-        assert 'href="/lite/static/style.css"' in r.text
+        assert re.search(r'href="/lite/static/style\.css\?v=[0-9a-f]{12}"', r.text)
         assert 'href="/guanlimanage"' in r.text
         a=c.get('/guanlimanage')
         assert a.status_code==200
-        assert 'src="/lite/static/app.js"' in a.text
+        assert re.search(r'src="/lite/static/app\.js\?v=[0-9a-f]{12}"', a.text)
         assert 'href="/lite"' in a.text
         cfg=c.get('/lite/api/config').json()
         assert cfg['api_base']=='https://aistudio.tizenty.xyz/lite/v1'

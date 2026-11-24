@@ -265,6 +265,7 @@ func runServer(ctx context.Context, cfg config.Config, manager *runtimeManager, 
 		MediaDir:         filepath.Join("runtime", "media"), MediaLimit: mediaLimit, MediaLinks: manager.mediaLinks,
 		ResponseModes: manager.responseModes, WaitLaunch: manager.WaitLaunch,
 		SearchSettings: manager.searchSettings, EgressProxy: manager.egressProxy, States: manager.states,
+		AccountScopeRequired: strings.EqualFold(strings.TrimSpace(os.Getenv("XGF_ACCOUNT_SCOPE")), "required"),
 	})
 	server := &http.Server{
 		Handler:           rootHandler(apiHandler),

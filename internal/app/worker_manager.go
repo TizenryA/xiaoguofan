@@ -268,7 +268,7 @@ func (manager *accountWorkerManager) expandInBackground(accountID string, modelI
 
 // spareForCooling 在热 Worker 账户对模型进入请求不排队等待的长冷却后，峰值未满时在后台为一个对该模型未冷却、没有 Worker 的候选账户启动 Worker，冷却的 Worker 保留给其他模型与指定账户的请求
 func (manager *accountWorkerManager) spareForCooling(ctx context.Context, selection aistudio.AccountSelection, accountID string, until time.Time) {
-	if time.Until(until) <= cooldownQueueLimit {
+	if time.Until(until) <= aistudio.CooldownQueueLimit {
 		return
 	}
 	warm := manager.WarmAccountIDs()

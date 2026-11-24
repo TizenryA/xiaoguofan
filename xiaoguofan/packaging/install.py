@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 HERE=Path(__file__).resolve().parent
-VERSION='0.9.22'
+VERSION='1.0.0'
 
 
 def run(*args,**kw):return subprocess.run(list(args),check=True,**kw)
@@ -37,11 +37,15 @@ def compose(c,uid,gid):
         'tmpfs':['/tmp:rw,size=67108864'],'environment':{'XGF_CONFIG':'/config/config.json'},'pids_limit':160,'healthcheck':{'test':['CMD','python','-c','import os,pathlib,urllib.request,json;c=json.loads(pathlib.Path("/config/config.json").read_text());urllib.request.urlopen("http://127.0.0.1:"+str(c["port"])+"/health",timeout=2)'],'interval':'5s','timeout':'3s','retries':12,'start_period':'10s'}}
     # host networking is intentional: workers publish random loopback ports on the host.
     volumes=[c['root']+'/config.json:/config/config.json:ro',c['data']+':'+c['data'],c['socket_dir']+':'+c['socket_dir']]
-    portal=common|{'command':['portal'],'user':f'{uid}:{gid}','volumes':volumes,'mem_limit':'200m','memswap_limit':'200m'}
+    portal=common|{'command':['portal'],'user':f'{uid}:{gid}','volumes':volumes,'mem_limit':'768m','memswap_limit':'768m'}
     broker=common|{'command':['broker'],'user':f'{uid}:{gid}','group_add':[str(c['docker_gid'])],'volumes':volumes+['/var/run/docker.sock:/var/run/docker.sock','/sys/fs/cgroup:/sys/fs/cgroup:ro'],'mem_limit':'150m','memswap_limit':'150m'}
     # Both processes need read-only project metrics, but only broker has Docker privilege.
     portal['volumes']=volumes+['/sys/fs/cgroup:/sys/fs/cgroup:ro']
-    return {'name':'xiaoguofan-release','services':{'broker':broker,'portal':portal}}
+    # Resident anti-truncation service: no network use, only a unix socket in socket_dir.
+    anti=common|{'command':['anti'],'user':f'{uid}:{gid}','volumes':[c['root']+'/config.json:/config/config.json:ro',c['socket_dir']+':'+c['socket_dir']],
+        'mem_limit':'512m','memswap_limit':'512m','healthcheck':{'test':['CMD','test','-S',c['anti_socket']],'interval':'5s','timeout':'3s','retries':12,'start_period':'5s'}}
+    portal['depends_on']={'anti':{'condition':'service_healthy'}}
+    return {'name':'xiaoguofan-release','services':{'anti':anti,'broker':broker,'portal':portal}}
 
 
 def units(c):
@@ -72,17 +76,33 @@ MemoryMax=150M
 '''+common.replace('UMask=0077','UMask=0007')+'''[Install]
 WantedBy=multi-user.target
 '''
+    anti=f'''[Unit]
+Description=Xiaoguofan anti-truncation service
+[Service]
+User=xiaoguofan
+Group=xiaoguofan
+RuntimeDirectory=xiaoguofan-anti
+RuntimeDirectoryMode=0750
+ExecStart={c['python']} {c['root']}/runtime.py anti
+MemoryMax=512M
+ProtectSystem=strict
+PrivateTmp=true
+PrivateNetwork=true
+'''+common+'''[Install]
+WantedBy=multi-user.target
+'''
     portal=f'''[Unit]
 Description=Xiaoguofan BYOA portal
-After=xiaoguofan-broker.service
+After=xiaoguofan-broker.service xiaoguofan-anti.service
 Requires=xiaoguofan-broker.service
+Wants=xiaoguofan-anti.service
 [Service]
 User=xiaoguofan
 Group=xiaoguofan
 ExecStart={c['python']} {c['root']}/runtime.py portal
-MemoryMax=200M
+MemoryMax=768M
 ProtectSystem=strict
-ReadWritePaths={c['data']} {c['socket_dir']}
+ReadWritePaths={c['data']} {c['socket_dir']} -/run/xiaoguofan-anti
 PrivateTmp=true
 '''+common+'''[Install]
 WantedBy=multi-user.target
@@ -103,7 +123,7 @@ ExecStopPost=/usr/bin/python3 {c['root']}/runtime.py cleanup
 [Install]
 WantedBy=multi-user.target
 '''
-    return {'xiaoguofan-broker.service':broker,'xiaoguofan-portal.service':portal} if c['mode']=='linux' else {'xiaoguofan-compose.service':docker}
+    return {'xiaoguofan-broker.service':broker,'xiaoguofan-anti.service':anti,'xiaoguofan-portal.service':portal} if c['mode']=='linux' else {'xiaoguofan-compose.service':docker}
 
 
 def main():
@@ -132,7 +152,7 @@ def main():
         run('/usr/bin/python3',str(root/'runtime.py'),'backup')
         stamp=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
         rollback=root.parent/(root.name+'-rollback-'+stamp);shutil.copytree(root,rollback,ignore=shutil.ignore_patterns('.venv','rollback-*'))
-        run('systemctl','stop',*(['xiaoguofan-portal','xiaoguofan-broker'] if a.mode=='linux' else ['xiaoguofan-compose']))
+        run('systemctl','stop',*(['xiaoguofan-portal','xiaoguofan-anti','xiaoguofan-broker'] if a.mode=='linux' else ['xiaoguofan-compose']))
     else:
         for existing in ['xiaoguofan-portal','xiaoguofan-broker','xiaoguofan-compose']:
             assert subprocess.run(['systemctl','is-active','--quiet',existing]).returncode!=0,'另一套小锅饭发行安装正在运行，拒绝覆盖'
@@ -164,6 +184,7 @@ def main():
         for f in files:os.chmod(Path(path)/f,0o644)
     c={'root':str(root),'data':str(data),'mode':a.mode,'origin':a.origin.rstrip('/'),'port':a.port,
        'socket_dir':'/run/xiaoguofan-release','socket':'/run/xiaoguofan-release/broker.sock',
+       'anti_socket':'/run/xiaoguofan-anti/anti.sock' if a.mode=='linux' else '/run/xiaoguofan-release/anti.sock',
        'worker_image':'xiaoguofan-worker:'+VERSION,'portal_image':'xiaoguofan-portal:'+VERSION,
        'docker_gid':Path('/var/run/docker.sock').stat().st_gid,
        'instance':old['instance'] if old else secrets.token_hex(16),'python':str(root/'app/.venv/bin/python')}
@@ -183,11 +204,12 @@ def main():
         run('docker','load','-i',str(HERE/'images/portal.tar.gz'),stdout=subprocess.DEVNULL)
         (root/'compose.yaml').write_text(json.dumps(compose(c,pw.pw_uid,pw.pw_gid),indent=2))
         (root/'runtime.env').write_text('COMPOSE_PROJECT_NAME=xiaoguofan-release\n')
-    budget='''[Unit]\nDescription=Xiaoguofan project total budget\n[Slice]\nMemoryAccounting=true\nCPUAccounting=true\nMemoryHigh=1792M\nMemoryMax=2G\nMemorySwapMax=0\n[Install]\nWantedBy=multi-user.target\n'''
+    # 1.0: one shared engine (8g) + portal/broker/anti; matches the production slice (9G/10G).
+    budget='''[Unit]\nDescription=Xiaoguofan project total budget\n[Slice]\nMemoryAccounting=true\nCPUAccounting=true\nMemoryHigh=9G\nMemoryMax=10G\nMemorySwapMax=0\n[Install]\nWantedBy=multi-user.target\n'''
     Path('/etc/systemd/system/xiaoguofan.slice').write_text(budget)
     for name,text in units(c).items():Path('/etc/systemd/system',name).write_text(text)
     run('systemctl','daemon-reload');run('systemctl','enable','--now','xiaoguofan.slice')
-    run('systemctl','enable','--now',*(['xiaoguofan-broker','xiaoguofan-portal'] if a.mode=='linux' else ['xiaoguofan-compose']))
+    run('systemctl','enable','--now',*(['xiaoguofan-broker','xiaoguofan-anti','xiaoguofan-portal'] if a.mode=='linux' else ['xiaoguofan-compose']))
     import time
     import urllib.request
     for i in range(30):

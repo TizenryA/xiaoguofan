@@ -1,131 +1,101 @@
-"""Per-owner FIFO admission and disconnect ownership."""
+"""Shared-engine admission (global FIFO + per-user cap) and disconnect ownership."""
 import asyncio
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
 
 from fastapi import HTTPException
-from starlette.responses import JSONResponse
 
-BODY_LIMIT = 2 * 1024**2
-BODY_BUDGET = 32 * 1024**2
-BUSY_DETAILS = frozenset({
-    '项目内存预算已满，请稍后重试', '项目资源保护未就绪，请稍后重试',
-    '账号池正在启动或维护，请稍后重试', '自己的账号池正在处理请求，请稍后重试',
-})
+BODY_LIMIT = 2 * 1024**2          # portal pages and management API
+API_BODY_LIMIT = 64 * 1024**2     # model requests (inline images, long contexts)
+BODY_BUDGET = int(os.environ.get("PORTAL_BODY_BUDGET_MB", "256")) * 1024**2  # all in-flight request bodies
+
+
+class Admission:
+    """Global FIFO admission with a per-user cap (shared engine).
+
+    Replaces the per-user single-flight queue of the per-container design:
+    a user may run up to ``per_user()`` requests at once, the site up to
+    ``capacity()``; waiters are served in arrival order, skipping users that
+    are already at their own cap so one heavy user cannot block others.
+    """
+
+    def __init__(self, capacity, per_user, timeout=300):
+        self.capacity, self.per_user, self.timeout = capacity, per_user, timeout
+        self.waiting = deque()
+        self.running = {}
+        self.total = 0
+        self.peak = 0
+
+    def snapshot(self, uid=None):
+        return {'active': self.total, 'queued': len(self.waiting),
+                'queued_users': len({t.uid for t in self.waiting}),
+                'limit': self.capacity(), 'per_user': self.per_user(), 'peak': self.peak,
+                'user_active': self.running.get(uid, 0) if uid else None,
+                'user_queued': sum(t.uid == uid for t in self.waiting) if uid else None,
+                'wait_timeout_seconds': self.timeout}
+
+    def _eligible(self):
+        if self.total >= self.capacity():
+            return None
+        limit = self.per_user()
+        for ticket in self.waiting:
+            if self.running.get(ticket.uid, 0) < limit:
+                return ticket
+        return None
+
+    async def acquire(self, uid):
+        ticket = Ticket(uid, time.monotonic()+self.timeout)
+        self.waiting.append(ticket)
+        try:
+            while True:
+                if self._eligible() is ticket:
+                    self.waiting.remove(ticket)
+                    self.running[uid] = self.running.get(uid, 0)+1
+                    self.total += 1
+                    self.peak = max(self.peak, self.total)
+                    ticket.reserved = True
+                    return ticket
+                if ticket.deadline <= time.monotonic():
+                    raise HTTPException(429, '现在排队的人太多，请稍后重试', headers={'Retry-After': '30'})
+                await asyncio.sleep(.02)
+        except BaseException:
+            if ticket in self.waiting:
+                self.waiting.remove(ticket)
+            raise
+
+    def release(self, ticket):
+        if not ticket.reserved:
+            return
+        ticket.reserved = False
+        left = self.running.get(ticket.uid, 1)-1
+        if left > 0:
+            self.running[ticket.uid] = left
+        else:
+            self.running.pop(ticket.uid, None)
+        self.total = max(0, self.total-1)
 
 
 @dataclass(eq=False)
 class Ticket:
     uid: str
     deadline: float
-    retry_at: float = 0
     reserved: bool = False
-    committed: bool = False
-
-
-class FairQueue:
-    def __init__(self, capacity, locks, timeout=900, per_user=5, total=100):
-        self.capacity = capacity  # Synchronous cached value only; never network I/O.
-        self.locks = locks
-        self.timeout, self.per_user, self.total = timeout, per_user, total
-        self.queues = {}
-        self.turns = deque()
-        self.running = {}
-        self.quarantined = set()
-
-    @property
-    def waiting(self):
-        return sum(sum(not t.reserved for t in q) for q in self.queues.values())
-
-    def snapshot(self, uid=None):
-        return {'active': len(self.running), 'queued': self.waiting,
-                'queued_users': sum(any(not t.reserved for t in q) for q in self.queues.values()),
-                'limit': self.capacity(), 'user_queued': sum(not t.reserved for t in self.queues.get(uid, ())),
-                'queue_limit': None, 'user_queue_limit': None,
-                'wait_timeout_seconds': self.timeout, 'quarantined': len(self.quarantined)}
-
-    def enqueue(self, uid):
-        self.expire()
-        ticket = Ticket(uid, time.monotonic() + self.timeout)
-        if uid not in self.queues:
-            self.queues[uid] = deque()
-            self.turns.append(uid)
-        self.queues[uid].append(ticket)
-        return ticket
-
-    def expire(self):
-        now = time.monotonic()
-        for q in list(self.queues.values()):
-            for ticket in list(q):
-                if not ticket.reserved and ticket.deadline <= now:
-                    self.remove(ticket)
-
-    def eligible(self):
-        now = time.monotonic()
-        for uid in self.turns:
-            q = self.queues[uid]
-            if (q and uid not in self.running
-                    and not self.locks[uid].locked() and q[0].retry_at <= now
-                    and q[0].deadline > now):
-                return q[0]
-        return None
-
-    async def acquire(self, ticket, request):
-        try:
-            while True:
-                if ticket.deadline <= time.monotonic():
-                    raise HTTPException(504, '排队等待超时，请稍后重试')
-                if len(self.running) < self.capacity() and self.eligible() is ticket:
-                    # asyncio's unlocked Lock.acquire completes without yielding.
-                    await self.locks[ticket.uid].acquire()
-                    self.running[ticket.uid] = ticket
-                    ticket.reserved = True
-                    return
-                await asyncio.sleep(.05)
-        except BaseException:
-            self.finish(ticket)
-            raise
-
-    def commit(self, ticket):
-        self.remove(ticket)
-        ticket.committed = True
-        # Rotate this user's remaining FIFO behind other users only on successful start.
-        if ticket.uid in self.turns:
-            self.turns.remove(ticket.uid)
-            self.turns.append(ticket.uid)
-
-    def retry(self, ticket):
-        # Keep the exact head/turn and monotonic deadline; release only the reservation.
-        if self.running.get(ticket.uid) is ticket:
-            del self.running[ticket.uid]
-            self.locks[ticket.uid].release()
-        ticket.reserved = False
-        ticket.retry_at = time.monotonic() + .2
-
-    def remove(self, ticket):
-        q = self.queues.get(ticket.uid)
-        if q is not None and ticket in q:
-            q.remove(ticket)
-            if not q:
-                del self.queues[ticket.uid]
-                self.turns.remove(ticket.uid)
-
-    def finish(self, ticket, safe=True):
-        self.remove(ticket)
-        if self.running.get(ticket.uid) is ticket:
-            del self.running[ticket.uid]
-            self.locks[ticket.uid].release()
-            if ticket.uid in self.turns:
-                self.turns.remove(ticket.uid)
-                self.turns.append(ticket.uid)
-        ticket.reserved = False
 
 
 class BodyBudget:
     def __init__(self, limit=BODY_BUDGET):
         self.limit = limit
         self.used = 0
+
+
+async def _reject(send, status, message):
+    import json
+    raw = json.dumps({'detail': message, 'error': {'message': message}}, ensure_ascii=False).encode()
+    await send({'type': 'http.response.start', 'status': status,
+                'headers': [(b'content-type', b'application/json; charset=utf-8'), (b'content-length', str(len(raw)).encode()), (b'connection', b'close')]})
+    await send({'type': 'http.response.body', 'body': raw})
 
 
 class BoundedBodyMiddleware:
@@ -138,6 +108,8 @@ class BoundedBodyMiddleware:
             return await self.app(scope, receive, send)
         held = 0
         chunks = []
+        path = scope.get('path', '')
+        limit = API_BODY_LIMIT if path.startswith(('/v1/', '/v1beta/', '/v1alpha/')) or path in ('/v1', '/v1beta') else BODY_LIMIT
         try:
             while True:
                 message = await receive()
@@ -147,6 +119,10 @@ class BoundedBodyMiddleware:
                 self.budget.used += len(part)
                 held += len(part)
                 chunks.append(part)
+                if held > limit:
+                    return await _reject(send, 413, '请求内容太大')
+                if self.budget.used > self.budget.limit:
+                    return await _reject(send, 503, '服务器正忙，请稍后重试')
                 if not message.get('more_body', False):
                     break
             body = b''.join(chunks)

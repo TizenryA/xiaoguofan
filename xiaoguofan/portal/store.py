@@ -17,7 +17,9 @@ from portal.accounts import account_email
 DEFAULTS = {'site_name': '渡鸦の小锅饭', 'public_login': False, 'discord_client_id': '',
             'discord_client_secret': '', 'blocked_guilds': [], 'block_enabled': False, 'discord_allowlist': [],
             'verification_hours': 24, 'requests_per_minute': 20, 'max_accounts': 5,
-            'max_keys': 10, 'max_workers': 6, 'global_concurrency': 3}
+            'max_keys': 10, 'max_workers': 6, 'global_concurrency': 3,
+            # 1.0 shared engine. max_workers/global_concurrency above are legacy (ignored).
+            'engine_concurrency': 48, 'user_concurrency': 4, 'rate_limit_enabled': False}
 
 
 def digest(s):
@@ -67,6 +69,8 @@ class Store:
         self.db.execute('CREATE INDEX IF NOT EXISTS idx_requests_owner_time ON requests(user_id,created)')
         if 'avatar' not in {r[1] for r in self.db.execute('PRAGMA table_info(users)')}:
             self.db.execute('ALTER TABLE users ADD COLUMN avatar TEXT')
+        from portal import migrations
+        migrations.apply(self.db)
         self.db.execute("INSERT OR IGNORE INTO users(id,discord_id,name,role,disabled,verified,policy,created) VALUES ('admin',NULL,'管理员','admin',0,0,0,?)", (time.time(),))
         if not self.db.execute("SELECT 1 FROM metadata WHERE key='admin_hash'").fetchone():
             self.db.execute('INSERT INTO metadata VALUES (?,?)', ('admin_hash', PasswordHasher().hash(admin_password)))
@@ -200,6 +204,15 @@ class Store:
             self.audit(uid, 'account_credentials_updated' if matches else 'account_imported')
             return aid
 
+    def email_owner(self, email, exclude_uid=None):
+        """User id that first imported this Google email (accounts are never shared)."""
+        if not email:
+            return None
+        for row in self.all('SELECT user_id,payload FROM accounts ORDER BY created,id'):
+            if row['user_id'] != exclude_uid and account_email(self.decrypt(row['payload'])) == email:
+                return row['user_id']
+        return None
+
     def delete_account(self, uid, aid):
         with self.lock:
             old = self.account(uid, aid)
@@ -257,9 +270,43 @@ class Store:
         self.run('DELETE FROM requests WHERE created<?', (cutoff,))
         self.run('DELETE FROM audit WHERE created<?', (cutoff,))
         self.run('DELETE FROM sessions WHERE expires<?', (time.time(),))
+        self.run('DELETE FROM response_owners WHERE created<?', (cutoff,))
+        self.run('DELETE FROM alerts WHERE resolved IS NOT NULL AND resolved<?', (cutoff,))
 
     def stats(self, uid):
         self.cleanup()
         return {'summary': self.one('SELECT COUNT(*) requests,COALESCE(SUM(status<400),0) success,COALESCE(SUM(input_tokens),0) input_tokens,COALESCE(SUM(output_tokens),0) output_tokens,COUNT(input_tokens) metered_requests FROM requests WHERE user_id=?', (uid,)),
                 'recent': self.all('SELECT model,status,duration,input_tokens,output_tokens,created FROM requests WHERE user_id=? ORDER BY id DESC LIMIT 50', (uid,)),
                 'daily': self.all("SELECT strftime('%m-%d',created,'unixepoch') day,COUNT(*) requests FROM requests WHERE user_id=? AND created>? GROUP BY day ORDER BY day", (uid, time.time()-7*86400))}
+
+
+class Alerts:
+    """Admin-only alerts (never shown to ordinary users). Deduplicated by kind+subject."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def __call__(self, kind, subject, message, level='warning'):
+        now = time.time()
+        with self.store.lock:
+            row = self.store.one('SELECT id FROM alerts WHERE kind=? AND subject=? AND resolved IS NULL', (kind, subject))
+            if row:
+                self.store.run('UPDATE alerts SET message=?,level=?,count=count+1,updated=? WHERE id=?', (message[:300], level, now, row['id']))
+            else:
+                self.store.run('INSERT INTO alerts(kind,subject,level,message,count,created,updated) VALUES (?,?,?,?,1,?,?)',
+                               (kind, subject, level, message[:300], now, now))
+
+    def resolve(self, kind, subject=None):
+        if subject is None:
+            return self.store.run('UPDATE alerts SET resolved=? WHERE kind=? AND resolved IS NULL', (time.time(), kind))
+        return self.store.run('UPDATE alerts SET resolved=? WHERE kind=? AND subject=? AND resolved IS NULL', (time.time(), kind, subject))
+
+    def open(self, limit=100):
+        return self.store.all('SELECT id,kind,subject,level,message,count,created,updated FROM alerts WHERE resolved IS NULL ORDER BY '
+                              "CASE level WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, updated DESC LIMIT ?", (limit,))
+
+    def recent(self, limit=50):
+        return self.store.all('SELECT id,kind,subject,level,message,count,created,updated,resolved FROM alerts ORDER BY updated DESC LIMIT ?', (limit,))
+
+    def dismiss(self, alert_id):
+        return self.store.run('UPDATE alerts SET resolved=? WHERE id=? AND resolved IS NULL', (time.time(), alert_id))

@@ -6,8 +6,8 @@ import pytest
 from fastapi import HTTPException
 from test_lite import setup
 
+from portal.accounts import worker_payload
 from portal.native_cookie import parse_header, verify_native
-from portal.workers import worker_payload
 
 RAW='SID=ISOLATED-SID; SAPISID=ISOLATED-SAP; __Secure-1PAPISID=ISOLATED-1P; __Secure-3PAPISID=ISOLATED-3P; UNKNOWN=not-forwarded'
 
