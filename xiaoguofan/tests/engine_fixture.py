@@ -37,6 +37,7 @@ class FakeEngine:
         self.seen = []              # (path, scope list, serving account)
         self.imports = []
         self.cooldowns = []         # [{'account_id','model_id','until' (RFC3339),'reason'}]
+        self.flaky = set()          # labels whose next import fails with 503
         self.deletes = []
         self.first_token_delay = 0.0
         self.chunk_delay = 0.0
@@ -129,6 +130,9 @@ class FakeEngine:
             payload = await request.json()
             label = payload['label']
             assert '@' in label, 'engine accounts are keyed by Google email'
+            if label in engine.flaky:
+                engine.flaky.discard(label)
+                return JSONResponse({'error': {'message': 'upstream busy'}}, 503)
             if 'expired' in label:
                 return JSONResponse({'error': {'message': '认证状态无法用于 AI Studio'}}, 422)
             engine.imports.append(label)

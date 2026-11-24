@@ -295,3 +295,19 @@ def test_engine_requires_scope_header_is_respected_by_fixture(fake):
     from engine_fixture import KEY
     r = httpx.post(fake.url+'/v1/chat/completions', headers={'Authorization': 'Bearer '+KEY}, json={'model': 'x', 'messages': []})
     assert r.status_code == 403
+
+
+def test_transient_import_failure_retries_but_bad_credentials_wait(tmp_path, fake):
+    import asyncio
+    app, s, alice, bob, c = portal(tmp_path, fake)
+    add(s, alice, 'flaky@gmail.com')
+    add(s, alice, 'expired@gmail.com')
+    fake.flaky.add('flaky@gmail.com')
+    asyncio.run(app.state.engine.sync())
+    rows = {r['engine_id']: r for r in s.all('SELECT engine_id,state,message FROM engine_accounts')}
+    assert rows['flaky@gmail.com']['state'] == 'error' and '自动重试' in rows['flaky@gmail.com']['message']
+    imports = list(fake.imports)
+    asyncio.run(app.state.engine.sync())
+    assert 'flaky@gmail.com' in fake.accounts
+    assert s.one("SELECT state FROM engine_accounts WHERE engine_id='flaky@gmail.com'")['state'] != 'error'
+    assert fake.imports.count('expired@gmail.com') == imports.count('expired@gmail.com')  # not hammered

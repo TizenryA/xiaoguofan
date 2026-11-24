@@ -36,6 +36,7 @@ STATE_TEXT = {
     'error': '没能载入', 'conflict': '这个 Google 账号已被其他用户导入，不能重复使用',
 }
 PAID_TIERS = {'pro', 'ultra', 'plus'}
+TRANSIENT_LOAD = '暂时没能载入，系统会自动重试'
 TIER_LABELS = {'free': '免费版', 'plus': 'Plus', 'pro': 'Pro', 'ultra': 'Ultra'}
 
 
@@ -258,8 +259,8 @@ class EngineClient:
                     unchanged = old and old['fingerprint'] == fingerprint and old['account_id'] == row['id'] and old['user_id'] == row['user_id']
                     if unchanged and email in remote:
                         continue
-                    if unchanged and old['state'] == 'error' and not force:
-                        continue  # same broken credentials; wait for the owner to re-import
+                    if unchanged and old['state'] == 'error' and not force and old['message'] != TRANSIENT_LOAD:
+                        continue  # same broken credentials; wait for the owner to re-import (transient failures retry each sync)
                     if email in remote and old and (old['user_id'] != row['user_id'] or old['account_id'] != row['id']):
                         # Ownership moved (account deleted and re-imported elsewhere): drop the
                         # engine copy first so no runtime state follows it to the new owner.
@@ -307,9 +308,10 @@ class EngineClient:
             return 'error', TERMS_REQUIRED
         if '登录邮箱与账户不一致' in message:
             return 'error', '登录会话与所填 Google 邮箱不一致，请重新导出'
+        log.warning('engine import returned %s: %s', r.status_code, re.sub(r'\S+@\S+', '<email>', message)[:200])
         if r.status_code in (400, 401, 403, 422):
             return 'error', 'Google 登录状态无效或已过期，请重新登录后导入'
-        return 'error', '暂时没能载入，系统会自动重试'
+        return 'error', TRANSIENT_LOAD
 
     def _save(self, email, row, fingerprint, state, message, now):
         self.store.run('INSERT INTO engine_accounts(engine_id,account_id,user_id,fingerprint,state,message,synced) VALUES (?,?,?,?,?,?,?) '

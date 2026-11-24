@@ -4,6 +4,12 @@
 # 使用前设置两个环境变量（例如写进 /etc/caddy/env 并在 systemd 单元里 EnvironmentFile=）：
 #   XGF_ORIGIN_HOST  生产门户现在用的域名（生产 Caddy 已有证书的那个），例如 xiaoguofan.example.com
 #   XGF_ORIGIN_ADDR  生产机地址:443，例如 156.9.67.181:443
+#   XGF_ORIGIN_PREFIX 门户在生产域名下的路径前缀，例如 /lite（门户在根路径时设为空）
+#   生产 Caddy 用 `tls internal` 时，把它的根证书（公开证书，不是私钥）
+#   /opt/caddy-migrated/data/caddy/pki/authorities/local/root.crt 复制到 DMIT 的 /etc/caddy/origin-root.crt。
+#
+# 对外地址：https://xiaoguofanapi.tizenty.xyz/v1（OpenAI/Anthropic）和 /v1beta（Gemini），
+# 转发到生产的 {$XGF_ORIGIN_PREFIX}/v1…；其他路径跳回生产门户网页。
 #
 # 关键点：
 #   flush_interval -1   流式回复逐字转发，不在 DMIT 攒包（首字延迟不受影响）
@@ -24,7 +30,10 @@ xiaoguofanapi.tizenty.xyz {
 		max_size 64MB
 	}
 
-	reverse_proxy {$XGF_ORIGIN_ADDR} {
+	@api path /v1 /v1/* /v1beta /v1beta/*
+	handle @api {
+		rewrite * {$XGF_ORIGIN_PREFIX}{uri}
+		reverse_proxy {$XGF_ORIGIN_ADDR} {
 		header_up Host {$XGF_ORIGIN_HOST}
 		# Caddy 默认会追加 X-Forwarded-For；真实访客 IP 交给生产 Caddy（生产侧需把 DMIT 列入 trusted_proxies，见部署文档）
 		header_up X-Real-IP {remote_host}
@@ -34,6 +43,7 @@ xiaoguofanapi.tizenty.xyz {
 		transport http {
 			tls
 			tls_server_name {$XGF_ORIGIN_HOST}
+			tls_trust_pool file /etc/caddy/origin-root.crt
 			dial_timeout 10s
 			response_header_timeout 45m
 			read_timeout 0
@@ -45,6 +55,10 @@ xiaoguofanapi.tizenty.xyz {
 
 		# 生产不可达时快速给出明确错误，不重试生成请求（避免重复扣用量）
 		lb_try_duration 0
+		}
+	}
+	handle {
+		redir https://{$XGF_ORIGIN_HOST}{$XGF_ORIGIN_PREFIX} 302
 	}
 
 	header {
