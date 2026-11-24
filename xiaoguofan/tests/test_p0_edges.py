@@ -8,7 +8,7 @@ from portal import gateway
 from portal.main import create_app
 
 CF = '104.16.0.1'
-DMIT = '179.253.243.0'
+DMIT = '69.63.193.127'
 
 
 def test_client_ip_trusts_forwarding_only_from_trusted_hops():
