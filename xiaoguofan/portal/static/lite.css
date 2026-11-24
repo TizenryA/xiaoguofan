@@ -345,7 +345,7 @@ details.fold.inline>.fold-body{padding:0 .9rem .9rem}
 /* access: two routes */
 .route-list{display:grid;gap:.7rem}
 @media(min-width:1000px){.route-list:not(.compact){grid-template-columns:1fr 1fr}}
-.route{border:1px solid var(--line);border-radius:var(--radius-sm);padding:.75rem .85rem;background:var(--surface);display:grid;gap:.45rem;min-width:0}
+.route{border:1px solid var(--line);border-radius:var(--radius-sm);padding:.75rem .85rem;background:var(--surface);display:grid;gap:.45rem;min-width:0;align-content:start}
 .route-optimized{border-color:var(--ok);box-shadow:0 0 0 2px var(--ok-soft)}
 .route-head{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
 .route .copy-row code{overflow-wrap:anywhere;word-break:break-all}
