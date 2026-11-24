@@ -458,6 +458,60 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
         from portal.admin_stats import admin_statistics
         return admin_statistics(store,days=days,limit=limit,offset=offset,query=q.strip())
 
+    @app.get('/api/admin/live')
+    async def admin_live(request: Request):
+        auth(request, admin=True)
+        from portal import admin_live as live
+        try:
+            load = await asyncio.wait_for(broker.load(), 5)
+        except Exception:
+            load = None
+        return JSONResponse({'engine': dict(engine.health), 'admission': scheduler.snapshot(),
+                             'load': load, 'accounts': live.account_states(store), 'traffic': live.recent_traffic(store),
+                             'alerts_open': len(alerts.open()), 'timestamp': time.time()},
+                            headers={'Cache-Control': 'no-store'})
+
+    @app.get('/api/admin/health-matrix')
+    def admin_health_matrix(request: Request, hours: int = Query(24, ge=1, le=720), models: int = Query(8, ge=1, le=20), used: bool = False):
+        auth(request, admin=True)
+        from portal.admin_live import health_matrix
+        return health_matrix(store, hours=hours, max_models=models, only_used=used)
+
+    @app.get('/api/admin/alerts')
+    def admin_alerts(request: Request):
+        auth(request, admin=True)
+        return {'open': alerts.open(), 'recent': alerts.recent(50)}
+
+    @app.post('/api/admin/alerts/{alert_id}/dismiss')
+    def admin_alert_dismiss(alert_id: int, request: Request):
+        auth(request, admin=True, csrf=True)
+        if not alerts.dismiss(alert_id):
+            raise HTTPException(404, '告警不存在或已处理')
+        store.audit('admin', 'alert_dismissed')
+        return {'ok': True}
+
+    @app.post('/api/admin/engine/sync')
+    async def admin_engine_sync(request: Request):
+        auth(request, admin=True, csrf=True)
+        try:
+            await asyncio.wait_for(engine.sync(force=True), 120)
+            await asyncio.wait_for(engine.refresh_status(), 30)
+        except Exception as e:
+            raise HTTPException(502, '同步失败：'+(str(e)[:200] or type(e).__name__)) from None
+        store.audit('admin', 'engine_synced')
+        return {'ok': True, 'message': '已重新同步全部账号'}
+
+    @app.post('/api/admin/engine/restart')
+    async def admin_engine_restart(request: Request):
+        auth(request, admin=True, csrf=True)
+        try:
+            await broker.restart()
+        except Exception as e:
+            raise HTTPException(502, '重启失败：'+(str(e)[:200] or type(e).__name__)) from None
+        engine.request_sync()
+        store.audit('admin', 'engine_restarted')
+        return {'ok': True, 'message': '生成服务已重启，账号正在重新载入'}
+
     @app.get('/api/admin/users')
     def users(request: Request):
         auth(request, admin=True)

@@ -1,31 +1,27 @@
 'use strict';
+// Home page status line: short, human, no internals. Polls only while the home tab is visible.
 (function(){
- let enabled=false,timer=null,inflight=false,epoch=0,last=0;
- const node=id=>document.getElementById(id),number=n=>n==null?'—':Number(n).toLocaleString('zh-CN');
- function state(message,error){document.querySelector('[data-page=load]').classList.toggle('load-stale',Boolean(error));node('load-state').textContent=message;node('load-error').hidden=!error;if(error)node('load-error').textContent=error;}
+ let enabled=false,timer=null,inflight=false,epoch=0;
+ const node=id=>document.getElementById(id);
  function render(d){
-  if(!d.available){state('采样不可用','资源保护或采样服务暂不可用，旧值不代表当前负载。');return;}
-  last=d.timestamp;const m=d.memory,p=d.pool,c=d.cpu;
-  node('load-memory').textContent=m.used_bytes==null?'—':(m.used_bytes/1048576).toFixed(0)+' MiB';
-  const bar=node('load-memory-bar');bar.max=m.limit_bytes;if(m.used_bytes==null)bar.removeAttribute('value');else bar.value=m.used_bytes;
-  node('load-memory-note').textContent=m.used_bytes>=m.high_bytes?'内存接近预算，账号池按 30 分钟续期':'总预算包含所有用户池与门户进程';
-  node('load-cpu').textContent=c.percent==null?'采样中':c.percent.toFixed(1)+'%';
-  node('load-queue').textContent='排队 '+number(d.requests.queued)+' · 本人 '+number(d.requests.user_queued);
-  node('load-requests').textContent=number(d.requests.active)+' / '+number(d.requests.limit);
-  node('load-running').textContent=number(p.running);node('load-pool-note').textContent='可用池 '+number(p.limit)+' · 空闲 30 分钟关闭';
-  for(const k of ['active','idle','starting','evictions'])node('load-'+k).textContent=number(p[k]);
-  node('load-time').textContent='更新于 '+new Date(last*1000).toLocaleTimeString('zh-CN');state('实时采样',null);
+  const card=node('home-status-card');if(!card)return;
+  card.classList.toggle('is-warning',!d.ok);
+  let title=d.ok?(d.busy?'现在人比较多，可能要稍等一下':'一切正常，可以直接用'):d.message;
+  const notes=[];
+  if(d.mine_running)notes.push('你有 '+d.mine_running+' 条对话正在进行');
+  if(d.mine_waiting)notes.push(d.mine_waiting+' 条在排队，马上轮到');
+  node('home-status').textContent=title;
+  node('home-status-note').textContent=notes.join(' · ')||'更新于 '+new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});
  }
- function schedule(){clearTimeout(timer);if(enabled&&!document.hidden)timer=setTimeout(refresh,3000);}
+ function schedule(seconds){clearTimeout(timer);if(enabled&&!document.hidden)timer=setTimeout(refresh,(seconds||5)*1000);}
  async function refresh(){
   if(!enabled||document.hidden||inflight)return;
-  const ticket=epoch;inflight=true;node('load-refresh').disabled=true;
-  try{const d=await api('/api/load');if(enabled&&ticket===epoch&&!document.hidden)render(d);}
-  catch(e){if(enabled&&ticket===epoch)state(last?'数据已过期':'连接失败','负载刷新失败，当前展示上次成功数据，请重试。');}
-  finally{inflight=false;node('load-refresh').disabled=false;schedule();}
+  const ticket=epoch;inflight=true;let wait=5;
+  try{const d=await api('/api/load');wait=d.refresh_seconds||5;if(enabled&&ticket===epoch)render(d);}
+  catch(e){if(enabled&&ticket===epoch){node('home-status').textContent='暂时连不上服务器';node('home-status-note').textContent='稍后会自动重试';}wait=15;}
+  finally{inflight=false;schedule(wait);}
  }
- window.poolLoadView=function(on){enabled=on;epoch++;clearTimeout(timer);if(on){state(last?'正在更新':'正在连接',null);refresh();}};
+ window.homeStatusView=function(on){enabled=on;epoch++;clearTimeout(timer);if(on)refresh();};
  document.addEventListener('visibilitychange',()=>{epoch++;clearTimeout(timer);if(enabled&&!document.hidden)refresh();});
- node('load-refresh').onclick=()=>{clearTimeout(timer);refresh();};
  window.addEventListener('pagehide',()=>{enabled=false;epoch++;clearTimeout(timer);});
 })();
