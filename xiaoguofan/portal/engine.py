@@ -12,6 +12,7 @@ import contextlib
 import copy
 import json
 import logging
+import re
 import time
 
 import httpx
@@ -43,6 +44,36 @@ def human_state(state, message=''):
     if state in ('error', 'conflict') and message:
         return message
     return text
+
+
+def _epoch(value):
+    """RFC3339 (Go time.Time, up to nanoseconds) -> unix seconds, or None."""
+    from datetime import datetime
+    if not isinstance(value, str) or not value or value.startswith('0001-'):
+        return None
+    m = re.fullmatch(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)', value.strip())
+    if not m:
+        return None
+    frac = (m.group(2) or '')[:7]
+    zone = '+00:00' if m.group(3) == 'Z' else m.group(3)
+    try:
+        return datetime.fromisoformat(m.group(1)+frac+zone).timestamp()
+    except ValueError:
+        return None
+
+
+def parse_cooldowns(items, now=None):
+    now = now or time.time()
+    out = {}
+    for c in items:
+        until = _epoch(c.get('until'))
+        if not until or until <= now:
+            continue
+        out.setdefault(str(c.get('account_id', '')).lower(), []).append(
+            {'model': str(c.get('model_id') or ''), 'until': until, 'reason': 'quota' if 'quota' in str(c.get('reason', '')).lower() or '429' in str(c.get('reason', '')) else 'other'})
+    for v in out.values():
+        v.sort(key=lambda c: c['until'])
+    return out
 
 
 def static_locator(info):
@@ -85,6 +116,7 @@ class EngineClient:
         self.last_sync = 0.0
         self.last_status = 0.0
         self.health = {'ok': None, 'checked': None, 'message': ''}
+        self.cooldowns = {}  # engine_id -> [{'model','until','reason'}], refreshed with status
         self.catalogue_task = None
         self.alert = None
 
@@ -274,6 +306,13 @@ class EngineClient:
         now = time.time()
         self.health.update(ok=True, checked=now, message='')
         self.alert_resolve('engine_down', 'engine')
+        try:
+            async with self.admin(timeout=10) as c:
+                r = await c.get('/api/cooldowns')
+                r.raise_for_status()
+                self.cooldowns = parse_cooldowns(r.json().get('cooldowns') or [], now)
+        except Exception:
+            pass  # recovery times are a nicety; never fail status refresh for them
         for a in accounts:
             engine_id = a['id'].lower()
             state = a.get('state') or 'pending'
@@ -312,8 +351,11 @@ class EngineClient:
                 state, message = rows[a['id']]['state'], rows[a['id']]['message']
             else:
                 state, message = 'pending', ''
+            engine_id = (rows.get(a['id']) or {}).get('engine_id')
+            cooling = [c for c in self.cooldowns.get(engine_id, []) if c['until'] > time.time()] if engine_id else []
             out[a['id']] = {'state': state, 'text': human_state(state, message),
-                            'tier': (rows.get(a['id']) or {}).get('tier', '')}
+                            'tier': (rows.get(a['id']) or {}).get('tier', ''),
+                            'cooling': cooling, 'recover_at': min((c['until'] for c in cooling), default=None)}
         return out
 
     async def ensure_ready(self, uid, timeout=60):

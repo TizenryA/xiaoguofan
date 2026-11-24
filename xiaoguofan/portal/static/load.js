@@ -5,7 +5,7 @@
  const node=id=>document.getElementById(id);
  function render(d){
   const card=node('home-status-card');if(!card)return;
-  card.classList.toggle('is-warning',!d.ok);
+  card.classList.toggle('is-warning',!d.ok);card.classList.toggle('is-busy',Boolean(d.ok&&d.busy));
   let title=d.ok?(d.busy?'现在人比较多，可能要稍等一下':'一切正常，可以直接用'):d.message;
   const notes=[];
   if(d.mine_running)notes.push('你有 '+d.mine_running+' 条对话正在进行');

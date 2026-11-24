@@ -39,12 +39,12 @@ def test_static_assets_versioned_urls_get_long_cache(tmp_path):
     app = create_app(tmp_path, 'test-password-long-enough', 'https://portal.example')
     with TestClient(app, base_url='https://portal.example') as c:
         page = c.get('/').text
-        url = re.search(r'/static/style\.css\?v=([0-9a-f]{12})', page).group(0)
+        url = re.search(r'/static/lite\.css\?v=([0-9a-f]{12})', page).group(0)
         assert 'immutable' in c.get(url).headers['cache-control']
         assert 'max-age=31536000' in c.get(url).headers['cache-control']
-        stale = c.get('/static/style.css?v=000000000000').headers['cache-control']
+        stale = c.get('/static/lite.css?v=000000000000').headers['cache-control']
         assert 'immutable' not in stale and 'max-age=3600' in stale
-        assert 'immutable' not in c.get('/static/style.css').headers['cache-control']
+        assert 'immutable' not in c.get('/static/lite.css').headers['cache-control']
 
 
 def test_per_minute_limit_is_optional(tmp_path):

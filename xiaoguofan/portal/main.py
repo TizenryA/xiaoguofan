@@ -705,8 +705,13 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
                 'concurrency':s['user_concurrency'], 'summary':store.stats(u['id'])['summary']} | reference_quota(store,u['id'])
 
     @app.get('/api/records')
-    def records(request: Request, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000)):
-        return store.records(auth(request)['id'], limit, offset)
+    def records(request: Request, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000),
+                status: Literal['', 'ok', 'limited', 'failed', 'cancelled'] = ''):
+        uid = auth(request)['id']
+        from portal.quota import day_start
+        now = time.time()
+        return store.records(uid, limit, offset, status) | {
+            'summary': {'today': store.record_summary(uid, day_start(now)), 'week': store.record_summary(uid, now-7*86400)}}
 
     @app.get('/api/load')
     async def project_load(request: Request):

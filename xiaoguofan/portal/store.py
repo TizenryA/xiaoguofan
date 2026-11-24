@@ -233,10 +233,28 @@ class Store:
         sql = ','.join(k+'=?' for k in allowed)
         return bool(self.run('UPDATE accounts SET '+sql+' WHERE user_id=? AND id=?', (*allowed.values(), uid, aid)))
 
-    def records(self, uid, limit=20, offset=0):
+    RECORD_FILTERS = {'ok': 'r.status<400', 'limited': 'r.status=429', 'cancelled': 'r.status=499',
+                      'failed': 'r.status>=400 AND r.status NOT IN (429,499)'}
+
+    def records(self, uid, limit=20, offset=0, status=''):
         self.cleanup()
-        return {'total':self.one('SELECT COUNT(*) n FROM requests WHERE user_id=?', (uid,))['n'],
-                'items':self.all('SELECT r.model,r.status,r.duration,r.first_token_seconds,r.input_tokens,r.output_tokens,r.created,r.account_id,r.generation,a.label account_label FROM requests r LEFT JOIN accounts a ON a.id=r.account_id AND a.user_id=r.user_id WHERE r.user_id=? ORDER BY r.id DESC LIMIT ? OFFSET ?', (uid, limit, offset))}
+        where = 'r.user_id=?' + (' AND '+self.RECORD_FILTERS[status] if status in self.RECORD_FILTERS else '')
+        return {'total':self.one(f'SELECT COUNT(*) n FROM requests r WHERE {where}', (uid,))['n'],
+                'items':self.all(f'SELECT r.model,r.status,r.duration,r.first_token_seconds,r.input_tokens,r.output_tokens,r.created,r.account_id,r.generation,a.label account_label FROM requests r LEFT JOIN accounts a ON a.id=r.account_id AND a.user_id=r.user_id WHERE {where} ORDER BY r.id DESC LIMIT ? OFFSET ?', (uid, limit, offset))}
+
+    def record_summary(self, uid, since):
+        """Headline numbers for the records page (generation requests only)."""
+        r = self.one('SELECT COUNT(*) n, COALESCE(SUM(status<400),0) ok, COALESCE(SUM(status=429),0) limited, '
+                     'COALESCE(SUM(status=499),0) cancelled, COALESCE(SUM(status>=400 AND status NOT IN (429,499)),0) failed, '
+                     'AVG(CASE WHEN status<400 THEN first_token_seconds END) ttft, AVG(CASE WHEN status<400 THEN duration END) duration, '
+                     'COALESCE(SUM(input_tokens),0) input_tokens, COALESCE(SUM(output_tokens),0) output_tokens, '
+                     'COALESCE(SUM(input_tokens IS NOT NULL OR output_tokens IS NOT NULL),0) metered '
+                     'FROM requests WHERE user_id=? AND created>=? AND (generation=1 OR (generation IS NULL AND model<>\'\'))', (uid, since))
+        counted = r['n'] - r['cancelled']
+        r['success_rate'] = round(r['ok']/counted*100, 1) if counted > 0 else None
+        for k in ('ttft', 'duration'):
+            r[k] = round(r[k], 2) if r[k] is not None else None
+        return r
 
     def create_key(self, uid, label):
         with self.lock:

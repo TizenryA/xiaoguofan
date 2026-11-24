@@ -10,7 +10,7 @@ def test_subpath_deployment_preserves_host_origin_csrf_and_routes(tmp_path):
     with TestClient(app,base_url='https://aistudio.tizenty.xyz') as c:
         r=c.get('/lite')
         assert r.status_code==200
-        assert re.search(r'href="/lite/static/style\.css\?v=[0-9a-f]{12}"', r.text)
+        assert re.search(r'href="/lite/static/lite\.css\?v=[0-9a-f]{12}"', r.text)
         assert 'href="/guanlimanage"' in r.text
         a=c.get('/guanlimanage')
         assert a.status_code==200

@@ -36,6 +36,7 @@ class FakeEngine:
         self.quota = {}             # account -> remaining successful generations before 429
         self.seen = []              # (path, scope list, serving account)
         self.imports = []
+        self.cooldowns = []         # [{'account_id','model_id','until' (RFC3339),'reason'}]
         self.deletes = []
         self.first_token_delay = 0.0
         self.chunk_delay = 0.0
@@ -139,6 +140,11 @@ class FakeEngine:
         def accounts(request: Request):
             assert admin(request)
             return {'accounts': list(engine.accounts.values())}
+
+        @app.get('/api/cooldowns')
+        def cooldowns(request: Request):
+            assert admin(request)
+            return {'cooldowns': engine.cooldowns}
 
         @app.delete('/api/accounts/{aid}')
         def delete(aid: str, request: Request):
