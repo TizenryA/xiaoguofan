@@ -308,6 +308,11 @@ class EngineClient:
             return 'error', TERMS_REQUIRED
         if '登录邮箱与账户不一致' in message:
             return 'error', '登录会话与所填 Google 邮箱不一致，请重新导出'
+        if '不匹配' in message:
+            return 'error', '登录会话与所选 Google 账号不匹配，请重新导出'
+        if any(k in message for k in ('未登录', '已失效', '账号列表为空', '已退出')):
+            # The engine reports dead Google sessions as 502; they are not worth retrying.
+            return 'error', 'Google 登录已失效，请重新登录后导入'
         log.warning('engine import returned %s: %s', r.status_code, re.sub(r'\S+@\S+', '<email>', message)[:200])
         if r.status_code in (400, 401, 403, 422):
             return 'error', 'Google 登录状态无效或已过期，请重新登录后导入'

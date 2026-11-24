@@ -302,6 +302,7 @@ def test_transient_import_failure_retries_but_bad_credentials_wait(tmp_path, fak
     app, s, alice, bob, c = portal(tmp_path, fake)
     add(s, alice, 'flaky@gmail.com')
     add(s, alice, 'expired@gmail.com')
+    add(s, alice, 'loggedout@gmail.com')
     fake.flaky.add('flaky@gmail.com')
     asyncio.run(app.state.engine.sync())
     rows = {r['engine_id']: r for r in s.all('SELECT engine_id,state,message FROM engine_accounts')}
@@ -311,3 +312,4 @@ def test_transient_import_failure_retries_but_bad_credentials_wait(tmp_path, fak
     assert 'flaky@gmail.com' in fake.accounts
     assert s.one("SELECT state FROM engine_accounts WHERE engine_id='flaky@gmail.com'")['state'] != 'error'
     assert fake.imports.count('expired@gmail.com') == imports.count('expired@gmail.com')  # not hammered
+    assert rows['loggedout@gmail.com']['message'] == 'Google 登录已失效，请重新登录后导入'  # engine 502, but not transient

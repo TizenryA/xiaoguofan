@@ -133,6 +133,8 @@ class FakeEngine:
             if label in engine.flaky:
                 engine.flaky.discard(label)
                 return JSONResponse({'error': {'message': 'upstream busy'}}, 503)
+            if 'loggedout' in label:
+                return JSONResponse({'error': {'message': 'Cookie 未登录 AI Studio 或已失效'}}, 502)
             if 'expired' in label:
                 return JSONResponse({'error': {'message': '认证状态无法用于 AI Studio'}}, 422)
             engine.imports.append(label)
