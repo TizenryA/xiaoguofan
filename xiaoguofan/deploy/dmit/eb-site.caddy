@@ -1,0 +1,65 @@
+# DMIT EB（69.63.193.127）上已经有一个 Caddy（Raven 的 fastapi.tizenry.xyz 线路）占着 80/443。
+# 不要替换它的 Caddyfile：把这一段追加到 /etc/caddy/Caddyfile 末尾，caddy validate 后 systemctl reload caddy（平滑重载，原站点不断）。
+# 值已写死，不需要 env；日志走 journal（该单元 ProtectSystem=strict，不能写 /var/log/caddy）。
+# 生产 Caddy 的公开根证书 root.crt（不是 root.key）放到 /etc/caddy/xiaoguofan-origin-root.crt（644）。
+xiaoguofanapi.tizenty.xyz {
+	# 只压缩网页静态资源；不压缩 text/event-stream
+	encode gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type application/javascript*
+		}
+	}
+
+	request_body {
+		max_size 64MB
+	}
+
+	@api path /v1 /v1/* /v1beta /v1beta/*
+	handle @api {
+		rewrite * /lite{uri}
+		reverse_proxy 156.9.67.181:443 {
+		header_up Host aistudio.tizenty.xyz
+		# Caddy 默认会追加 X-Forwarded-For；真实访客 IP 交给生产 Caddy（生产侧需把 DMIT 列入 trusted_proxies，见部署文档）
+		header_up X-Real-IP {remote_host}
+
+		flush_interval -1
+
+		transport http {
+			tls
+			tls_server_name aistudio.tizenty.xyz
+			tls_trust_pool file /etc/caddy/xiaoguofan-origin-root.crt
+			dial_timeout 10s
+			response_header_timeout 45m
+			read_timeout 0
+			write_timeout 0
+			keepalive 5m
+			keepalive_idle_conns 64
+			versions 1.1 2
+		}
+
+		# 生产不可达时快速给出明确错误，不重试生成请求（避免重复扣用量）
+		lb_try_duration 0
+		}
+	}
+	handle {
+		redir https://aistudio.tizenty.xyz/lite 302
+	}
+
+	header {
+		-Server
+	}
+
+	log {
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>X-Goog-Api-Key delete
+				request>headers>X-Api-Key delete
+			}
+		}
+	}
+}

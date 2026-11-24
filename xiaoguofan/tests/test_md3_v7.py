@@ -13,8 +13,15 @@ class Page(HTMLParser):
 def test_md3_navigation_avatar_and_guide():
     html=(Path(__file__).parents[1]/'portal/static/lite.html').read_text()
     p=Page();p.feed(html)
-    assert p.tabs[:3]==['quota','records','upload']
+    assert p.tabs==['home','records','accounts','access']
     assert 'avatar-button' in p.ids and 'profile-menu' in p.ids
     assert p.ids['anti-truncation']['role']=='switch'
     assert 'extension-guide' in p.ids
     assert all(n in html for n in ['SAPISID','__Secure-1PAPISID','__Secure-3PAPISID','猫娘图标.webp'])
+
+
+def test_user_page_has_no_internal_jargon():
+    root=Path(__file__).parents[1]/'portal/static'
+    text=''.join((root/n).read_text() for n in ['lite.html','lite.js','load.js'])
+    for word in ['账号池','worker','冷启动','Playground','动态用户池','预算回收','实时负载','/api/pool/stop']:
+        assert word not in text, word

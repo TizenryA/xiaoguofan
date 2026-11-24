@@ -94,10 +94,49 @@ func contextAccount(ctx context.Context) string {
 	return accountID
 }
 
-// ContextWithSelectionScope 返回带有 source 中所用 API key 与指定账户的 ctx，供跨请求的操作沿用发起请求的选号范围
+// accountScopeContextKey 是请求上下文中可信账户范围的键
+type accountScopeContextKey struct{}
+
+// ContextWithAccountScope 返回只允许使用 accountIDs 中账户的上下文；空集合表示本次请求没有任何可用账户。
+// 共享引擎由门户按用户传入其自有账户，账户池在任何选号路径上都只会在该集合内选号。
+func ContextWithAccountScope(ctx context.Context, accountIDs []string) context.Context {
+	scope := make([]string, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID = strings.TrimSpace(accountID); accountID != "" && !slices.Contains(scope, accountID) {
+			scope = append(scope, accountID)
+		}
+	}
+	return context.WithValue(ctx, accountScopeContextKey{}, scope)
+}
+
+// ContextAccountScope 返回请求上下文中的可信账户范围，ok 为 false 表示未设置范围
+func ContextAccountScope(ctx context.Context) (scope []string, ok bool) {
+	scope, ok = ctx.Value(accountScopeContextKey{}).([]string)
+	return slices.Clone(scope), ok
+}
+
+// servingAccountReporterKey 是请求上下文中上报实际服务账户的回调的键
+type servingAccountReporterKey struct{}
+
+// ContextWithServingAccountReporter 返回在请求取得账户租约时回调 report 的上下文，换号时以最后一次为准
+func ContextWithServingAccountReporter(ctx context.Context, report func(accountID string)) context.Context {
+	return context.WithValue(ctx, servingAccountReporterKey{}, report)
+}
+
+// ReportServingAccount 把本次请求取得租约的账户告知上下文中的回调，没有回调时不做任何事
+func ReportServingAccount(ctx context.Context, accountID string) {
+	if report, ok := ctx.Value(servingAccountReporterKey{}).(func(string)); ok && report != nil {
+		report(accountID)
+	}
+}
+
+// ContextWithSelectionScope 返回带有 source 中所用 API key、指定账户与可信账户范围的 ctx，供跨请求的操作沿用发起请求的选号范围
 func ContextWithSelectionScope(ctx, source context.Context) context.Context {
 	if key, ok := source.Value(apiKeyContextKey{}).(string); ok {
 		ctx = ContextWithAPIKey(ctx, key)
+	}
+	if scope, ok := ContextAccountScope(source); ok {
+		ctx = ContextWithAccountScope(ctx, scope)
 	}
 	if accountID := contextAccount(source); accountID != "" {
 		ctx = ContextWithAccount(ctx, accountID)
@@ -129,13 +168,17 @@ func (p *AccountPool) ScopedSelection(ctx context.Context, selection AccountSele
 	if modelBound && selection.AccountID == "" && selection.ResourceID == "" {
 		selection.AllowedAccountIDs = narrowedAccounts(selection.AllowedAccountIDs, modelScope)
 	}
+	// 可信账户范围对指定账户与资源所有者同样生效：selectionIndicesLocked 会拒绝范围外的账户
+	if scope, ok := ContextAccountScope(ctx); ok {
+		selection.AllowedAccountIDs = narrowedAccounts(selection.AllowedAccountIDs, scope)
+	}
 	return selection
 }
 
 // narrowedAccounts 返回 allowed 中属于 scope 的账户，allowed 为 nil 时返回 scope
 func narrowedAccounts(allowed []string, scope []string) []string {
 	if allowed == nil {
-		return scope
+		return slices.Clone(scope)
 	}
 	return slices.DeleteFunc(slices.Clone(allowed), func(id string) bool { return !slices.Contains(scope, id) })
 }

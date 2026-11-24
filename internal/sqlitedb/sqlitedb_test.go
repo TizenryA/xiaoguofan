@@ -11,6 +11,9 @@ import (
 
 // TestOpenAppliesSchema 验证已有库打开后与建表语句一致：补上缺少的列，删除未定义的表与索引，Reclaim 后空闲页交还文件系统
 func TestOpenAppliesSchema(t *testing.T) {
+	if !Available {
+		t.Skip("SQLite 需要 cgo")
+	}
 	path := filepath.Join(t.TempDir(), "old.db")
 	old, err := sql.Open("sqlite3", "file:"+filepath.ToSlash(path))
 	if err != nil {

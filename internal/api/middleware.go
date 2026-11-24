@@ -547,6 +547,100 @@ func accountContextMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// AccountScopeHeader 是门户传入本次请求可信账户范围（逗号分隔的引擎账户 ID）的请求头
+const AccountScopeHeader = "X-Xiaoguofan-Account-Scope"
+
+// accountScopeMiddleware 把门户传入的可信账户范围放进请求上下文，账户池只在其中选号；
+// 只在鉴权之后生效，因此只有持有引擎 API key 的门户能设置它。required 为真时缺少该请求头的请求直接拒绝，
+// 避免共享引擎被不带范围的请求用到其他用户的账户。
+func accountScopeMiddleware(required bool, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		values, present := r.Header[http.CanonicalHeaderKey(AccountScopeHeader)]
+		if !present {
+			if required {
+				writeOpenAIError(w, http.StatusForbidden, "account_scope_required", "request is missing the trusted account scope")
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		var scope []string
+		for _, value := range values {
+			for accountID := range strings.SplitSeq(value, ",") {
+				if accountID = strings.TrimSpace(accountID); accountID != "" {
+					scope = append(scope, accountID)
+				}
+			}
+		}
+		r.Header.Del(AccountScopeHeader)
+		reporting := &servingAccountWriter{ResponseWriter: w}
+		ctx := aistudio.ContextWithAccountScope(r.Context(), scope)
+		ctx = aistudio.ContextWithServingAccountReporter(ctx, reporting.report)
+		next.ServeHTTP(reporting, r.WithContext(ctx))
+	})
+}
+
+// ServingAccountHeader 是共享引擎告知门户本次实际使用的账户的响应头，只在响应头尚未写出时附带
+const ServingAccountHeader = "X-Xiaoguofan-Account"
+
+// servingAccountWriter 在写出响应头时附带最后一次取得租约的账户，供门户记账；保活等提前写出的响应不附带
+type servingAccountWriter struct {
+	http.ResponseWriter
+	mu      sync.Mutex
+	account string
+	wrote   bool
+}
+
+func (w *servingAccountWriter) report(accountID string) {
+	w.mu.Lock()
+	w.account = accountID
+	w.mu.Unlock()
+}
+
+func (w *servingAccountWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	if !w.wrote {
+		w.wrote = true
+		if w.account != "" {
+			w.ResponseWriter.Header().Set(ServingAccountHeader, w.account)
+		}
+	}
+	w.mu.Unlock()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *servingAccountWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	wrote := w.wrote
+	w.mu.Unlock()
+	if !wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+// Flush 让流式响应保持逐块刷新
+func (w *servingAccountWriter) Flush() {
+	w.mu.Lock()
+	wrote := w.wrote
+	w.mu.Unlock()
+	if !wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// Unwrap 供 http.ResponseController 找到底层连接
+func (w *servingAccountWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *servingAccountWriter) setError(message string) {
+	setAccessLogResponseError(w.ResponseWriter, message)
+}
+
 // apiKeyContextMiddleware 把请求所用的已配置 API key 放进请求上下文，供账户池按 key 绑定的账户选号
 func apiKeyContextMiddleware(configuredKeys string, next http.Handler) http.Handler {
 	keys := apiKeys(configuredKeys)

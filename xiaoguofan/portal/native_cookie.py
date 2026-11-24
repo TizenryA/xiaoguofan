@@ -125,3 +125,87 @@ async def verify_native(raw,accounts_raw='',*,transport=None):
     state={'cookies':cookies,'origins':[], 'xiaoguofan_cookie_source':{'kind':'native_header','attributes_known':False,'scope_policy':'google-auth-allowlist-v2','expiry_policy':'unknown-session-until-upstream-rejects','verified_at':time.time()}}
     if verification:state['xiaoguofan_identity_verification']=verification
     return {'storage_state':state,'locale':'en-US','timezone':'America/Los_Angeles'},rows
+
+
+# ---- one paste box, several formats -------------------------------------------
+# Accepts what people actually have in hand: a browser Cookie header, a Cookie-Editor /
+# EditThisCookie JSON export, our own export file (storage_state), or Netscape cookies.txt.
+# Everything is reduced to name=value pairs for the Google auth allowlist and then goes
+# through verify_native, so Google (not the file) decides whose account it is.
+PASTE_KINDS={'header':'浏览器复制的 Cookie','json':'Cookie 导出 JSON（Cookie-Editor 等扩展）','storage':'小锅饭导出文件 / 扩展导出','netscape':'cookies.txt 文件'}
+MAIN_DOMAINS={'google.com','aistudio.google.com'}
+EXTRA_DOMAINS={'accounts.google.com','myaccount.google.com'}
+
+
+def _bucket(rows,now):
+    main,extra={},{}
+    for row in rows:
+        name,value,domain,path,expires=row
+        domain=str(domain or '').lstrip('.').lower()
+        if path not in ('/','',None):continue
+        if isinstance(expires,(int,float)) and 0<expires<now:continue
+        target=main if domain in MAIN_DOMAINS else extra if domain in EXTRA_DOMAINS else None
+        if target is None or not isinstance(name,str) or not isinstance(value,str) or not value:continue
+        if target.get(name,value)!=value:
+            raise HTTPException(422,'同一个登录项出现了两个不同的值（可能混进了两个账号），请在只登录一个 Google 账号的浏览器里重新导出')
+        target[name]=value
+    return main,extra
+
+
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError,ValueError):
+        return None
+
+
+def normalize_paste(raw,accounts_raw='',now=None):
+    """Return (cookie_header, accounts_header, kind) for verify_native."""
+    import json
+    now=time.time() if now is None else now
+    if not isinstance(raw,str) or not raw.strip():
+        raise HTTPException(422,'没有粘贴内容')
+    text=raw.strip()
+    if text[0] in '[{':
+        try:
+            data=json.loads(text)
+        except ValueError:
+            raise HTTPException(422,'看起来是 JSON，但内容不完整：请把导出的内容全部复制过来') from None
+        kind='json'
+        if isinstance(data,dict):
+            state=data.get('storage_state') if isinstance(data.get('storage_state'),dict) else data
+            data=state.get('cookies')
+            kind='storage'
+        if not isinstance(data,list) or not data or len(data)>2000 or not all(isinstance(c,dict) for c in data):
+            raise HTTPException(422,'JSON 里没有找到 Cookie 列表，请用 Cookie-Editor 的“导出 → JSON”或小锅饭导出脚本')
+        rows=[]
+        for c in data:
+            if c.get('partitionKey'):continue
+            expires=_number(c.get('expirationDate',c.get('expires')))
+            if c.get('session') is True:expires=None
+            rows.append((c.get('name'),c.get('value'),c.get('domain'),c.get('path','/'),expires))
+        main,extra=_bucket(rows,now)
+    elif '\t' in text or text.startswith('# Netscape'):
+        kind='netscape'
+        rows=[]
+        for line in text.splitlines():
+            line=line.strip()
+            if line.startswith('#HttpOnly_'):line=line[len('#HttpOnly_'):]
+            elif not line or line.startswith('#'):continue
+            parts=line.split('\t')
+            if len(parts)!=7:raise HTTPException(422,'cookies.txt 格式不对：每行应该有 7 列，用 Tab 分隔')
+            rows.append((parts[5],parts[6],parts[0],parts[2],_number(parts[4])))
+        main,extra=_bucket(rows,now)
+    else:
+        return raw,accounts_raw,'header'
+    if not main:
+        raise HTTPException(422,'没有找到 google.com 的登录项：请在打开 AI Studio 的页面里导出，并确认已登录')
+    extra_header=accounts_raw
+    if extra:
+        if accounts_raw:
+            extra=parse_header(accounts_raw)|extra
+        extra_header='; '.join(k+'='+v for k,v in extra.items() if k in ACCOUNTS_NAMES)
+    header='; '.join(k+'='+v for k,v in main.items() if k in GOOGLE_NAMES)
+    if not header:
+        raise HTTPException(422,'缺少 Google 会话关键项（SID、SAPISID 等），请确认已登录后重新导出')
+    return header,extra_header,kind

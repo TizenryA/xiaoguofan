@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import math
 import os
 import re
@@ -22,16 +21,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from starlette.routing import Mount, compile_path
 
-from portal.accounts import normalize_cookie, normalize_email
+from portal import gateway, i18n
+from portal.accounts import account_email, normalize_cookie, normalize_email
 from portal.anti_truncation import PREFIX, augment_models, eligible, inject, normalize, transform_stream
-from portal.channels import split_catalogue, split_model
+from portal.channels import split_model
+from portal.engine import SCOPE_HEADER, SERVING_HEADER, EngineClient, broker_locator
 from portal.oauth import OAuthStates, discord_identity
-from portal.quota import choose_account, reference_quota
-from portal.store import DEFAULTS, Store, digest
+from portal.quota import reference_quota
+from portal.store import DEFAULTS, Alerts, Store, digest
 from portal.usage import UsageMeter
-from portal.workers import BrokerClient
 
-VERSION = '0.9.22'
+VERSION = '1.0.0'
 
 
 class Strict(BaseModel):
@@ -77,7 +77,7 @@ class Import(Label):
 
 
 class NativeVerify(Strict):
-    cookie: str = Field(min_length=1,max_length=65536,repr=False)
+    cookie: str = Field(min_length=1,max_length=400000,repr=False)
     accounts_cookie: str = Field(default='',max_length=65536,repr=False)
     consent: StrictBool
 
@@ -100,8 +100,12 @@ class Settings(Strict):
     requests_per_minute: int = Field(default=20, ge=1, le=120)
     max_accounts: int = Field(default=5, ge=1, le=20)
     max_keys: int = Field(default=10, ge=1, le=30)
+    # Legacy (per-user container era); kept so old settings still validate, ignored since 1.0.
     max_workers: int = Field(default=6, ge=1, le=100)
     global_concurrency: int = Field(default=3, ge=1, le=100)
+    engine_concurrency: int = Field(default=48, ge=1, le=512)
+    user_concurrency: int = Field(default=4, ge=1, le=32)
+    rate_limit_enabled: bool = False
 
     @field_validator('discord_allowlist')
     @classmethod
@@ -143,7 +147,26 @@ def validate_account(p):
         raise HTTPException(422, '语言或时区格式无效')
 
 
-def create_app(directory=None, admin_password=None, origin=None, broker=None):
+class BrokerLoad:
+    """Read-only resource snapshot from the root broker (admin dashboard)."""
+
+    def __init__(self, socket):
+        self.socket = socket
+
+    async def load(self):
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=self.socket), base_url='http://broker', timeout=5) as c:
+            r = await c.post('/load', json={})
+            r.raise_for_status()
+            return r.json()
+
+    async def restart(self):
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=self.socket), base_url='http://broker', timeout=330) as c:
+            r = await c.post('/engine/restart', json={})
+            r.raise_for_status()
+            return r.json()
+
+
+def create_app(directory=None, admin_password=None, origin=None, broker=None, engine=None):
     directory = Path(directory or os.environ.get('PORTAL_DATA', '/data/aistudio-portal'))
     origin = (origin or os.environ.get('PORTAL_ORIGIN', 'http://127.0.0.1:8088')).rstrip('/')
     parsed_origin = urlsplit(origin)
@@ -157,9 +180,26 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     if not password or len(password) < 16:
         raise RuntimeError('管理员密码必须通过受限配置提供，至少 16 位')
     store = Store(directory, password)
-    workers = broker or BrokerClient(os.environ.get('PORTAL_BROKER', '/run/aistudio-portal/broker.sock'))
+    alerts = Alerts(store)
+    broker_socket = os.environ.get('PORTAL_BROKER', '/run/aistudio-portal/broker.sock')
+    broker = broker or BrokerLoad(broker_socket)
+    engine = (engine or EngineClient(broker_locator(broker_socket))).attach(store, alerts)
+    trusted_proxies = gateway.parse_networks(os.environ.get('PORTAL_TRUSTED_PROXIES', ''))
+    # Second public entry (e.g. a relay closer to mainland users) mapping to this portal's root.
+    # Empty string hides it; must be a bare https origin.
+    optimized_origin = os.environ.get('PORTAL_OPTIMIZED_ORIGIN', 'https://xiaoguofanapi.tizenty.xyz').strip().rstrip('/')
+    if optimized_origin and not re.fullmatch(r'https://[A-Za-z0-9.-]+(:[0-9]{1,5})?', optimized_origin):
+        raise RuntimeError('PORTAL_OPTIMIZED_ORIGIN must be an https origin without a path')
+    routes = [{'id': 'original', 'name': '原始线路', 'badge': '', 'root': origin, 'base': origin+'/v1',
+               'note': '直连本站服务器。海外网络用这个；优化线路连不上时也可以换回来。'}]
+    if optimized_origin and optimized_origin != host_origin:
+        routes.insert(0, {'id': 'optimized', 'name': '优化线路', 'badge': '国内推荐', 'root': optimized_origin,
+                          'base': optimized_origin+'/v1',
+                          'note': '经洛杉矶中转，国内一般更快更稳。密钥、账号、记录和原始线路完全通用，随时可以换。'})
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
+    app.state.engine = engine
+    app.state.alerts = alerts
     native_slots=asyncio.Semaphore(4)
 
     from fastapi.exceptions import RequestValidationError
@@ -171,6 +211,13 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         from fastapi.exception_handlers import request_validation_exception_handler
         return await request_validation_exception_handler(request,exc)
 
+    import hashlib
+    asset_versions = {}
+    static_root = Path(__file__).parent/'static'
+    if static_root.exists():
+        for asset in static_root.rglob('*'):
+            if asset.is_file():
+                asset_versions[asset.relative_to(static_root).as_posix()] = hashlib.sha256(asset.read_bytes()).hexdigest()[:12]
     states = OAuthStates()
     limits = defaultdict(deque)
     userlocks = defaultdict(asyncio.Lock)
@@ -182,21 +229,18 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             raise HTTPException(409,'账号操作进行中，请稍后重试；不要重复点击检查')
         async with lock:
             yield
-    from portal.scheduling import FairQueue, BodyBudget, BoundedBodyMiddleware
-    def capacity():
-        settings = store.settings()
-        return min(settings['global_concurrency'], settings['max_workers'])
-    from portal.model_cache import ModelCache
-    model_cache = ModelCache(store)
-    app.state.model_cache = model_cache
-    scheduler = FairQueue(capacity, userlocks)
+    from portal.scheduling import Admission, BodyBudget, BoundedBodyMiddleware
+    scheduler = Admission(lambda: store.settings()['engine_concurrency'], lambda: store.settings()['user_concurrency'])
     budget = BodyBudget()
     app.state.scheduler = scheduler
     app.state.body_budget = budget
     @asynccontextmanager
     async def lifespan(app):
-        yield
-        await model_cache.close()
+        await engine.start()
+        try:
+            yield
+        finally:
+            await engine.close()
     app.router.lifespan_context = lifespan
     secure = origin.startswith('https://')
     redirect_uri = origin + '/auth/discord/callback'
@@ -214,16 +258,31 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                 if not limits[k] or limits[k][-1] < now-600:
                     limits.pop(k, None)
 
-    def verify_access(user):
+    def client_ip(request):
+        return gateway.client_ip(request.client.host if request.client else '', request.headers, trusted_proxies)
+
+    def verify_access(user, api=False):
         if not user or user['disabled']:
             raise HTTPException(401, '请先登录')
         if user['role'] != 'admin':
             s = store.settings()
             if not s['public_login']:
                 raise HTTPException(403, '公共访问尚未开放')
-            if s['block_enabled'] and (user['policy'] != s['policy'] or time.time()-user['verified'] > s['verification_hours']*3600):
+            # API keys keep working while the periodic Discord re-check is pending;
+            # the re-check only gates the web pages. Admins disable users explicitly.
+            if not api and s['block_enabled'] and (user['policy'] != s['policy'] or time.time()-user['verified'] > s['verification_hours']*3600):
                 raise HTTPException(403, '本站 Discord 权限验证已到期或规则已更新，请重新登录；Google 账号和用量记录不受影响')
+            # An admin removing someone from the allowlist is an explicit revocation, not a
+            # periodic re-check, so it also stops that person's keys.
+            if api and s['block_enabled'] and allowlist_revoked(user, s):
+                raise HTTPException(403, '本站访问权限已被管理员收回')
         return user
+
+    def allowlist_revoked(user, s):
+        discord_id = dict(user).get('discord_id')
+        if not discord_id or discord_id in s['discord_allowlist']:
+            return False
+        return bool(store.one("SELECT 1 x FROM audit WHERE actor=? AND action='discord_allowlist_login' LIMIT 1", (user['id'],)))
 
     def auth(request, admin=False, csrf=False):
         user = verify_access(store.session(request.cookies.get('portal_session', '')))
@@ -240,8 +299,15 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             if request.headers.get('origin') and request.headers['origin'].rstrip('/') != host_origin:
                 return JSONResponse({'detail':'来源验证失败'}, 403)
         response = await call_next(request)
+        static_asset = request.url.path.startswith(prefix+'/static/') and response.status_code == 200
+        if static_asset and request.query_params.get('v') and request.query_params['v'] == asset_versions.get(request.url.path[len(prefix)+8:]):
+            cache = 'public, max-age=31536000, immutable'
+        elif static_asset:
+            cache = 'public, max-age=3600'
+        else:
+            cache = response.headers.get('Cache-Control') if request.url.path.startswith(('/v1/', '/v1beta/', prefix+'/v1/', prefix+'/v1beta/')) and response.headers.get('Cache-Control') else 'no-store'
         response.headers.update({'X-Content-Type-Options':'nosniff', 'Referrer-Policy':'no-referrer',
-                                 'X-Frame-Options':'DENY', 'Cache-Control':'no-store',
+                                 'X-Frame-Options':'DENY', 'Cache-Control':cache,
                                  'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://cdn.discordapp.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"})
         return response
 
@@ -249,7 +315,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     async def value_error(request, exc):
         return JSONResponse({'detail':str(exc)[:150]}, 400)
 
-    def error_page(status, detail, denied=False):
+    def error_page(status, detail, denied=False, lang='zh'):
         template = (Path(__file__).parent/'static/access-error.html').read_text()
         values = {
             'BASE': prefix, 'HOME': prefix or '/', 'VERSION': VERSION,
@@ -266,6 +332,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             template = template.replace('<h1 id="error-title">你的账号脏脏的，不允许进去喵</h1>', '<h1 id="error-title"><span>你的账号脏脏的，</span><span>不允许进去喵</span></h1>')
         if not denied:
             template = re.sub(r'<figure\b.*?</figure>', '', template, flags=re.DOTALL)
+        if lang == 'en':
+            template = i18n.translate_html(template)
         response = HTMLResponse(template, status_code=status)
         response.delete_cookie('oauth_browser', path=cookie_path)
         return response
@@ -273,12 +341,12 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     @app.exception_handler(HTTPException)
     async def browser_auth_error(request, exc):
         if request.url.path.startswith(prefix+'/auth/') and 'text/html' in request.headers.get('accept',''):
-            return error_page(exc.status_code, exc.detail, exc.status_code == 403 and exc.detail == '当前账号不符合本站访问规则')
+            return error_page(exc.status_code, exc.detail, exc.status_code == 403 and exc.detail == '当前账号不符合本站访问规则', i18n.lang_of(request.headers, request.cookies))
         return await http_exception_handler(request, exc)
 
     @app.get('/access-denied', include_in_schema=False)
-    def denied_preview():
-        return error_page(403, '当前账号不符合本站访问规则', True)
+    def denied_preview(request: Request):
+        return error_page(403, '当前账号不符合本站访问规则', True, i18n.lang_of(request.headers, request.cookies))
 
     @app.get('/health')
     def health():
@@ -288,11 +356,11 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     def config():
         s = store.settings()
         return {'site_name':s['site_name'], 'version':VERSION, 'discord_ready':bool(s['public_login'] and s['discord_client_id'] and s['discord_client_secret']),
-                'api_base':origin+'/v1', 'callback_url':redirect_uri}
+                'api_base':origin+'/v1', 'routes':routes, 'callback_url':redirect_uri}
 
     @app.post('/api/auth/admin')
     def admin_login(payload: Login, request: Request):
-        rate('admin:'+request.client.host, 8, 300)
+        rate('admin:'+client_ip(request), 8, 300)
         hashed = store.one("SELECT value FROM metadata WHERE key='admin_hash'")['value']
         try:
             PasswordHasher().verify(hashed, payload.password)
@@ -324,7 +392,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
 
     @app.get('/auth/discord')
     def discord_start(request: Request):
-        rate('oauth:'+request.client.host, 20)
+        rate('oauth:'+client_ip(request), 20)
         s = store.settings()
         if not secure or not s['public_login'] or not s['discord_client_id'] or not s['discord_client_secret']:
             raise HTTPException(503, 'Discord 登录未配置或尚未开放')
@@ -403,6 +471,60 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         from portal.admin_stats import admin_statistics
         return admin_statistics(store,days=days,limit=limit,offset=offset,query=q.strip())
 
+    @app.get('/api/admin/live')
+    async def admin_live(request: Request):
+        auth(request, admin=True)
+        from portal import admin_live as live
+        try:
+            load = await asyncio.wait_for(broker.load(), 5)
+        except Exception:
+            load = None
+        return JSONResponse({'engine': dict(engine.health), 'admission': scheduler.snapshot(),
+                             'load': load, 'accounts': live.account_states(store), 'traffic': live.recent_traffic(store),
+                             'alerts_open': len(alerts.open()), 'timestamp': time.time()},
+                            headers={'Cache-Control': 'no-store'})
+
+    @app.get('/api/admin/health-matrix')
+    def admin_health_matrix(request: Request, hours: int = Query(24, ge=1, le=720), models: int = Query(8, ge=1, le=20), used: bool = False):
+        auth(request, admin=True)
+        from portal.admin_live import health_matrix
+        return health_matrix(store, hours=hours, max_models=models, only_used=used)
+
+    @app.get('/api/admin/alerts')
+    def admin_alerts(request: Request):
+        auth(request, admin=True)
+        return {'open': alerts.open(), 'recent': alerts.recent(50)}
+
+    @app.post('/api/admin/alerts/{alert_id}/dismiss')
+    def admin_alert_dismiss(alert_id: int, request: Request):
+        auth(request, admin=True, csrf=True)
+        if not alerts.dismiss(alert_id):
+            raise HTTPException(404, '告警不存在或已处理')
+        store.audit('admin', 'alert_dismissed')
+        return {'ok': True}
+
+    @app.post('/api/admin/engine/sync')
+    async def admin_engine_sync(request: Request):
+        auth(request, admin=True, csrf=True)
+        try:
+            await asyncio.wait_for(engine.sync(force=True), 120)
+            await asyncio.wait_for(engine.refresh_status(), 30)
+        except Exception as e:
+            raise HTTPException(502, '同步失败：'+(str(e)[:200] or type(e).__name__)) from None
+        store.audit('admin', 'engine_synced')
+        return {'ok': True, 'message': '已重新同步全部账号'}
+
+    @app.post('/api/admin/engine/restart')
+    async def admin_engine_restart(request: Request):
+        auth(request, admin=True, csrf=True)
+        try:
+            await broker.restart()
+        except Exception as e:
+            raise HTTPException(502, '重启失败：'+(str(e)[:200] or type(e).__name__)) from None
+        engine.request_sync()
+        store.audit('admin', 'engine_restarted')
+        return {'ok': True, 'message': '生成服务已重启，账号正在重新载入'}
+
     @app.get('/api/admin/users')
     def users(request: Request):
         auth(request, admin=True)
@@ -414,15 +536,21 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         if uid == 'admin' or not store.user(uid):
             raise HTTPException(404)
         async with account_operation(uid):
-            await workers.stop(uid)
             store.run('UPDATE users SET disabled=1-disabled WHERE id=?', (uid,))
             store.run('DELETE FROM sessions WHERE user_id=?', (uid,))
+        engine.request_sync()
         store.audit('admin', 'user_access_toggled')
         return {'ok':True}
 
     @app.get('/api/accounts')
     def accounts(request: Request):
-        return store.accounts(auth(request)['id'])
+        uid = auth(request)['id']
+        view = engine.account_view(uid)
+        return [a | {'live': view.get(a['id'], {'state':'pending','text':'正在准备，稍等片刻','tier':'','plan_tier':{'tier':'unknown','label':'未识别','source':''}})} for a in store.accounts(uid)]
+
+    def ensure_unowned(uid, email):
+        if email and store.email_owner(email, exclude_uid=uid):
+            raise HTTPException(409, '这个 Google 账号已被其他用户导入；每个账号只能属于一个人，请换一个账号')
 
     @app.post('/api/accounts/import', status_code=201)
     async def account_import(payload: Import, request: Request):
@@ -433,23 +561,25 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         from portal.accounts import validate_selected_identity
         validate_selected_identity(p)
         async with account_operation(u['id']):
-            await workers.stop(u['id'])
+            ensure_unowned(u['id'], account_email(p))
             try:
                 aid = store.add_account(u['id'], payload.label, p)
             except ValueError as exc:
                 raise HTTPException(422,str(exc)) from None
-        return {'id':aid, 'label':payload.label, 'status':'待首次调用验证'}
+        engine.request_sync()
+        return {'id':aid, 'label':payload.label, 'status':'已保存，正在载入'}
 
     @app.post('/api/accounts/native/verify')
     async def native_verify(payload: NativeVerify, request: Request):
         u=auth(request,csrf=True)
         rate('native:'+u['id'],3)
         if not payload.consent:raise HTTPException(422,'请先确认本人授权')
-        from portal.native_cookie import verify_native
+        from portal.native_cookie import PASTE_KINDS, normalize_paste, verify_native
+        cookie,accounts_cookie,kind=normalize_paste(payload.cookie,payload.accounts_cookie)
         if native_slots.locked():raise HTTPException(429,'身份查询繁忙，请稍后重试')
         async with native_slots:
             try:
-                p,rows=await asyncio.wait_for(verify_native(payload.cookie,payload.accounts_cookie),45)
+                p,rows=await asyncio.wait_for(verify_native(cookie,accounts_cookie),45)
             except TimeoutError:
                 raise HTTPException(504,'Google 身份查询超时，未保存；请稍后重试') from None
         # Recheck access after network I/O before issuing a session-bound ticket.
@@ -461,7 +591,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                 raise HTTPException(503,'待确认数量已满，请稍后重试')
             store.run('INSERT INTO native_pending VALUES (?,?,?,?,?)',
                       (digest(ticket),u['id'],digest(u['csrf']),time.time()+300,store.encrypt({'payload':p,'rows':rows})))
-        return {'ticket':ticket,'expires_in':300,'accounts':[{'email':r['email'],'authuser':r['authuser']} for r in rows],
+        return {'ticket':ticket,'expires_in':300,'source':PASTE_KINDS[kind],'accounts':[{'email':r['email'],'authuser':r['authuser']} for r in rows],
                 'message':('Google 默认账号页身份已核对（账号列表接口为空，仅支持默认账号）；未验证模型权限。选择后确认保存。' if p['storage_state'].get('xiaoguofan_identity_verification') else 'Google 身份已核对；未验证 AI Studio 模型权限。选择账号后确认保存。')}
 
     @app.post('/api/accounts/native/import',status_code=201)
@@ -481,7 +611,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             validate_account(p)
             from portal.accounts import validate_selected_identity
             validate_selected_identity(p)
-            await workers.stop(u['id'])
+            ensure_unowned(u['id'], account_email(p))
             auth(request,csrf=True)
             if row['expires']<=time.time():raise HTTPException(422,'确认已过期，请重新核对 Cookie')
             # Serialized one-use consumption within the owner lock; no destructive overwrites.
@@ -493,7 +623,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
                 except ValueError as exc:
                     raise HTTPException(422,str(exc)) from None
                 store.run('DELETE FROM native_pending WHERE token=?',(digest(payload.ticket),))
-            return {'id':aid,'label':payload.label,'status':'身份已核对，模型权限待检查'}
+            engine.request_sync()
+            return {'id':aid,'label':payload.label,'status':'身份已核对，正在载入'}
 
     @app.delete('/api/accounts/native/pending')
     def native_cancel(request: Request):
@@ -511,15 +642,16 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             values = payload.model_dump(exclude_none=True)
             if not values:
                 raise HTTPException(422, '未提供修改内容')
-            await workers.stop(u['id'])
             if 'email' in values:
                 data = account['payload'] | {'email':values.pop('email')}
                 from portal.accounts import validate_selected_identity
                 validate_selected_identity(data)
+                ensure_unowned(u['id'], account_email(data))
                 store.run('UPDATE accounts SET payload=? WHERE user_id=? AND id=?', (store.encrypt(data),u['id'],aid))
                 values.update(status='unverified',checked=None,note='邮箱已更新，请重新检查')
             store.update_account(u['id'], aid, values)
             store.audit(u['id'], 'account_updated')
+        engine.request_sync()
         return {'ok':True}
 
     @app.post('/api/accounts/{aid}/check')
@@ -527,21 +659,18 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         u = auth(request, csrf=True)
         rate('check:'+u['id'], 3)
         async with account_operation(u['id']):
-            account = store.account(u['id'], aid)
-            if not account:
+            if not store.account(u['id'], aid):
                 raise HTTPException(404, '账号不存在')
             try:
-                result = await asyncio.wait_for(workers.check(u['id'], account, store.settings()['max_workers']),360)
-            except TimeoutError:
-                result = {'status':'error','models':0,'message':'账号检查超时，请稍后再试；不要连续点击检查'}
-            except HTTPException as exc:
-                message = exc.detail if exc.status_code in (409,422,502,503) else '独立账号池未就绪，请稍后检查重建；无需删除或重导账号'
-                result = {'status':'error', 'models':0, 'message':message}
+                await asyncio.wait_for(engine.sync(force=True), 200)
             except Exception:
-                result = {'status':'error', 'models':0, 'message':'检查未通过：登录失效、网络故障或服务器繁忙，请稍后重试'}
-            store.update_account(u['id'], aid, {'status':result['status'],'checked':time.time(),'note':result['message']})
+                pass
+            live = engine.account_view(u['id']).get(aid, {'state':'pending','text':'正在准备，稍等片刻'})
+            ok = live['state'] in ('ready', 'busy', 'cooldown')
+            status = 'ready' if ok else 'pending' if live['state'] == 'pending' else 'error'
+            store.update_account(u['id'], aid, {'status':status,'checked':time.time(),'note':live['text']})
             store.audit(u['id'], 'account_checked')
-            return result
+            return {'status':status, 'message':live['text'], 'state':live['state']}
 
     @app.delete('/api/accounts/{aid}')
     async def account_delete(aid: str, request: Request):
@@ -549,15 +678,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         async with account_operation(u['id']):
             if not store.account(u['id'], aid):
                 raise HTTPException(404, '账号不存在')
-            await workers.stop(u['id'])
             store.delete_account(u['id'], aid)
-        return {'ok':True}
-
-    @app.post('/api/pool/stop')
-    async def pool_stop(request: Request):
-        u = auth(request, csrf=True)
-        async with account_operation(u['id']):
-            await workers.stop(u['id'])
+        engine.request_sync()
         return {'ok':True}
 
     @app.get('/api/keys')
@@ -593,26 +715,29 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         return {'google_remaining':None, 'google_note':'当前上游未提供可靠的剩余额度，不以调用量推算',
                 'accounts':{'used':len(rows),'enabled':sum(bool(a['enabled']) for a in rows),'limit':s['max_accounts']},
                 'keys':{'used':len(store.keys(u['id'])),'limit':s['max_keys']},
-                'requests_per_minute':s['requests_per_minute'], 'summary':store.stats(u['id'])['summary']} | reference_quota(store,u['id'])
+                'requests_per_minute':s['requests_per_minute'] if s.get('rate_limit_enabled') else None,
+                'concurrency':s['user_concurrency'], 'summary':store.stats(u['id'])['summary']} | reference_quota(store,u['id'])
 
     @app.get('/api/records')
-    def records(request: Request, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000)):
-        return store.records(auth(request)['id'], limit, offset)
+    def records(request: Request, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000),
+                status: Literal['', 'ok', 'limited', 'failed', 'cancelled'] = ''):
+        uid = auth(request)['id']
+        from portal.quota import day_start
+        now = time.time()
+        return store.records(uid, limit, offset, status) | {
+            'summary': {'today': store.record_summary(uid, day_start(now), 3600),
+                        'week': store.record_summary(uid, day_start(now)-6*86400, 86400)}}
 
     @app.get('/api/load')
     async def project_load(request: Request):
-        auth(request)
-        from portal.resources import ProjectResources
-        try:
-            data = await asyncio.wait_for(workers.load(), 3)
-        except Exception:
-            data = ProjectResources('/nonexistent-xiaoguofan-metrics').snapshot()
-            data['pool'] = {'running':None,'active':None,'idle':None,'starting':None,'evictions':None}
-        capacity = min(store.settings()['max_workers'], data['pool'].get('limit', 0))
-        data['pool']['limit'] = capacity
-        data['requests'] = scheduler.snapshot(auth(request)['id'])
-        data['refresh_seconds'] = 3
-        return JSONResponse(data,headers={'Cache-Control':'no-store'})
+        """Short, jargon-free service status for the user home page."""
+        u = auth(request)
+        snap = scheduler.snapshot(u['id'])
+        busy = snap['queued'] > 0
+        return JSONResponse({'ok': engine.health.get('ok') is not False,
+                             'message': '服务正常' if engine.health.get('ok') is not False else '服务暂时不可用，管理员已收到提醒',
+                             'busy': busy, 'mine_running': snap['user_active'], 'mine_waiting': snap['user_queued'],
+                             'refresh_seconds': 5}, headers={'Cache-Control':'no-store'})
 
     @app.get('/api/records.csv')
     def records_csv(request: Request):
@@ -621,16 +746,29 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         u = auth(request)
         data = store.records(u['id'], 10000)['items']
         out = io.StringIO(); writer = csv.writer(out)
-        writer.writerow(['模型','状态','耗时秒','首字耗时秒','输入Token','输出Token','时间UTC','账号','请求类型'])
+        en = i18n.lang_of(request.headers, request.cookies) == 'en'
+        word = i18n.translate if en else (lambda s: s)
+        writer.writerow([word(h) for h in ['模型','状态','耗时秒','首字耗时秒','输入Token','输出Token','时间UTC','账号','请求类型']])
         for r in data:
             model = r['model']
             if model.lstrip().startswith(('=','+','-','@')):
                 model = "'"+model
             writer.writerow([model,r['status'],r['duration'],r['first_token_seconds'],r['input_tokens'],r['output_tokens'],time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime(r['created'])),
-                             ("'" if (r['account_label'] or '').lstrip().startswith(('=','+','-','@')) else '')+(r['account_label'] or ('账号已删除' if r['account_id'] else '历史未归属')),
-                             '生成调用' if r['generation']==1 else '查询 / 其他' if r['generation']==0 else '历史类型未记录'])
+                             ("'" if (r['account_label'] or '').lstrip().startswith(('=','+','-','@')) else '')+(r['account_label'] or word('账号已删除' if r['account_id'] else '历史未归属')),
+                             word('生成调用' if r['generation']==1 else '查询 / 其他' if r['generation']==0 else '历史类型未记录')])
         from fastapi.responses import Response
         return Response('\ufeff'+out.getvalue(), media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename=usage-records.csv'})
+
+    def account_for(uid, engine_id):
+        if not engine_id:
+            return None
+        row = store.one('SELECT account_id FROM engine_accounts WHERE engine_id=? AND user_id=?', (engine_id.lower(), uid))
+        return row['account_id'] if row else None
+
+    def remember_responses(uid, ids):
+        now = time.time()
+        for rid in ids[:20]:
+            store.run('INSERT OR IGNORE INTO response_owners(response_id,user_id,created) VALUES (?,?,?)', (rid, uid, now))
 
     async def proxy(path, request):
         raw = request.headers.get('authorization','')
@@ -638,39 +776,28 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         u = store.key_user(key)
         if not u:
             raise HTTPException(401, 'API Key 无效或已撤销')
-        verify_access(u)
+        verify_access(u, api=True)
+        uid = u['id']
         s = store.settings()
-        if not any(a['enabled'] for a in store.accounts(u['id'])):
-            raise HTTPException(503, '未导入自己的 Google 账号，不会使用其他用户账号')
-        if request.method == 'GET' and path == '/v1/models':
-            uid = u['id']
-            rows = store.all('SELECT id,payload,enabled FROM accounts WHERE user_id=? ORDER BY id', (uid,))
-            fingerprint = digest(json.dumps(rows, sort_keys=True))
-            async def load_catalogue():
-                async with userlocks[uid]:
-                    accounts = [store.account(uid, a['id']) for a in store.accounts(uid) if a['enabled']]
-                    selected = choose_account(accounts, store, uid, '')
-                    pool = await workers.acquire(uid, [selected] if selected else [], store.settings()['max_workers'], channel='')
-                    try:
-                        async with httpx.AsyncClient(timeout=httpx.Timeout(360, connect=30)) as http:
-                            result = await http.get(pool['url']+'/v1/models', headers={'Authorization':'Bearer '+pool['key']})
-                            result.raise_for_status()
-                            return split_catalogue(result.json())
-                    finally:
-                        await workers.release(uid, pool['lease'])
+        if s.get('rate_limit_enabled'):
+            rate('rpm:'+uid, s['requests_per_minute'])
+        if gateway.blocked(path):
+            raise HTTPException(400, gateway.BLOCKED_MESSAGE)
+        if not any(a['enabled'] for a in store.accounts(uid)):
+            raise HTTPException(503, '你还没有导入自己的 Google 账号（本站不会使用其他用户的账号）')
+        kind = gateway.protocol(path, request.headers)
+        enabled = store.preferences(uid)['anti_truncation']
+        if request.method == 'GET' and path == '/v1/models' and kind == 'openai':
+            # Site-wide public catalogue from SQLite, filtered by this user's own
+            # accounts; never starts or waits for anything per user.
             try:
-                payload = await model_cache.get(uid, fingerprint, load_catalogue)
-            except httpx.TimeoutException as exc:
-                raise HTTPException(504, '模型目录读取超时，请稍后重试') from exc
-            except httpx.HTTPStatusError as exc:
-                raise HTTPException(exc.response.status_code, '上游模型目录读取失败') from exc
-            except httpx.HTTPError as exc:
-                raise HTTPException(502, '模型目录连接失败，请稍后重试') from exc
-            try:
-                await asyncio.wait_for(workers.touch(uid), timeout=1)
-            except (httpx.HTTPError, HTTPException, TimeoutError):
-                logging.getLogger(__name__).warning('cached catalogue worker renewal unavailable')
-            if store.preferences(uid)['anti_truncation']:
+                payload = await engine.catalogue()
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(503, '模型列表暂时读取不到，请稍后重试') from None
+            payload = engine.user_catalogue(uid, payload)
+            if enabled:
                 payload = augment_models(payload)
             return JSONResponse(payload, headers={'Cache-Control':'private, no-cache'})
         body = await request.body()
@@ -685,194 +812,261 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
             path_model = path.split('/models/', 1)[1].split(':', 1)[0]
             model = path_model
         anti = model.startswith(PREFIX)
-        enabled = store.preferences(u['id'])['anti_truncation']
-        base_model, channel = split_model(model.removeprefix(PREFIX) if anti else model)
+        # Historical -pg/-build suffixes are still accepted; the engine routes channels itself.
+        base_model, _ = split_model(model.removeprefix(PREFIX) if anti else model)
         if anti and (not enabled or request.method != 'POST' or path != '/v1/chat/completions' or not eligible(base_model)):
             raise HTTPException(400, '请先开启防截断，仅支持带前缀的 OpenAI 聊天模型')
         if path_model and base_model != path_model:
             path = path.replace('/models/'+path_model, '/models/'+base_model, 1)
         if not anti and PREFIX in path:
             raise HTTPException(400, '防截断模型仅支持 OpenAI /v1/chat/completions')
-        ticket = scheduler.enqueue(u['id'])
+        if message := gateway.body_blocked(parsed):
+            raise HTTPException(400, message)
+        if path == '/v1/responses' and isinstance(parsed, dict) and parsed.get('previous_response_id'):
+            previous = str(parsed['previous_response_id'])
+            if not store.one('SELECT 1 FROM response_owners WHERE response_id=? AND user_id=?', (previous, uid)):
+                raise HTTPException(404, '找不到上一轮对话（previous_response_id），请重新开始对话')
+        generation = gateway.is_generation(request.method, path)
+        wants_stream = request.method == 'POST' and ((isinstance(parsed, dict) and parsed.get('stream') is True) or ':streamGenerateContent' in path)
+        # Native Gemini streaming without alt=sse is a JSON array: pass bytes straight through.
+        sse = wants_stream and (':streamGenerateContent' not in path or request.query_params.get('alt') == 'sse')
         start = time.monotonic()
-        aid, generation, synthetic_name, buffered = None, False, '', None
-        worker = None
-
-        from portal.proxy_response import ManagedStreamingResponse
-        response = None
-        client = None
         meter = UsageMeter(started=start)
-        final_status = 499
-        from portal.proxy_cleanup import ProxyCleanup
+        scanner = gateway.ResponseIdScanner() if path == '/v1/responses' else None
+        state = {'status': 499, 'account': None, 'ticket': None, 'response': None, 'client': None,
+                 'synthetic': '', 'buffered': None, 'error': None, 'recorded': False, 'cleaned': False}
+
         def record():
-            store.record(u['id'], u['key_id'], model, final_status, time.monotonic()-start, meter.finish(), account_id=aid, generation=generation, first_token_seconds=meter.first_token_seconds if generation and final_status < 400 else None)
-        cleanup = ProxyCleanup(workers, u['id'], scheduler, ticket, record)
+            if state['recorded']:
+                return
+            state['recorded'] = True
+            status = state['status']
+            store.record(uid, u['key_id'], model, status, time.monotonic()-start, meter.finish(), account_id=state['account'],
+                         generation=generation, first_token_seconds=meter.first_token_seconds if generation and status < 400 else None)
+            if scanner is not None and status < 400 and scanner.ids:
+                remember_responses(uid, scanner.ids)
+            if status >= 500 and status != 503:
+                alerts('upstream_5xx', model or path, f'最近有请求返回 {status}（{model or path}）', 'info')
+
+        async def cleanup():
+            if state['cleaned']:
+                return
+            state['cleaned'] = True
+            import anyio
+            with anyio.CancelScope(shield=True):
+                for name in ('response', 'client'):
+                    resource = state[name]
+                    if resource is not None:
+                        try:
+                            with anyio.move_on_after(5):
+                                await resource.aclose()
+                        except Exception:
+                            pass
+                if state['ticket'] is not None:
+                    scheduler.release(state['ticket'])
+                    state['ticket'] = None
+                record()
+
         async def prepare():
-            nonlocal u, s, worker, aid, client, response, body, parsed, synthetic_name, model, generation, buffered
-            while True:
-                await scheduler.acquire(ticket, request)
-                # Revalidate under the same user lock used by all account management.
-                current = store.key_user(key)
-                if not current or current['id'] != ticket.uid:
-                    raise HTTPException(401, 'API Key 无效或已撤销')
-                u = verify_access(current)
-                s = store.settings()
-                accounts = [store.account(u['id'], a['id']) for a in store.accounts(u['id']) if a['enabled']]
-                if not accounts:
-                    raise HTTPException(503, '未导入自己的 Google 账号，不会使用其他用户账号')
-                selected = choose_account(accounts, store, u['id'], base_model or model)
-                aid = selected['id'] if selected else None
-                try:
-                    async with asyncio.timeout(max(0, ticket.deadline-time.monotonic())):
-                        worker = await workers.acquire(u['id'], [selected] if selected else [], s['max_workers'], channel=channel or 'playground')
-                    cleanup.worker = worker
-                    scheduler.commit(ticket)
-                    break
-                except HTTPException as exc:
-                    from portal.scheduling import BUSY_DETAILS
-                    if exc.detail not in BUSY_DETAILS or exc.status_code not in (429, 503):
-                        raise
-                    scheduler.retry(ticket)
-                finally:
-                    accounts = selected = None
-            client = httpx.AsyncClient(timeout=httpx.Timeout(1800 if anti else 600, connect=30), follow_redirects=False)
-            cleanup.client = client
+            nonlocal body, parsed
+            state['ticket'] = await scheduler.acquire(uid)
+            current = store.key_user(key)
+            if not current or current['id'] != uid:
+                raise HTTPException(401, 'API Key 无效或已撤销')
+            verify_access(current, api=True)
+            scope = await engine.ensure_ready(uid)
+            if not scope:
+                raise HTTPException(503, '你的账号还在准备中，或者都暂时不可用；请到「我的账号」查看')
+            info = await engine.endpoint()
             if isinstance(parsed, dict) and base_model != model:
                 parsed = dict(parsed, model=base_model)
                 body = json.dumps(parsed, ensure_ascii=True).encode()
             if anti:
-                parsed = dict(parsed, model=base_model)
-                parsed, synthetic_name = await inject(parsed)
+                parsed, state['synthetic'] = await inject(dict(parsed, model=base_model))
                 body = json.dumps(parsed, ensure_ascii=True).encode()
             if request.method == 'POST' and path == '/v1/chat/completions' and isinstance(parsed,dict) and parsed.get('stream') is True:
-                options=parsed.get('stream_options')
-                parsed=dict(parsed,stream_options=(options if isinstance(options,dict) else {}) | {'include_usage':True})
-                body=json.dumps(parsed,ensure_ascii=True).encode()
-            if not model and path.startswith('/v1beta/models/'):
-                model = path.split('/models/',1)[1].split(':',1)[0]
-            generation = request.method=='POST' and (path in ['/v1/chat/completions','/v1/completions','/v1/messages','/v1/responses','/v1/images/generations'] or ':generateContent' in path or ':streamGenerateContent' in path)
-            # User supplied cookies, upstream keys, forwarding headers and target URLs never pass through.
-            headers = {'Authorization':'Bearer '+worker['key']}
-            for h in ['content-type','accept','anthropic-version']:
+                options = parsed.get('stream_options')
+                parsed = dict(parsed, stream_options=(options if isinstance(options,dict) else {}) | {'include_usage':True})
+                body = json.dumps(parsed, ensure_ascii=True).encode()
+            # User cookies, user keys, forwarding headers and target URLs never pass through.
+            headers = {'Authorization':'Bearer '+info['key'], SCOPE_HEADER: ','.join(scope)}
+            for h in ['content-type','accept','anthropic-version','anthropic-beta']:
                 if h in request.headers:
                     headers[h] = request.headers[h]
             params = [(k,v) for k,v in request.query_params.multi_items() if k not in ['key','api_key']]
-            req = client.build_request(request.method, worker['url']+path, params=params, headers=headers, content=body)
-            response = await client.send(req, stream=True)
-            cleanup.response = response
-            if response.status_code in (401,403):
-                raise HTTPException(502, 'Google／账号池认证失败，不是 Discord 登录失效；请检查 Google 会话或联系站长')
+            client = engine.client(info, 1800 if anti else 900)
+            state['client'] = client
+            response = await client.send(client.build_request(request.method, path, params=params, headers=headers, content=body), stream=True)
+            state['response'] = response
+            state['account'] = account_for(uid, response.headers.get(SERVING_HEADER, ''))
+            if not response.is_success:
+                raw_error = b''
+                async for part in response.aiter_bytes():
+                    raw_error += part
+                    if len(raw_error) > 65536:
+                        break
+                status = response.status_code
+                if status in (401, 403) and (b'account_scope_required' in raw_error or b'invalid_api_key' in raw_error or b'Unauthorized' in raw_error):
+                    alerts('engine_auth', 'engine', '门户与生成服务之间的密钥不匹配，请重启生成服务', 'critical')
+                    raise HTTPException(502, '生成服务配置异常，管理员已收到提醒')
+                headers_out = {}
+                if status == 429:
+                    seconds = gateway.retry_seconds(response.headers, raw_error)
+                    message = gateway.recovery_message(seconds, lang=i18n.lang_of(request.headers, request.cookies))
+                    if seconds:
+                        headers_out['Retry-After'] = str(seconds)
+                else:
+                    message = gateway.upstream_message(status, raw_error)
+                state['error'] = (status, message, headers_out)
+                return
             catalogue = request.method == 'GET' and path == '/v1/models'
-            if response.is_success and (catalogue or (anti and 'text/event-stream' not in response.headers.get('content-type',''))):
+            if catalogue or (anti and 'text/event-stream' not in response.headers.get('content-type','')):
                 raw_response = bytearray()
                 async for part in response.aiter_bytes():
                     raw_response.extend(part)
                 payload = json.loads(raw_response)
                 if catalogue:
-                    result = split_catalogue(payload)
-                    if enabled:result = augment_models(result)
+                    result = augment_models(payload) if enabled else payload
                 else:
-                    result = await normalize(payload, synthetic_name, model)
-                buffered = json.dumps(result, ensure_ascii=False).encode()
-        async def own_preparation():
-            nonlocal final_status
-            try:
-                await prepare()
-            except BaseException as exc:
-                final_status = exc.status_code if isinstance(exc, HTTPException) else 504 if isinstance(exc, TimeoutError) else 499 if isinstance(exc, asyncio.CancelledError) else 503
-                await cleanup()
-                if isinstance(exc, TimeoutError):
-                    raise HTTPException(504, '排队等待超时，请稍后重试') from None
-                raise
-        async def watch_disconnect():
-            await request.scope['portal.disconnect'].wait()
-        preparation = asyncio.create_task(own_preparation())
-        disconnected = asyncio.create_task(watch_disconnect())
-        async def wait_prepared():
-            nonlocal final_status
-            try:
-                done, _ = await asyncio.wait({preparation, disconnected}, return_when=asyncio.FIRST_COMPLETED)
-                if disconnected in done:
-                    raise HTTPException(499, '请求已断开')
-                await preparation
-            except BaseException as exc:
-                final_status = exc.status_code if isinstance(exc, HTTPException) else 499 if isinstance(exc, asyncio.CancelledError) else 503
-                if not preparation.done():
-                    preparation.cancel()
-                try:
-                    await preparation
-                except BaseException:
-                    pass
-                await cleanup()
-                if isinstance(exc, (asyncio.CancelledError, HTTPException)):
-                    raise
-                raise HTTPException(503, '自己的账号池未就绪，请稍后重试') from None
-            finally:
-                disconnected.cancel()
-                if not preparation.done():
-                    preparation.cancel()
-                try:
-                    await preparation
-                except BaseException:
-                    pass
-                try:
-                    await disconnected
-                except BaseException:
-                    pass
+                    result = await normalize(payload, state['synthetic'], model)
+                state['buffered'] = json.dumps(result, ensure_ascii=False).encode()
 
-        async def stream():
-            nonlocal final_status
-            final_status = response.status_code
+        def failure_status(exc):
+            if isinstance(exc, HTTPException):
+                return exc.status_code
+            if isinstance(exc, asyncio.CancelledError):
+                return 499
+            if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+                return 504
+            return 503
+
+        def failure_message(exc):
+            if isinstance(exc, HTTPException):
+                return str(exc.detail)
+            if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+                return '生成服务响应超时，请稍后重试'
+            return '生成服务暂时连不上，请稍后重试'
+
+        async def output():
+            response = state['response']
+            if state['buffered'] is not None:
+                yield state['buffered']
+            elif anti and response.is_success and 'text/event-stream' in response.headers.get('content-type',''):
+                from contextlib import aclosing
+                async with aclosing(transform_stream(response.aiter_bytes(), state['synthetic'], model)) as transformed:
+                    async for part in transformed:
+                        yield part
+            else:
+                async for part in response.aiter_bytes():
+                    yield part
+
+        async def body_stream():
+            state['status'] = state['response'].status_code
             try:
-                async def output():
-                    if buffered is not None:
-                        yield buffered
-                    elif anti and response.is_success and 'text/event-stream' in response.headers.get('content-type',''):
-                        from contextlib import aclosing
-                        async with aclosing(transform_stream(response.aiter_bytes(), synthetic_name, model)) as transformed:
-                            async for part in transformed:
-                                yield part
-                    else:
-                        async for part in response.aiter_bytes():
-                            yield part
                 from contextlib import aclosing
                 async with aclosing(output()) as source:
                     async for chunk in source:
                         meter.feed(chunk)
+                        if scanner is not None:
+                            scanner.feed(chunk)
                         yield chunk
             except BaseException:
-                final_status = 499
+                state['status'] = 499
                 raise
-        wants_stream = request.method == 'POST' and ((isinstance(parsed, dict) and parsed.get('stream') is True) or ':streamGenerateContent' in path)
-        if wants_stream:
+
+        preparation = asyncio.create_task(prepare())
+        disconnect = request.scope.get('portal.disconnect')
+        watcher = asyncio.create_task(disconnect.wait()) if disconnect is not None else None
+
+        async def settle(timeout=None):
+            """Wait for preparation (or client disconnect). Returns True when prepared."""
+            waiters = {preparation} | ({watcher} if watcher else set())
+            done, _ = await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            if preparation in done:
+                preparation.result()
+                return True
+            if watcher is not None and watcher in done:
+                preparation.cancel()
+                await asyncio.gather(preparation, return_exceptions=True)
+                raise HTTPException(499, '请求已断开')
+            return False
+
+        def error_response(status, message, headers=None):
+            return JSONResponse(gateway.error_body(kind, status, message), status_code=status, headers=headers or {})
+
+        async def stop_watcher():
+            if watcher is not None and not watcher.done():
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+
+        if sse:
+            # Give a fast engine answer (e.g. 429 with recovery time) a real HTTP status;
+            # otherwise start the event stream and keep it alive while preparing.
+            try:
+                ready = await settle(timeout=2.0)
+            except BaseException as exc:
+                state['status'] = failure_status(exc)
+                await stop_watcher()
+                await cleanup()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return error_response(state['status'], failure_message(exc))
+            if ready and state['error']:
+                state['status'], message, extra = state['error']
+                await stop_watcher()
+                await cleanup()
+                return error_response(state['status'], message, extra)
+            from portal.proxy_response import ManagedStreamingResponse
             from portal.streaming import with_heartbeats
-            async def prepared_output():
-                nonlocal final_status
+
+            async def events():
                 try:
-                    await wait_prepared()
-                    if response is not None and not response.is_success:
-                        final_status = response.status_code
-                        detail = (await response.aread()).decode(errors='replace')
-                        yield ('data: '+json.dumps({'error': {'message': detail, 'type': 'upstream_error', 'code': response.status_code}})+'\n\n').encode()
+                    if not ready:
+                        while not await settle(timeout=None):
+                            pass
+                    if state['error']:
+                        state['status'], message, _ = state['error']
+                        yield ('data: '+json.dumps(gateway.error_body(kind, state['status'], message), ensure_ascii=False)+'\n\n').encode()
                         return
                     from contextlib import aclosing
-                    async with aclosing(stream()) as source:
+                    async with aclosing(body_stream()) as source:
                         async for chunk in source:
                             yield chunk
                 except HTTPException as exc:
-                    final_status = exc.status_code
-                    yield ('data: '+json.dumps({'error': {'message': str(exc.detail), 'type': 'upstream_error', 'code': exc.status_code}})+'\n\n').encode()
-            async def finish_stream():
-                for task in (preparation, disconnected):
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(preparation, disconnected, return_exceptions=True)
+                    state['status'] = exc.status_code
+                    if exc.status_code != 499:
+                        yield ('data: '+json.dumps(gateway.error_body(kind, exc.status_code, str(exc.detail)), ensure_ascii=False)+'\n\n').encode()
+                except (TimeoutError, httpx.HTTPError) as exc:
+                    state['status'] = failure_status(exc)
+                    yield ('data: '+json.dumps(gateway.error_body(kind, state['status'], failure_message(exc)), ensure_ascii=False)+'\n\n').encode()
+
+            async def finish():
+                if not preparation.done():
+                    preparation.cancel()
+                await asyncio.gather(preparation, return_exceptions=True)
+                await stop_watcher()
                 await cleanup()
-            return ManagedStreamingResponse(with_heartbeats(prepared_output(), interval=30 if anti else 15), cleanup=finish_stream,
-                media_type='text/event-stream', headers={'X-Accel-Buffering':'no', 'Cache-Control':'no-cache'})
-        await wait_prepared()
-        return ManagedStreamingResponse(stream(), cleanup=cleanup, status_code=response.status_code,
-            headers={'Content-Type':response.headers.get('content-type','application/json'), 'X-Accel-Buffering':'no'})
+            return ManagedStreamingResponse(with_heartbeats(events(), interval=30 if anti else 15), cleanup=finish,
+                                            media_type='text/event-stream', headers={'X-Accel-Buffering':'no', 'Cache-Control':'no-cache'})
+        try:
+            await settle()
+        except BaseException as exc:
+            state['status'] = failure_status(exc)
+            await stop_watcher()
+            await cleanup()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return error_response(state['status'], failure_message(exc))
+        await stop_watcher()
+        if state['error']:
+            state['status'], message, extra = state['error']
+            await cleanup()
+            return error_response(state['status'], message, extra)
+        from portal.proxy_response import ManagedStreamingResponse
+        response = state['response']
+        content_type = 'application/json' if state['buffered'] is not None else response.headers.get('content-type', 'application/json')
+        return ManagedStreamingResponse(body_stream(), cleanup=cleanup, status_code=response.status_code,
+                                        headers={'Content-Type': content_type, 'X-Accel-Buffering':'no', 'Cache-Control':'no-cache'})
 
     @app.api_route('/v1/{rest:path}', methods=['GET','POST','DELETE'])
     async def openai(rest: str, request: Request):
@@ -889,6 +1083,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
     def page(filename):
         text = (static/filename).read_text()
         text = text.replace('<html ', '<html data-portal-base="'+prefix+'" ')
+        # Content-hashed URLs let browsers cache static assets for a year.
+        text = re.sub(r'"/static/([^"?#]+)"', lambda m: '"/static/'+m.group(1)+('?v='+asset_versions[m.group(1)] if m.group(1) in asset_versions else '')+'"', text)
         for path in ['/static/', '/auth/', '/api/']:
             text = text.replace('"'+path, '"'+prefix+path)
         text = text.replace('href="/admin"', 'href="'+admin_path+'"')
@@ -911,5 +1107,6 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None):
         app.add_api_route(prefix, index, methods=['GET'])
         app.add_api_route(admin_path, admin_index, methods=['GET'])
         app.add_api_route('/health', health, methods=['GET'])
+    app.add_middleware(i18n.I18nMiddleware, prefix=prefix)
     app.add_middleware(BoundedBodyMiddleware, budget=budget)
     return app

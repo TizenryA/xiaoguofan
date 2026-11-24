@@ -1,3 +1,5 @@
+//go:build cgo && !nomozjs
+
 // clock.cpp 实现 clock.h：performance.now、事件时间戳与 Date 共用的线程 VM 时钟
 #include "clock.h"
 

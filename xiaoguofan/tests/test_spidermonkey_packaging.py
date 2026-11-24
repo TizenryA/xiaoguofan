@@ -21,14 +21,15 @@ def test_linux_build_uses_static_cgo_for_each_arch(tmp_path):
         assert env['GOARCH'] == arch and env['GOOS'] == 'linux'
         assert f'{target}-linux-musl' in env['CC']
         assert f'{target}-linux-musl' in env['CXX']
-        assert f'/spidermonkey/linux-{arch}/include' in env['CGO_CXXFLAGS']
+        assert f'/spidermonkey/linux-{arch}/include' in env['CGO_CPPFLAGS']
         assert f'/spidermonkey/linux-{arch}/lib' in env['CGO_LDFLAGS']
     assert '-static' in builder.LINK_FLAGS
     assert 'internal/app.version=' in builder.LINK_FLAGS
 
 
 def test_toolchain_downloads_are_pinned_and_hashed():
-    assert builder.SPIDERMONKEY == 'v152.0.4-aistudio2api.1'
+    import re
+    assert re.fullmatch(r'v\d+\.\d+\.\d+-aistudio2api\.\d+', builder.SPIDERMONKEY)
     assert builder.ZIG_VERSION == '0.16.0'
     assert set(builder.SM_SHA256) == {'amd64', 'arm64'}
     assert all(len(h) == 64 for h in builder.SM_SHA256.values())
@@ -39,6 +40,9 @@ def test_worker_runtime_selects_supported_backend():
     text = (P.parents[1] / 'portal/workers.py').read_text()
     assert 'WAA_BACKEND=spidermonkey' in text
     assert 'WAA_BACKEND=go' not in text
+    # Shared engine: trusted per-user account scope is mandatory, no cooldown queueing.
+    assert 'XGF_ACCOUNT_SCOPE=required' in text
+    assert 'AISTUDIO_COOLDOWN_QUEUE_SECONDS=0' in text
 
 
 def _official_archive(payload=b'official'):

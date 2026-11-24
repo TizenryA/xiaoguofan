@@ -1,3 +1,5 @@
+//go:build cgo && !nomozjs
+
 // Package mozjs 经 cgo 嵌入 SpiderMonkey，提供线程绑定的上下文、根表句柄、求值、Go 原生函数、微任务与中断
 package mozjs
 

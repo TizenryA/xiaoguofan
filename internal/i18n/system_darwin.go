@@ -1,3 +1,5 @@
+//go:build cgo
+
 package i18n
 
 // #cgo LDFLAGS: -framework CoreFoundation

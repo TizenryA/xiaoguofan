@@ -1,3 +1,5 @@
+//go:build cgo && !nolibwebp
+
 // Package libwebp 经 cgo 调用 libwebp 编码有损 WebP
 package libwebp
 

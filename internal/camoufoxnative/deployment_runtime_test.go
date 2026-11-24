@@ -46,7 +46,7 @@ func TestDeploymentOfflineBrowserRuntime(t *testing.T) {
 	defer connection.Close()
 	connection.SetReadDeadline(time.Now().Add(35 * time.Second))
 	t.Log("BIDI_CONNECTED")
-	client := newBiDiClient(connection)
+	client := newBiDiClient(connection, process)
 	if _, err = client.command(ctx, "session.new", map[string]any{"capabilities": map[string]any{}}); err != nil {
 		t.Fatal(err)
 	}

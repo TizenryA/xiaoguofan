@@ -1,11 +1,10 @@
 import asyncio
 
-import httpx
 import pytest
 from fastapi import HTTPException
 from test_lite import setup
 
-from portal.workers import WorkerManager, worker_payload
+from portal.accounts import worker_payload
 
 
 def test_upstream_payload_uses_email_not_remark_and_preserves_cookies():
@@ -17,12 +16,10 @@ def test_upstream_payload_uses_email_not_remark_and_preserves_cookies():
     assert data['payload']['label']=='测试1'
 
 
-def test_existing_email_labels_work_but_missing_email_fails_before_docker(tmp_path):
+def test_existing_email_labels_work_but_missing_email_fails_before_engine(tmp_path):
     assert worker_payload({'payload':{'label':'friend@gmail.com'}})['label']=='friend@gmail.com'
-    class Manager(WorkerManager):
-        async def docker(self,*a,**kw):raise AssertionError('must not start Docker')
     with pytest.raises(HTTPException) as err:
-        asyncio.run(Manager(tmp_path).ensure('admin',[{'id':'a','payload':{'label':'测试1'}}],1))
+        worker_payload({'id':'a','payload':{'label':'测试1'}})
     assert err.value.status_code==422
     assert 'Google 邮箱' in err.value.detail
 
@@ -44,17 +41,13 @@ def test_email_patch_is_private_owner_scoped_and_encrypted(tmp_path):
     assert 'friend@gmail.com' not in c.get('/api/admin/users').text
 
 
-def test_worker_import_http_receives_email_not_remark(tmp_path,monkeypatch):
-    sent=[]
-    def handler(r):
-        import json
-        if r.url.path=='/api/pairing/accounts':sent.append(json.loads(r.content))
-        return httpx.Response(200,json={'token':'fixture'})
-    real=httpx.AsyncClient
-    monkeypatch.setattr(httpx,'AsyncClient',lambda **kw:real(transport=httpx.MockTransport(handler),**kw))
-    class Manager(WorkerManager):
-        async def docker(self,*args,**kw):return '127.0.0.1:9999' if args[0]=='port' else ''
-    account={'id':'a','payload':{'label':'测试1','email':'friend@gmail.com','storage_state':{'cookies':[]}}}
-    asyncio.run(Manager(tmp_path).ensure('admin',[account],1))
-    assert sent[0]['label']=='friend@gmail.com'
-    assert 'email' not in sent[0]
+def test_engine_import_receives_email_not_remark(tmp_path):
+    from engine_fixture import FakeEngine, cookie_payload, portal
+    fake=FakeEngine().start()
+    try:
+        app,s,alice,bob,client=portal(tmp_path,fake)
+        s.add_account(alice['id'],'测试1',cookie_payload('Friend@Gmail.com')|{'label':'测试1'})
+        asyncio.run(app.state.engine.sync())
+        assert fake.imports==['friend@gmail.com']
+    finally:
+        fake.stop()

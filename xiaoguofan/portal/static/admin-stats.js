@@ -1,8 +1,8 @@
 'use strict';
 let adminStatsOffset=0,adminStatsRequest=0;
-const adminNumber=n=>Number(n||0).toLocaleString('zh-CN');
+const adminNumber=n=>Number(n||0).toLocaleString((globalThis.XGF_I18N?.locale||'zh-CN'));
 const adminTokenTotal=row=>row.metered_requests?adminNumber(row.input_tokens+row.output_tokens):'未报告';
-const adminDate=ts=>new Date(ts*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+const adminDate=ts=>new Date(ts*1000).toLocaleString((globalThis.XGF_I18N?.locale||'zh-CN'),{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
 const adminSeconds=n=>n===null||n===undefined?'未提供':Number(n).toFixed(2)+' 秒';
 function adminMetric(title,value,note,id){const a=el('article');a.append(el('span',title));const strong=el('strong',value);if(id)strong.id=id;a.append(strong,el('small',note));return a}
 function adminDataRow(title,details){const row=el('div',undefined,'admin-data-row'),head=el('h4',title),body=el('div',undefined,'admin-data-details');details.forEach(t=>body.append(el('span',t)));row.append(head,body);return row}
@@ -13,7 +13,7 @@ async function siteStats(){
  try{
  const d=await api('/api/admin/stats?'+new URLSearchParams({days,limit:20,offset:adminStatsOffset,q:query}));if(ticket!==adminStatsRequest)return;
  const t=d.totals,s=d.summary;
- $('#admin-stats-meta').textContent=`近 ${d.days} 天 · 北京时间 · 更新于 ${new Date(d.generated_at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}`;
+ $('#admin-stats-meta').textContent=`近 ${d.days} 天 · 北京时间 · 更新于 ${new Date(d.generated_at*1000).toLocaleString((globalThis.XGF_I18N?.locale||'zh-CN'),{timeZone:'Asia/Shanghai'})}`;
  const metrics=$('#admin-stat-metrics');metrics.replaceChildren(
  adminMetric('累计注册用户',adminNumber(t.registered_users),`本期新增 ${adminNumber(t.new_users)} · 已禁用 ${adminNumber(t.disabled_users)}`,'admin-user-total'),
  adminMetric('当前接入账号',adminNumber(t.accounts),`启用 ${adminNumber(t.enabled_accounts)} · ${adminNumber(t.account_owners)} 位用户持有`),

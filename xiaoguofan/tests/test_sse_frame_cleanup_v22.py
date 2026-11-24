@@ -2,8 +2,8 @@ import asyncio
 
 import pytest
 
-from portal.streaming import with_heartbeats
 from portal.proxy_response import ManagedStreamingResponse
+from portal.streaming import with_heartbeats
 
 
 @pytest.mark.parametrize('newline', [b'\n', b'\r\n'])

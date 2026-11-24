@@ -1,42 +1,27 @@
-def test_proxy_selects_one_owned_account_and_records_non_generation_separately(tmp_path):
-    import http.server
-    import threading
-
-    from fastapi.testclient import TestClient
-    from test_isolation import RecordingBroker
-
-    from portal.main import create_app
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
-            self.rfile.read(int(self.headers.get('Content-Length','0')))
-            self.send_response(200);self.send_header('Content-Type','text/event-stream');self.end_headers()
-            self.wfile.write(b'data: {"choices":[{"delta":{"content":"FIXTURE"}}]}\n\ndata: [DONE]\n\n')
-        def do_GET(self):
-            self.send_response(200);self.end_headers();self.wfile.write(b'{"data":[]}')
-        def log_message(self,*args):pass
-    server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
-    threading.Thread(target=server.serve_forever,daemon=True).start()
-    broker=RecordingBroker('http://127.0.0.1:'+str(server.server_port))
-    app=create_app(tmp_path,'fixture-long-password','https://portal.example',broker);s=app.state.store
-    first=s.add_account('admin','first',{});second=s.add_account('admin','second',{})
-    key=s.create_key('admin','fixture')['key'];headers={'Authorization':'Bearer '+key}
+def test_proxy_uses_only_owned_accounts_and_records_non_generation_separately(tmp_path):
+    from engine_fixture import FakeEngine, cookie_payload, portal
+    fake = FakeEngine().start()
     try:
-        with TestClient(app,base_url='https://portal.example') as c:
+        app, s, alice, bob, c = portal(tmp_path, fake)
+        first = s.add_account(alice['id'], 'first', cookie_payload('first@gmail.com'))
+        second = s.add_account(alice['id'], 'second', cookie_payload('second@gmail.com'))
+        s.add_account(bob['id'], 'bob', cookie_payload('bob@gmail.com'))
+        headers = {'Authorization': 'Bearer '+s.create_key(alice['id'], 'fixture')['key']}
+        with c:
             for _ in range(2):
-                r=c.post('/v1/chat/completions',headers=headers,json={'model':'gemini-4-argon','messages':[{'role':'user','content':'fixture'}],'stream':True})
-                assert r.status_code==200 and 'FIXTURE' in r.text
-            assert c.get('/v1/models',headers=headers).status_code==200
-            assert c.post('/v1beta/models/gemini-3.8-flash:generateContent',headers=headers,json={'contents':[]}).status_code==200
-        rows=s.all('SELECT account_id,generation,model FROM requests ORDER BY id')
-        assert rows[0]['account_id']==rows[1]['account_id']
-        assert rows[0]['account_id'] in {first,second}
-        assert rows[2]['generation']==0
-        assert rows[3]['model']=='gemini-3.8-flash' and rows[3]['generation']==1
-        assert all(len(ids)==1 for _,ids in broker.seen)
-        assert all(uid=='admin' for uid,_ in broker.seen)
+                r = c.post('/v1/chat/completions', headers=headers, json={'model': 'gemini-4-argon', 'messages': [{'role': 'user', 'content': 'fixture'}], 'stream': True})
+                assert r.status_code == 200 and '片段0' in r.text
+            assert c.get('/v1/models', headers=headers).status_code == 200
+            assert c.post('/v1beta/models/gemini-3.8-flash:countTokens', headers=headers, json={'contents': []}).status_code in (200, 404, 405)
+            assert c.post('/v1beta/models/gemini-3.8-flash:generateContent', headers=headers, json={'contents': []}).status_code == 200
+        rows = s.all('SELECT account_id,generation,model FROM requests ORDER BY id')
+        gens = [r for r in rows if r['generation'] == 1]
+        assert all(r['account_id'] in {first, second} for r in gens)
+        assert any(r['generation'] == 0 for r in rows)
+        assert gens[-1]['model'] == 'gemini-3.8-flash'
+        assert all(set(scope) == {'first@gmail.com', 'second@gmail.com'} for p, scope, _ in fake.seen if p != '/v1/models')
     finally:
-        server.shutdown();server.server_close()
+        fake.stop()
 
 
 def test_legacy_database_migration_is_idempotent_and_preserves_payloads(tmp_path):

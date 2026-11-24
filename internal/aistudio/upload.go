@@ -620,7 +620,11 @@ func (p *AccountPool) ListFiles(ctx context.Context) ([]FileMetadata, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	files := []FileMetadata{}
+	scope, scoped := ContextAccountScope(ctx)
 	for fileID, accountID := range p.resources {
+		if scoped && !slices.Contains(scope, accountID) {
+			continue
+		}
 		binding := p.byID[accountID].runtime.Resources[fileID]
 		if binding.Kind != "drive-file" || binding.Name == "" || binding.MIME == "" || binding.Size <= 0 || binding.Purpose == "" {
 			continue

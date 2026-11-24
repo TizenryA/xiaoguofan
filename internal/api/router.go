@@ -39,6 +39,8 @@ type Config struct {
 	WaitLaunch func(context.Context)
 	// EgressProxy 返回服务连接外部 MCP 服务器所用的出口代理，空串为直连
 	EgressProxy func() string
+	// AccountScopeRequired 为真时公开 API 请求必须带门户传入的可信账户范围（共享引擎模式）
+	AccountScopeRequired bool
 	// States 持久保存 Responses、Interactions 与 Chat 音频回复的续接节点，为空时只保存在内存中
 	States StateStore
 }
@@ -155,7 +157,7 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 
 	root := http.NewServeMux()
 	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
-	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, apiKeyContextMiddleware(config.APIKey, accountContextMiddleware(requestBodyMiddleware(config.Ledger, waitLaunchMiddleware(config.WaitLaunch, s.catalogRead, public)))))))
+	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, apiKeyContextMiddleware(config.APIKey, accountScopeMiddleware(config.AccountScopeRequired, accountContextMiddleware(requestBodyMiddleware(config.Ledger, waitLaunchMiddleware(config.WaitLaunch, s.catalogRead, public))))))))
 	loggedHandler := requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler))
 	root.Handle("/v1/", loggedHandler)
 	root.Handle("/v1beta/", loggedHandler)

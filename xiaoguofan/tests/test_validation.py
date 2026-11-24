@@ -2,13 +2,12 @@
 import pytest
 
 
-def test_worker_start_does_not_start_empty_generator():
+def test_engine_start_only_after_accounts_exist():
     import inspect
 
-    from portal.workers import WorkerManager
-    # The smoke test also runs this against the release container on InstaBox.
-    source = inspect.getsource(WorkerManager.ensure)
-    assert "if accounts:" in source
+    from portal.engine import EngineClient
+    source = inspect.getsource(EngineClient.sync)
+    assert "if desired:" in source
 
 
 def test_cookie_expiry_malformed_is_validation_error():

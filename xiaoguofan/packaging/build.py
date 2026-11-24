@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-VERSION = '0.9.22'
+VERSION = '1.0.0'
 OUT = ROOT / 'dist/xiaoguofan'
 GO_VERSION = '1.27.3'
 SPIDERMONKEY = 'v158.0.1-aistudio2api.2'
@@ -163,6 +163,8 @@ def main():
             app.mkdir()
             shutil.copytree(ROOT / 'xiaoguofan/portal', app / 'portal',
                             ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+            shutil.copytree(ROOT / 'xiaoguofan/anti', app / 'anti',
+                            ignore=shutil.ignore_patterns('test', 'node_modules'))
             for f in ['requirements.txt', 'pyproject.toml', 'uv.lock']:
                 shutil.copy2(ROOT / 'xiaoguofan' / f, app / f)
             (stage / 'build-info.json').write_text(json.dumps({

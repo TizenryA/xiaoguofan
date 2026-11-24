@@ -28,9 +28,16 @@ def reference_quota(store,uid):
         today=[r for r in own if r['created']>=start]
         success=[r for r in today if 200<=r['status']<300]
         models={}
-        for group,limit in [('4a',50 if a['plan']=='pro' else 2),('3.8f',100)]:
+        week=[r for r in own if r['created']>=start-6*86400]
+        for group,limit in [('4a',50 if a['plan']=='pro' else 2),('3.8f',100),('other',0)]:
             used=sum(model_group(r['model'])==group for r in success)
-            models[group]={'used':used,'limit':limit,'remaining':max(0,limit-used)}
+            mine=[r for r in week if model_group(r['model'])==group]
+            # used/week/days are real counts; limit/remaining are legacy reference numbers kept for old clients only.
+            models[group]={'used':used,'limit':limit,'remaining':max(0,limit-used),
+                           'attempts':sum(r['created']>=start for r in mine),
+                           'limited':sum(r['created']>=start and r['status']==429 for r in mine),
+                           'week':sum(200<=r['status']<300 for r in mine),
+                           'days':[sum(200<=r['status']<300 and start-i*86400<=r['created']<start-(i-1)*86400 for r in mine) for i in range(6,-1,-1)]}
         result.append({k:a[k] for k in ['id','label','email','plan','enabled']}|{
             'today':{'attempts':len(today),'success':len(success),'failed':sum(r['status']>=400 for r in today)},
             'period':{'attempts':len(own),'success':sum(200<=r['status']<300 for r in own)},'models':models})
@@ -45,7 +52,7 @@ def reference_quota(store,uid):
     unknown=[r for r in generation if r['account_id'] not in known]
     return {'reference_only':True,'timezone':'Asia/Shanghai','reset_at':start+86400,'period_days':30,
             'account_usage':result,'trend':trend,'unattributed':{'attempts':len(unknown),'success':sum(200<=r['status']<300 for r in unknown)},
-            'quota_note':'站内参考额度，每日北京时间 00:00 重置；仅成功生成计数，不是 Google 实际余额，不拦截调用。Free / PRO 由本人标注；站外调用不计入。'}
+            'quota_note':'这里只统计本站成功回复的次数（每天北京时间 00:00 从零开始算）。Google 没有公开具体额度，所以不显示剩余；只有 Google 真的返回“额度用完”时才会提示，并显示预计恢复时间。站外调用不计入。'}
 
 
 def choose_account(accounts,store,uid,model=''):

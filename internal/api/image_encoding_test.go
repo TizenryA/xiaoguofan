@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/imagecodec/libwebp"
 )
 
 // TestFitImageJPEGToPNGIsRGB8 核对 JPEG 源不缩放输出 PNG 时为 8 位 RGB，像素与 image/jpeg 解码后经 draw.Draw 以 draw.Src 转为 RGBA 的结果相同
@@ -47,6 +48,9 @@ func TestFitImageJPEGToPNGIsRGB8(t *testing.T) {
 
 // TestFitImageWebPOutputCompression 核对 OpenAI 的 output_compression 作用于 webp 输出：输出为有损 VP8 WebP，压缩级别越低文件越小
 func TestFitImageWebPOutputCompression(t *testing.T) {
+	if !libwebp.Available {
+		t.Skip("本构建未链接 libwebp")
+	}
 	picture := image.NewRGBA(image.Rect(0, 0, 192, 128))
 	for y := range 128 {
 		for x := range 192 {
