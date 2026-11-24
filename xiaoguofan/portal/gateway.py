@@ -77,8 +77,17 @@ def retry_seconds(headers, body=b''):
     return int(match.group(1)) if match else None
 
 
-def recovery_message(seconds, now=None):
-    """Human message for 'all of your own accounts are out of quota'."""
+def recovery_message(seconds, now=None, lang='zh'):
+    """Human message for 'all of your own accounts are out of quota'.
+
+    Chinese gives Beijing time; English gives UTC (Retry-After carries the exact wait)."""
+    if lang == 'en':
+        base = "All of your accounts are out of quota for now (each of your own accounts was tried in turn; other people's accounts are never used)"
+        if not seconds or seconds <= 0:
+            return base+'. Please try again later.'
+        at = datetime.fromtimestamp((now or time.time())+seconds, timezone.utc)
+        span = f'about {int(seconds)} s' if seconds < 90 else f'about {math.ceil(seconds/60)} min' if seconds < 5400 else f'about {seconds/3600:.1f} h'
+        return f'{base}. Available again at {at:%H:%M} UTC on {at:%b} {at.day} (in {span}).'
     base = '你名下的可用账号额度都暂时用完了（已自动依次尝试你自己的全部账号，不会借用别人的账号）'
     if not seconds or seconds <= 0:
         return base+'，请稍后再试'

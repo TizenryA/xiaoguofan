@@ -6,7 +6,7 @@
  const node=id=>document.getElementById(id);
  const GROUPS=[['4a','4a · Gemini 4 Argon'],['3.8f','3.8f · Gemini 3.8 Flash'],['other','其他模型']];
  const shown=(key,rows)=>key!=='other'||rows.some(m=>m&&(m.used||m.week));
- const bj=t=>new Date(t*1000).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hour12:false});
+ const bj=t=>new Date(t*1000).toLocaleTimeString((globalThis.XGF_I18N?.locale||'zh-CN'),{timeZone:(globalThis.XGF_I18N?globalThis.XGF_I18N.tz:'Asia/Shanghai'),hour:'2-digit',minute:'2-digit',hour12:false});
  function until(t){const m=Math.max(1,Math.round((t-Date.now()/1000)/60));return m<60?m+' 分钟后':Math.floor(m/60)+' 小时 '+(m%60)+' 分钟后'}
  window.xgfUntil=until;window.xgfBeijing=bj;
  function groupOf(model){const m=(model||'').toLowerCase();if(!m)return 'all';if(m.includes('argon')||m==='4a'||m.startsWith('4a'))return '4a';if(m.includes('3.8')&&m.includes('flash')||m==='3.8f')return '3.8f';return 'other'}
@@ -19,7 +19,7 @@
  window.xgfUsage=function(o){
   const box=make('div',undefined,'usage'+(o.cool?' cool':''));
   const head=make('div',undefined,'usage-head'),val=make('span',undefined,'usage-val');
-  val.append(make('b',String(o.used)),document.createTextNode(' 次'),make('small',' 今天'));head.append(make('span',o.name,'usage-name'),val);
+  val.append(make('b',String(o.used)),document.createTextNode(' 次'),make('small',' 今天','usage-day'));head.append(make('span',o.name,'usage-name'),val);
   box.append(head,spark(o.days||[],o.name+' 近 7 天每天成功次数'));
   if(o.cool){const b=make('div',undefined,'usage-cool');b.append(make('b','已用完'),document.createTextNode('，约 '+bj(o.cool.until)+' 恢复（'+until(o.cool.until)+'）'));box.append(b)}
   else{const f=make('div',undefined,'usage-foot');f.append(make('span','近 7 天 '+(o.week??0)+' 次'),make('span',o.limited?'今天 Google 说过 '+o.limited+' 次“用完”':''));box.append(f)}

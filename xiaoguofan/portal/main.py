@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from starlette.routing import Mount, compile_path
 
-from portal import gateway
+from portal import gateway, i18n
 from portal.accounts import account_email, normalize_cookie, normalize_email
 from portal.anti_truncation import PREFIX, augment_models, eligible, inject, normalize, transform_stream
 from portal.channels import split_model
@@ -315,7 +315,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
     async def value_error(request, exc):
         return JSONResponse({'detail':str(exc)[:150]}, 400)
 
-    def error_page(status, detail, denied=False):
+    def error_page(status, detail, denied=False, lang='zh'):
         template = (Path(__file__).parent/'static/access-error.html').read_text()
         values = {
             'BASE': prefix, 'HOME': prefix or '/', 'VERSION': VERSION,
@@ -332,6 +332,8 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
             template = template.replace('<h1 id="error-title">你的账号脏脏的，不允许进去喵</h1>', '<h1 id="error-title"><span>你的账号脏脏的，</span><span>不允许进去喵</span></h1>')
         if not denied:
             template = re.sub(r'<figure\b.*?</figure>', '', template, flags=re.DOTALL)
+        if lang == 'en':
+            template = i18n.translate_html(template)
         response = HTMLResponse(template, status_code=status)
         response.delete_cookie('oauth_browser', path=cookie_path)
         return response
@@ -339,12 +341,12 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
     @app.exception_handler(HTTPException)
     async def browser_auth_error(request, exc):
         if request.url.path.startswith(prefix+'/auth/') and 'text/html' in request.headers.get('accept',''):
-            return error_page(exc.status_code, exc.detail, exc.status_code == 403 and exc.detail == '当前账号不符合本站访问规则')
+            return error_page(exc.status_code, exc.detail, exc.status_code == 403 and exc.detail == '当前账号不符合本站访问规则', i18n.lang_of(request.headers, request.cookies))
         return await http_exception_handler(request, exc)
 
     @app.get('/access-denied', include_in_schema=False)
-    def denied_preview():
-        return error_page(403, '当前账号不符合本站访问规则', True)
+    def denied_preview(request: Request):
+        return error_page(403, '当前账号不符合本站访问规则', True, i18n.lang_of(request.headers, request.cookies))
 
     @app.get('/health')
     def health():
@@ -744,14 +746,16 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
         u = auth(request)
         data = store.records(u['id'], 10000)['items']
         out = io.StringIO(); writer = csv.writer(out)
-        writer.writerow(['模型','状态','耗时秒','首字耗时秒','输入Token','输出Token','时间UTC','账号','请求类型'])
+        en = i18n.lang_of(request.headers, request.cookies) == 'en'
+        word = i18n.translate if en else (lambda s: s)
+        writer.writerow([word(h) for h in ['模型','状态','耗时秒','首字耗时秒','输入Token','输出Token','时间UTC','账号','请求类型']])
         for r in data:
             model = r['model']
             if model.lstrip().startswith(('=','+','-','@')):
                 model = "'"+model
             writer.writerow([model,r['status'],r['duration'],r['first_token_seconds'],r['input_tokens'],r['output_tokens'],time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime(r['created'])),
-                             ("'" if (r['account_label'] or '').lstrip().startswith(('=','+','-','@')) else '')+(r['account_label'] or ('账号已删除' if r['account_id'] else '历史未归属')),
-                             '生成调用' if r['generation']==1 else '查询 / 其他' if r['generation']==0 else '历史类型未记录'])
+                             ("'" if (r['account_label'] or '').lstrip().startswith(('=','+','-','@')) else '')+(r['account_label'] or word('账号已删除' if r['account_id'] else '历史未归属')),
+                             word('生成调用' if r['generation']==1 else '查询 / 其他' if r['generation']==0 else '历史类型未记录')])
         from fastapi.responses import Response
         return Response('\ufeff'+out.getvalue(), media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename=usage-records.csv'})
 
@@ -908,7 +912,7 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
                 headers_out = {}
                 if status == 429:
                     seconds = gateway.retry_seconds(response.headers, raw_error)
-                    message = gateway.recovery_message(seconds)
+                    message = gateway.recovery_message(seconds, lang=i18n.lang_of(request.headers, request.cookies))
                     if seconds:
                         headers_out['Retry-After'] = str(seconds)
                 else:
@@ -1103,5 +1107,6 @@ def create_app(directory=None, admin_password=None, origin=None, broker=None, en
         app.add_api_route(prefix, index, methods=['GET'])
         app.add_api_route(admin_path, admin_index, methods=['GET'])
         app.add_api_route('/health', health, methods=['GET'])
+    app.add_middleware(i18n.I18nMiddleware, prefix=prefix)
     app.add_middleware(BoundedBodyMiddleware, budget=budget)
     return app

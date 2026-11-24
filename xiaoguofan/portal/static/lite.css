@@ -356,3 +356,10 @@ details.fold.inline>.fold-body{padding:0 .9rem .9rem}
 @media(max-width:520px){.route-alt{grid-template-columns:1fr auto}.route-alt span{grid-column:1 / -1}}
 .route-list.compact .route{padding:.55rem .7rem}
 .reveal-sub{font-size:.9rem;margin:1rem 0 .5rem}
+/* language toggle */
+.lang-toggle{flex:none;min-width:2.6rem;height:2.1rem;padding:0 .6rem;border:1px solid var(--line);border-radius:999px;background:var(--surface,#fff);color:inherit;font:600 .8rem/1 inherit;cursor:pointer;margin-left:auto}
+.lang-toggle:hover{border-color:var(--primary,#4a5a8c)}
+.lang-toggle+.profile{margin-left:0}
+.login-card{position:relative}
+.login-lang{position:absolute;top:.8rem;right:.8rem;margin:0}
+html[lang=en] .usage-day{text-transform:lowercase}

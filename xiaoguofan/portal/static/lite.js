@@ -8,8 +8,8 @@ function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefine
 function notify(t){const modal=document.querySelector('dialog[open]');if(modal){let box=modal.querySelector('[data-operation-error]');if(!box){box=el('p','');box.dataset.operationError='';box.setAttribute('role','alert');(modal.querySelector('form')||modal).prepend(box)}box.textContent=t;box.hidden=false;return}$('#toast').textContent=t;$('#toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').hidden=true,5000)}
 async function api(path,opt={}){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),path.endsWith('/check')?420000:120000);try{const r=await fetch(portalBase+path,{...opt,signal:controller.signal,credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,...opt.headers}});const j=await r.json().catch(()=>({detail:'服务器返回异常'}));if(!r.ok)throw Error(typeof j.detail==='string'?j.detail:j.error?.message||'输入格式不对');return j}catch(e){if(e.name==='AbortError')throw Error('服务器响应超时，操作可能没有完成；请先刷新页面再看，不要重复提交');if(e instanceof TypeError)throw Error('连接服务器失败，请检查网络后刷新页面；操作可能没有完成');throw e}finally{clearTimeout(timer)}}
 async function task(button,fn){if(button&&button.disabled)return;if(button)button.disabled=true;try{await fn()}catch(e){notify(e.message)}finally{if(button)button.disabled=false}}
-function ago(t){const s=Date.now()/1000-t;if(s<60)return '刚刚';if(s<3600)return Math.floor(s/60)+' 分钟前';if(s<86400)return Math.floor(s/3600)+' 小时前';return new Date(t*1000).toLocaleDateString('zh-CN',{month:'numeric',day:'numeric'})+' '+new Date(t*1000).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false})}
-function full(t){return new Date(t*1000).toLocaleString('zh-CN',{hour12:false})}
+function ago(t){const s=Date.now()/1000-t;if(s<60)return '刚刚';if(s<3600)return Math.floor(s/60)+' 分钟前';if(s<86400)return Math.floor(s/3600)+' 小时前';return new Date(t*1000).toLocaleDateString((globalThis.XGF_I18N?.locale||'zh-CN'),{month:'numeric',day:'numeric'})+' '+new Date(t*1000).toLocaleTimeString((globalThis.XGF_I18N?.locale||'zh-CN'),{hour:'2-digit',minute:'2-digit',hour12:false})}
+function full(t){return new Date(t*1000).toLocaleString((globalThis.XGF_I18N?.locale||'zh-CN'),{hour12:false})}
 function confirmAction(message){return new Promise(resolve=>{const d=$('#confirm-dialog');$('#confirm-message').textContent=message;d.showModal();$('#confirm-yes').onclick=()=>{d.close();resolve(true)};$('#confirm-no').onclick=()=>{d.close();resolve(false)};d.oncancel=()=>resolve(false)})}
 const STATE_CLASS={ready:'ok',busy:'ok',cooldown:'warn',unavailable:'warn',pending:'idle',disabled:'idle',auth_required:'bad',restricted:'bad',error:'bad',conflict:'bad'};
 window.xgfStateClass=(state,enabled)=>enabled===false?'idle':STATE_CLASS[state]||'idle';
@@ -24,15 +24,17 @@ async function quota(){const [q,accs]=await Promise.all([api('/api/quota'),api('
  $('#google-remaining').textContent=q.google_remaining==null?'未提供':String(q.google_remaining);$('#google-note').textContent=q.google_note||'';
  $('#quota-accounts').textContent=q.accounts.used+' / '+q.accounts.limit;$('#enabled-count').textContent=q.accounts.enabled+' 个已启用';
  $('#quota-rate').textContent=q.concurrency?String(q.concurrency.per_user):'—';$('#quota-rate-note').textContent=q.requests_per_minute?`每分钟最多 ${q.requests_per_minute} 次`:'不限每分钟次数';
- const s=q.summary;$('#quota-tokens').textContent=s.metered_requests?(s.input_tokens+s.output_tokens).toLocaleString():'未统计';$('#quota-meter').textContent=`近 30 天 ${s.requests} 次请求`}
+ const s=q.summary;$('#quota-tokens').textContent=s.metered_requests?fmt(s.input_tokens+s.output_tokens):'未统计';$('#quota-meter').textContent=`近 30 天 ${s.requests} 次请求`}
 
 /* ---------- records ---------- */
 const STATUS={ok:['成功','ok'],limited:['额度用完','limited'],cancelled:['已取消','cancelled'],failed:['失败','failed']};
 function kind(code){return code<400?'ok':code===429?'limited':code===499?'cancelled':'failed'}
 function statusLabel(code){if(code<400)return '成功';return ({499:'已取消',429:'额度用完',401:'密钥无效',403:'被拒绝',400:'请求有误',413:'内容太大',502:'暂时失败',503:'暂时失败',504:'超时'})[code]||('失败 '+code)}
 function ttftClass(v){return v==null?'':v<2?'ttft-good':v<6?'ttft-mid':'ttft-slow'}
-function fmt(n){return n==null?'—':n>=10000?(n/10000).toFixed(n>=100000?0:1)+' 万':n.toLocaleString()}
-const bjPart=(t,o)=>new Date(t*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',...o});
+function fmt(n){return globalThis.XGF_I18N?globalThis.XGF_I18N.big(n):n==null?'—':n>=10000?(n/10000).toFixed(n>=100000?0:1)+' 万':n.toLocaleString()}
+// Day buckets are Beijing calendar days; hour labels follow the reader's zone (Beijing for Chinese).
+const bjPart=(t,o)=>new Date(t*1000).toLocaleString((globalThis.XGF_I18N?.locale||'zh-CN'),{timeZone:'Asia/Shanghai',...o});
+const hourPart=t=>new Date(t*1000).toLocaleString((globalThis.XGF_I18N?.locale||'zh-CN'),{timeZone:(globalThis.XGF_I18N?globalThis.XGF_I18N.tz:'Asia/Shanghai'),hour:'numeric',hour12:false});
 function setFilter(k){recordFilter=k;offset=0;$$('#record-filters button').forEach(x=>x.classList.toggle('on',x.dataset.filter===k));task(null,records)}
 function renderStats(s){const box=$('#record-stats');box.replaceChildren();if(!s)return;
  const big=(label,value,unit,cls)=>{const t=el('div',undefined,'big '+(cls||''));const b=el('b',value);if(unit)b.append(el('small',unit));t.append(el('span',label),b);return t};
@@ -57,7 +59,7 @@ function renderStats(s){const box=$('#record-stats');box.replaceChildren();if(!s
  const series=s.series||[];if(series.length){const max=Math.max(1,...series.map(x=>x.input_tokens+x.output_tokens)),useN=!s.metered,maxN=Math.max(1,...series.map(x=>x.n));
   const chart=el('div',undefined,'tok-chart'+(series.length>12?' dense':''));const daily=series.length<=8;
   series.forEach((x,i)=>{const col=el('div',undefined,'col'),stack=el('div',undefined,'stack');
-   const label=daily?bjPart(x.start,{month:'numeric',day:'numeric'}):bjPart(x.start,{hour:'numeric',hour12:false}).replace(/\D/g,'');
+   const label=daily?bjPart(x.start,{month:'numeric',day:'numeric'}):hourPart(x.start).replace(/\D/g,'');
    if(useN){const n=el('i',undefined,'c-n');n.style.height=(x.n/maxN*100)+'%';stack.append(n)}
    else{const o=el('i',undefined,'c-out'),n=el('i',undefined,'c-in');o.style.height=(x.output_tokens/max*100)+'%';n.style.height=(x.input_tokens/max*100)+'%';stack.append(o,n)}
    col.title=`${daily?label:label+':00'} · ${x.n} 次`+(useN?'':` · 输入 ${fmt(x.input_tokens)} · 输出 ${fmt(x.output_tokens)}`);

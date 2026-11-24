@@ -11,7 +11,7 @@
   if(d.mine_running)notes.push('你有 '+d.mine_running+' 条对话正在进行');
   if(d.mine_waiting)notes.push(d.mine_waiting+' 条在排队，马上轮到');
   node('home-status').textContent=title;
-  node('home-status-note').textContent=notes.join(' · ')||'更新于 '+new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});
+  node('home-status-note').textContent=notes.join(' · ')||'更新于 '+new Date().toLocaleTimeString((globalThis.XGF_I18N?.locale||'zh-CN'),{hour:'2-digit',minute:'2-digit'});
  }
  function schedule(seconds){clearTimeout(timer);if(enabled&&!document.hidden)timer=setTimeout(refresh,(seconds||5)*1000);}
  async function refresh(){

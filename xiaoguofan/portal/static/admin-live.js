@@ -5,7 +5,7 @@
  const $1=s=>document.querySelector(s);
  const make=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined&&text!==null)e.textContent=text;if(cls)e.className=cls;return e};
  const mib=b=>b==null?'—':b>=1073741824?(b/1073741824).toFixed(1)+' GiB':(b/1048576).toFixed(0)+' MiB';
- const time=t=>t?new Date(t*1000).toLocaleString('zh-CN',{hour12:false}):'—';
+ const time=t=>t?new Date(t*1000).toLocaleString((globalThis.XGF_I18N?.locale||'zh-CN'),{hour12:false}):'—';
  const ago=t=>{if(!t)return '—';const s=Math.max(0,Date.now()/1000-t);return s<60?Math.round(s)+' 秒前':s<3600?Math.round(s/60)+' 分钟前':s<86400?Math.round(s/3600)+' 小时前':Math.round(s/86400)+' 天前'};
  const STATE={ready:'可用',busy:'处理中',cooldown:'额度用完（会恢复）',auth_required:'登录失效',restricted:'被 Google 限制',unavailable:'暂时连不上',disabled:'已停用',pending:'准备中',error:'载入失败',conflict:'邮箱冲突'};
  const STATE_CLASS={ready:'good',busy:'good',cooldown:'warn',unavailable:'warn',pending:'idle',disabled:'idle',auth_required:'bad',restricted:'bad',error:'bad',conflict:'bad'};
@@ -32,7 +32,7 @@
   $1('#live-accounts-note').textContent=`已保存 ${acc.saved??'—'} 个 · 启用 ${acc.enabled??'—'} 个 · 已载入 ${acc.loaded??'—'} 个 · 正在处理 ${acc.active_requests??0} 个请求`;
   for(const [k,n] of Object.entries(acc.by_state||{}).sort((x,y)=>y[1]-x[1])){const c=make('span',undefined,'state-chip '+(STATE_CLASS[k]||'idle'));c.append(make('strong',String(n)),make('span',STATE[k]||k));box.append(c)}
   if(!box.children.length)box.append(make('p','还没有载入任何账号','muted'));
-  $1('#live-updated').textContent='更新于 '+new Date((d.timestamp||Date.now()/1000)*1000).toLocaleTimeString('zh-CN',{hour12:false})+' · 每 5 秒刷新'+(d.alerts_open?' · '+d.alerts_open+' 条告警待处理':'');
+  $1('#live-updated').textContent='更新于 '+new Date((d.timestamp||Date.now()/1000)*1000).toLocaleTimeString((globalThis.XGF_I18N?.locale||'zh-CN'),{hour12:false})+' · 每 5 秒刷新'+(d.alerts_open?' · '+d.alerts_open+' 条告警待处理':'');
  }
 
  async function renderAlerts(){
